@@ -12,6 +12,8 @@
 
 - GPU-resident RES sampler — `5594400`
 - Configurable slow/lossless encoding diagnostics — `772a3a7`
+- Standalone restart high-resolution refinement — `35f7597`, `f062b90`,
+  `c09af5c`, `2fbd396`
 
 ## Local behavior
 
