@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL tests/test_video_encoder_fp16.c: %s\n", message);
@@ -73,7 +74,13 @@ int main(void) {
         DECODER_QKV_COUNT = DECODER_SEQUENCE * DECODER_HEADS *
                             DECODER_HEAD_DIM * 3,
         DECODER_Q_COUNT = DECODER_SEQUENCE * DECODER_HEADS * DECODER_HEAD_DIM,
-        DECODER_ROPE_COUNT = DECODER_SEQUENCE * DECODER_ROPE_HALF
+        DECODER_ROPE_COUNT = DECODER_SEQUENCE * DECODER_ROPE_HALF,
+        PACK_PATCH_ROWS = 2, PACK_REGISTERS = 4, PACK_SUFFIX = 1,
+        PACK_WIDTH = 4, PACK_COUNT = (PACK_PATCH_ROWS + PACK_REGISTERS +
+                                      PACK_SUFFIX) * PACK_WIDTH,
+        UNPACK_SEQUENCE = 12, UNPACK_PATCH = 3 * 4 * 16 * 16,
+        UNPACK_PROJECTED = UNPACK_SEQUENCE * UNPACK_PATCH,
+        UNPACK_RGB = 22 * 16 * 16 * 3
     };
     float source[NORM_COUNT], norm_weight[NORM_C], norm_bias[NORM_C];
     float pixels[PIXEL_COUNT];
@@ -82,6 +89,9 @@ int main(void) {
     float conv_bias[CONV_O];
     float decoder_qkv[DECODER_QKV_COUNT], decoder_rope_cos[DECODER_ROPE_COUNT];
     float decoder_rope_sin[DECODER_ROPE_COUNT];
+    float pack_patches[PACK_PATCH_ROWS * PACK_WIDTH];
+    float pack_registers[PACK_REGISTERS * PACK_WIDTH];
+    float unpack_projected[UNPACK_PROJECTED];
     h3_gpu_tensor *source_f32 = new_f32(gpu, source, NORM_COUNT, 1);
     h3_gpu_tensor *weight_f32 = new_f32(gpu, norm_weight, NORM_C, 20);
     h3_gpu_tensor *bias_f32 = new_f32(gpu, norm_bias, NORM_C, 40);
@@ -99,6 +109,18 @@ int main(void) {
         gpu, decoder_rope_cos, DECODER_ROPE_COUNT, 160);
     h3_gpu_tensor *decoder_rope_sin_f32 = new_f32(
         gpu, decoder_rope_sin, DECODER_ROPE_COUNT, 180);
+    h3_gpu_tensor *pack_patches_f32 = new_f32(gpu, pack_patches,
+        PACK_PATCH_ROWS * PACK_WIDTH, 200);
+    h3_gpu_tensor *pack_registers_f32 = new_f32(gpu, pack_registers,
+        PACK_REGISTERS * PACK_WIDTH, 220);
+    memset(unpack_projected, 0, sizeof(unpack_projected));
+    for (int patch = 0; patch < 7; patch++)
+        for (int component = 0; component < UNPACK_PATCH; component++)
+            unpack_projected[patch * UNPACK_PATCH + component] =
+                (float)(patch & 1);
+    h3_gpu_tensor *unpack_projected_f32 = h3_gpu_tensor_from_f32(
+        gpu, unpack_projected, UNPACK_PROJECTED);
+    if (!unpack_projected_f32) fail("cannot allocate unpack source");
 
 #define NEW_F16(name, count) \
     h3_gpu_tensor *name = h3_gpu_tensor_new_f16(gpu, (count)); \
@@ -137,6 +159,12 @@ int main(void) {
     NEW_F32(decoder_query_f32, DECODER_Q_COUNT);
     NEW_F32(decoder_key_f32, DECODER_Q_COUNT);
     NEW_F32(decoder_value_f32, DECODER_Q_COUNT);
+    NEW_F16(pack_patches_f16, PACK_PATCH_ROWS * PACK_WIDTH);
+    NEW_F16(pack_registers_f16, PACK_REGISTERS * PACK_WIDTH);
+    NEW_F16(pack_output_f16, PACK_COUNT);
+    NEW_F32(pack_output_f32, PACK_COUNT);
+    NEW_F16(unpack_projected_f16, UNPACK_PROJECTED);
+    NEW_F32(unpack_rgb_f32, UNPACK_RGB);
 
     gpu_check(gpu, h3_gpu_begin(gpu), "begin");
     gpu_check(gpu, h3_gpu_cast_f32_to_f16(
@@ -221,6 +249,24 @@ int main(void) {
     gpu_check(gpu, h3_gpu_cast_f16_to_f32(
         gpu, decoder_value_fp16_f32, decoder_value_f16, DECODER_Q_COUNT),
         "cast decoder value result");
+    gpu_check(gpu, h3_gpu_cast_f32_to_f16(
+        gpu, pack_patches_f16, pack_patches_f32, PACK_PATCH_ROWS * PACK_WIDTH),
+        "cast pack patches");
+    gpu_check(gpu, h3_gpu_cast_f32_to_f16(
+        gpu, pack_registers_f16, pack_registers_f32, PACK_REGISTERS * PACK_WIDTH),
+        "cast pack registers");
+    gpu_check(gpu, h3_gpu_video_vae_pack_f16(
+        gpu, pack_output_f16, pack_patches_f16, pack_registers_f16,
+        PACK_PATCH_ROWS, PACK_REGISTERS, PACK_SUFFIX, PACK_WIDTH),
+        "pack FP16 decoder sequence");
+    gpu_check(gpu, h3_gpu_cast_f16_to_f32(
+        gpu, pack_output_f32, pack_output_f16, PACK_COUNT), "cast pack result");
+    gpu_check(gpu, h3_gpu_cast_f32_to_f16(
+        gpu, unpack_projected_f16, unpack_projected_f32, UNPACK_PROJECTED),
+        "cast unpack projected patches");
+    gpu_check(gpu, h3_gpu_video_vae_unpack_rgb_f16(
+        gpu, unpack_rgb_f32, unpack_projected_f16, 1, 1, 22),
+        "unpack FP16 decoder RGB");
     gpu_check(gpu, h3_gpu_submit(gpu), "submit");
 
     float got_norm[NORM_COUNT], want_norm[NORM_COUNT];
@@ -231,6 +277,7 @@ int main(void) {
     float got_decoder_query[DECODER_Q_COUNT], want_decoder_query[DECODER_Q_COUNT];
     float got_decoder_key[DECODER_Q_COUNT], want_decoder_key[DECODER_Q_COUNT];
     float got_decoder_value[DECODER_Q_COUNT], want_decoder_value[DECODER_Q_COUNT];
+    float got_pack[PACK_COUNT], got_unpack[UNPACK_RGB];
     if (!h3_gpu_tensor_read_f32(norm_fp16_f32, got_norm, NORM_COUNT) ||
         !h3_gpu_tensor_read_f32(norm_f32, want_norm, NORM_COUNT) ||
         !h3_gpu_tensor_read_f32(sum_fp16_f32, got_sum, NORM_COUNT) ||
@@ -252,7 +299,9 @@ int main(void) {
         !h3_gpu_tensor_read_f32(decoder_value_fp16_f32, got_decoder_value,
                                 DECODER_Q_COUNT) ||
         !h3_gpu_tensor_read_f32(decoder_value_f32, want_decoder_value,
-                                DECODER_Q_COUNT))
+                                DECODER_Q_COUNT) ||
+        !h3_gpu_tensor_read_f32(pack_output_f32, got_pack, PACK_COUNT) ||
+        !h3_gpu_tensor_read_f32(unpack_rgb_f32, got_unpack, UNPACK_RGB))
         fail("cannot read oracle outputs");
     const float pixel_mean[] = {0.485f, 0.456f, 0.406f};
     const float pixel_std[] = {0.229f, 0.224f, 0.225f};
@@ -281,11 +330,28 @@ int main(void) {
             DECODER_Q_COUNT, 0.002, 0.001);
     compare("decoder QKV/RoPE value", got_decoder_value, want_decoder_value,
             DECODER_Q_COUNT, 0.00025, 0.0003);
+    for (int row = 0; row < PACK_PATCH_ROWS; row++)
+        compare("decoder pack patches", got_pack + row * PACK_WIDTH,
+                pack_patches + row * PACK_WIDTH, PACK_WIDTH, 0.00025, 0.0003);
+    for (int row = 0; row < PACK_REGISTERS; row++)
+        compare("decoder pack registers", got_pack + (row + PACK_PATCH_ROWS) * PACK_WIDTH,
+                pack_registers + row * PACK_WIDTH, PACK_WIDTH, 0.00025, 0.0003);
+    for (int index = (PACK_PATCH_ROWS + PACK_REGISTERS) * PACK_WIDTH;
+         index < PACK_COUNT; index++) if (got_pack[index] != 0.0f)
+        fail("decoder pack suffix is not zero");
+    for (int frame = 0; frame < 22; frame++) {
+        int decoded_t = frame + 3;
+        if (frame >= 17) decoded_t += 3;
+        float expected = (decoded_t / 4 & 1) ? 0.714f : 0.485f;
+        float observed = got_unpack[(size_t)frame * 16 * 16 * 3];
+        if (fabsf(observed - expected) > 0.0005f)
+            fail("decoder unpack temporal patch mapping is wrong");
+    }
 
     h3_gpu_stats stats;
     if (!h3_gpu_get_stats(gpu, &stats) || stats.submissions != 1 ||
         stats.blit_copies != 0 || stats.host_tensor_writes != 0 ||
-        stats.host_tensor_reads != 15)
+        stats.host_tensor_reads != 17)
         fail("unexpected submission/copy/transfer contract");
     printf("stats: submissions=%llu blits=%llu host-rw=%llu/%llu "
            "bytes=%llu/%llu peak=%.3fMiB conv=%llu direct=%llu\n",

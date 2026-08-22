@@ -1001,6 +1001,15 @@ int h3_gpu_begin(h3_gpu *opaque) {
     return 1;
 }
 
+void h3_gpu_abort(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !gpu.command) return;
+    /* This command has not been committed. Releasing it also releases any
+     * MPSGraph child encoder state; do not touch already submitted chains. */
+    gpu.command = nil;
+    gpu.mpsCommand = nil;
+}
+
 int h3_gpu_continue(h3_gpu *opaque) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || !gpu.command) return 0;

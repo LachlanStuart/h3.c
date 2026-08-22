@@ -628,6 +628,11 @@ static int convert_resident_weights_fp16(vae_context *vae, char *error,
     for (size_t index = 0; index < count; index++) h3_gpu_tensor_free(old[index]);
     return 1;
 failed:
+    /* old[] owns every source tensor replaced before the failure. The active
+     * command has not escaped this helper unless submit failed (which clears
+     * it itself), so aborting here cannot cancel valid work. */
+    h3_gpu_abort(vae->gpu);
+    for (size_t index = 0; index < count; index++) h3_gpu_tensor_free(old[index]);
     fail(error, error_size, "cannot convert resident VideoVAE weights to FP16: %s",
          h3_gpu_error(vae->gpu));
     return 0;

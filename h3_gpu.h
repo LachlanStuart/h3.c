@@ -105,6 +105,9 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
                                    const uint16_t *values, size_t elements);
 
 int h3_gpu_begin(h3_gpu *gpu);
+/* Drop an uncommitted command buffer after an encode/allocation failure.
+ * Already submitted work is never cancelled. */
+void h3_gpu_abort(h3_gpu *gpu);
 /* Commit the current command buffer without waiting, then continue encoding on
  * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
 int h3_gpu_continue(h3_gpu *gpu);
