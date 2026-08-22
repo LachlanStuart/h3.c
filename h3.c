@@ -1,6 +1,7 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
 #include "h3_host.h"
+#include "h3_latent_io.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
 #include "h3_metal.h"
@@ -531,6 +532,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "unknown sampler");
         return 0;
     }
+    if (params->latent_output_path && !*params->latent_output_path) {
+        h3_set_error(ctx, "latent output path must not be empty");
+        return 0;
+    }
     if (params->refine_video_path) {
         if (!*params->refine_video_path || params->sampler != H3_SAMPLER_RES ||
             !params->freeze_audio || params->restart_schedule_steps < 2 ||
@@ -562,9 +567,21 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
                 "restart refinement output must not alias the source video");
             return 0;
         }
+        if (params->refine_latent_path && !*params->refine_latent_path) {
+            h3_set_error(ctx, "refine latent path must not be empty");
+            return 0;
+        }
+        if (params->refine_latent_path && params->latent_output_path &&
+            h3_paths_alias(params->refine_latent_path,
+                           params->latent_output_path)) {
+            h3_set_error(ctx,
+                "refined latent output must not alias the imported latent");
+            return 0;
+        }
     } else if (params->restart_steps || params->restart_schedule_steps ||
-               params->freeze_audio) {
-        h3_set_error(ctx, "restart options require --refine-video");
+               params->freeze_audio || params->refine_latent_path) {
+        h3_set_error(ctx,
+            "restart options and --refine-latent require --refine-video");
         return 0;
     }
     if (!h3_video_settings_valid(params->video_codec, params->video_preset,
@@ -1674,11 +1691,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_video_latent source_video = {0};
         h3_audio_latent source_audio = {0};
         int expected_samples = h3_restart_audio_samples(temporal.frame_count);
-        if (!h3_ffmpeg_read_video_f32_bicubic(params->refine_video_path,
-                params->width, params->height, temporal.frame_count,
-                &source_rgb, &source_frames, detail, sizeof(detail)) ||
-            source_frames != temporal.frame_count ||
-            !h3_ffmpeg_read_audio_f32(params->refine_video_path,
+        if (!h3_ffmpeg_read_audio_f32(params->refine_video_path,
                 expected_samples, 1, &source_pcm, &source_samples,
                 detail, sizeof(detail)) ||
             !h3_restart_audio_source_valid(source_samples) ||
@@ -1690,11 +1703,30 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         source_samples = expected_samples;
-        if (!h3_video_vae_encode_ref2va_temporal(
-                vae_path, "h3_shaders.metal", source_rgb,
-                source_frames, params->height, params->width,
-                h3_video_encoder_progress_bridge, &progress, &source_video,
-                detail, sizeof(detail)) ||
+        int video_source_ok;
+        if (params->refine_latent_path) {
+            video_source_ok = h3_video_latent_file_read(
+                params->refine_latent_path, &source_video,
+                detail, sizeof(detail));
+            if (video_source_ok)
+                fprintf(stderr,
+                    "h3: imported clean restart latent %s shape=1x24x%dx%dx%d; "
+                    "skipped RGB resize and VideoVAE encode\n",
+                    params->refine_latent_path, source_video.time,
+                    source_video.height, source_video.width);
+        } else {
+            video_source_ok = h3_ffmpeg_read_video_f32_bicubic(
+                params->refine_video_path, params->width, params->height,
+                temporal.frame_count, &source_rgb, &source_frames,
+                detail, sizeof(detail)) &&
+                source_frames == temporal.frame_count &&
+                h3_video_vae_encode_ref2va_temporal(
+                    vae_path, "h3_shaders.metal", source_rgb,
+                    source_frames, params->height, params->width,
+                    h3_video_encoder_progress_bridge, &progress, &source_video,
+                    detail, sizeof(detail));
+        }
+        if (!video_source_ok ||
             !h3_audio_vae_encode(audio_vae_path, "h3_shaders.metal", source_pcm,
                 source_samples, h3_audio_vae_progress_bridge, &progress,
                 &source_audio, detail, sizeof(detail)) ||
@@ -1704,7 +1736,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             free(source_rgb); free(source_pcm); h3_video_latent_free(&source_video);
             h3_audio_latent_free(&source_audio);
             h3_set_error(ctx, "%s", detail[0] ? detail :
-                         "restart input VAE geometry mismatch");
+                         "restart input latent or audio geometry mismatch");
             goto cleanup;
         }
         memcpy(video, source_video.values, video_count * sizeof(*video));
@@ -1759,6 +1791,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->latent_output_path) {
+        if (!h3_video_latent_file_write(
+                params->latent_output_path, video, temporal.video_t,
+                latent_h, latent_w, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        fprintf(stderr, "h3: wrote clean video latent %s shape=1x24x%dx%dx%d\n",
+                params->latent_output_path, temporal.video_t,
+                latent_h, latent_w);
+    }
     if (!refine) h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!refine && !h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,

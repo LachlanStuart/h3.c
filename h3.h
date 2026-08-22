@@ -103,10 +103,18 @@ typedef struct {
     /* Optionally emit a second FFV1/Matroska diagnostic from these exact
      * generated RGB and PCM buffers. Must differ from output_path. */
     const char *lossless_output_path;
+    /* Optional normalized F32 [24,T,H,W] latent written after denoising and
+     * before VideoVAE decode. The stable file format is documented by
+     * h3_latent_io.h. */
+    const char *latent_output_path;
     /* Experimental RepLDM/Restart second pass. The input MP4 is decoded,
      * re-encoded by the VAEs, video-only forward noised, then refined over a
      * suffix of a normal serving schedule. */
     const char *refine_video_path;
+    /* Optional clean normalized high-resolution video latent. When present,
+     * restart refinement skips RGB decode/resize/VideoVAE encode entirely;
+     * refine_video_path still supplies the clean frozen audio and mux source. */
+    const char *refine_latent_path;
     int restart_steps;
     int restart_schedule_steps;
     int freeze_audio;
