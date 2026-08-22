@@ -340,6 +340,16 @@ prompt, seed, resolution, frame count, and step count.
   factor without resizing the generated video or the encoded terminal image.
 - `--frames-dir DIR` writes final callback frames as PPM files. Intermediate
   `--show` previews are not written there.
+- H.264 output defaults to `--video-preset slow --video-crf 18` rather than
+  the old `fast` preset. These change only the final FFmpeg encoding; they do
+  not change the decoded H3 RGB frames, sampler, VAE, or DiT trajectory.
+  `--video-preset` accepts `ultrafast`, `superfast`, `veryfast`, `faster`,
+  `fast`, `medium`, `slow`, `slower`, or `veryslow`; `--video-crf` accepts
+  0 through 51.
+- `--lossless-output PATH.mkv` writes a second, FFV1 RGB + F32 PCM Matroska
+  file from the same generated frame and audio buffers as `-o`. It is a
+  diagnostic artifact, not a delivery format. `--video-codec ffv1 -o
+  PATH.mkv` selects only that lossless path. FFV1 ignores preset and CRF.
 - `-o ''` disables MP4 encoding; combine it with `--frames-dir` when FFmpeg is
   unavailable.
 - `--profile` reports phase wall time, Metal encoding/wait time, peak live
@@ -353,6 +363,24 @@ For example:
   --layers 45 --reuse 2 --frames-dir outputs/hummingbird-frames \
   -o ''
 ```
+
+To separate generated artifacts from video encoding artifacts in one run,
+write all three forms together. `frames/` contains pre-FFmpeg PPMs, `slow.mp4`
+is the normal delivery encode, and `lossless.mkv` retains exact RGB frames and
+F32 PCM (subject to the FFV1/Matroska support in the local FFmpeg build):
+
+```sh
+./h3 -d ./MiniMax-H3 -p "..." --width 608 --height 352 --frames 260 \
+  --steps 10 --sampler res --frames-dir output/frames \
+  -o output/slow.mp4 --video-preset slow --video-crf 18 \
+  --lossless-output output/lossless.mkv
+```
+
+Compare the same frame number from a PPM and the lossless MKV first. If they
+match while the MP4 differs, the discrepancy is encoding-stage only; if the
+PPM already contains it, investigate H3/VAE output instead. The lossless
+Matroska uses FFV1 video and PCM F32 audio, so some consumer video apps may
+not play it even though FFmpeg can decode it.
 
 ### 8. Add image, video, and audio references
 

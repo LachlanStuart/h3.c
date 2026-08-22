@@ -524,6 +524,32 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "unknown sampler");
         return 0;
     }
+    if (!h3_video_settings_valid(params->video_codec, params->video_preset,
+                                 params->video_crf)) {
+        h3_set_error(ctx, "invalid video codec, preset, or CRF");
+        return 0;
+    }
+    if (params->video_codec == H3_VIDEO_CODEC_FFV1 &&
+        params->output_path && *params->output_path) {
+        size_t length = strlen(params->output_path);
+        if (length < 4 || strcmp(params->output_path + length - 4, ".mkv")) {
+            h3_set_error(ctx, "FFV1 output must use a .mkv path");
+            return 0;
+        }
+    }
+    if (params->lossless_output_path && *params->lossless_output_path) {
+        size_t length = strlen(params->lossless_output_path);
+        if (length < 4 || strcmp(params->lossless_output_path + length - 4,
+                                 ".mkv")) {
+            h3_set_error(ctx, "lossless output must use a .mkv path");
+            return 0;
+        }
+        if (params->output_path && *params->output_path &&
+            !strcmp(params->output_path, params->lossless_output_path)) {
+            h3_set_error(ctx, "lossless output must differ from output path");
+            return 0;
+        }
+    }
     if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
         h3_set_error(ctx, "denoise reuse must be in [1, 3]");
         return 0;
@@ -1699,12 +1725,27 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         if (!h3_ffmpeg_write_av_rgb24_f32(
                 params->output_path, rgb8, frames.frames, output_width,
                 output_height, H3_FPS, waveform.pcm, waveform.samples,
-                waveform.channels, waveform.sample_rate,
+                waveform.channels, waveform.sample_rate, params->video_codec,
+                params->video_preset, params->video_crf,
                 detail, sizeof(detail))) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
         h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
+    }
+    if (params->lossless_output_path && *params->lossless_output_path) {
+        h3_progress_emit(&progress, "FFmpeg lossless", 0, frames.frames);
+        if (!h3_ffmpeg_write_av_rgb24_f32(
+                params->lossless_output_path, rgb8, frames.frames,
+                output_width, output_height, H3_FPS, waveform.pcm,
+                waveform.samples, waveform.channels, waveform.sample_rate,
+                H3_VIDEO_CODEC_FFV1, H3_VIDEO_PRESET_SLOW, 18,
+                detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        h3_progress_emit(&progress, "FFmpeg lossless", frames.frames,
+                         frames.frames);
     }
     result = calloc(1, sizeof(*result));
     if (!result) {

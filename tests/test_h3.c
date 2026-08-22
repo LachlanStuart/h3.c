@@ -262,6 +262,9 @@ static void test_temporal_and_canvas(void) {
 static void test_schedule(void) {
     h3_params defaults = H3_PARAMS_DEFAULT;
     CHECK(defaults.steps == 20);
+    CHECK(defaults.video_codec == H3_VIDEO_CODEC_H264);
+    CHECK(defaults.video_preset == H3_VIDEO_PRESET_SLOW);
+    CHECK(defaults.video_crf == 18);
     CHECK(defaults.use_reference_rope == 0);
 
     h3_sigma_schedule schedule;

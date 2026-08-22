@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 
 static void die(const char *message) {
@@ -14,6 +15,35 @@ static void die(const char *message) {
 int main(int argc, char **argv) {
     enum { WIDTH = 32, HEIGHT = 32, FRAMES = 8, SAMPLES = 64000 };
     const char *path = argc > 1 ? argv[1] : "/tmp/h3-av-mux-test.mp4";
+    const char *lossless_path = "/tmp/h3-av-mux-lossless-test.mkv";
+    h3_ffmpeg_video_plan plan;
+    if (strcmp(h3_video_preset_name(H3_VIDEO_PRESET_SLOW), "slow") ||
+        strcmp(h3_video_preset_name(H3_VIDEO_PRESET_FAST), "fast") ||
+        h3_video_preset_name((h3_video_preset)-1) ||
+        !h3_video_settings_valid(H3_VIDEO_CODEC_H264,
+                                 H3_VIDEO_PRESET_SLOW, 18) ||
+        !h3_video_settings_valid(H3_VIDEO_CODEC_FFV1,
+                                 H3_VIDEO_PRESET_VERYSLOW, 51) ||
+        h3_video_settings_valid(H3_VIDEO_CODEC_H264,
+                                H3_VIDEO_PRESET_SLOW, 52))
+        die("video settings did not validate default and override values");
+    if (!h3_ffmpeg_video_plan_build(H3_VIDEO_CODEC_H264,
+                                    H3_VIDEO_PRESET_SLOW, 18, &plan) ||
+        strcmp(plan.video_codec, "libx264") || strcmp(plan.preset, "slow") ||
+        strcmp(plan.crf, "18") || strcmp(plan.pixel_format, "yuv420p") ||
+        strcmp(plan.audio_codec, "aac") || plan.container)
+        die("default H.264 FFmpeg argument plan is incorrect");
+    if (!h3_ffmpeg_video_plan_build(H3_VIDEO_CODEC_H264,
+                                    H3_VIDEO_PRESET_FAST, 27, &plan) ||
+        strcmp(plan.preset, "fast") || strcmp(plan.crf, "27"))
+        die("overridden H.264 FFmpeg argument plan is incorrect");
+    if (!h3_ffmpeg_video_plan_build(H3_VIDEO_CODEC_FFV1,
+                                    H3_VIDEO_PRESET_FAST, 27, &plan) ||
+        strcmp(plan.video_codec, "ffv1") || plan.preset || plan.crf[0] ||
+        strcmp(plan.pixel_format, "rgb24") ||
+        strcmp(plan.audio_codec, "pcm_f32le") ||
+        strcmp(plan.container, "matroska"))
+        die("lossless FFmpeg argument plan is incorrect");
     uint8_t *rgb = malloc(WIDTH * HEIGHT * 3 * FRAMES);
     float *pcm = malloc(2 * SAMPLES * sizeof(*pcm));
     if (!rgb || !pcm) die("out of memory creating mux fixture");
@@ -33,8 +63,16 @@ int main(int argc, char **argv) {
                              (float)(220 + channel * 110) * (float)sample /
                              32000.0f);
     char error[512];
+    if (h3_ffmpeg_write_av_rgb24_f32(
+            "/tmp/h3-lossless-wrong-container.mp4", rgb, FRAMES,
+            WIDTH, HEIGHT, 24, pcm, SAMPLES, 2, 32000,
+            H3_VIDEO_CODEC_FFV1, H3_VIDEO_PRESET_SLOW, 18,
+            error, sizeof(error)))
+        die("FFV1 accepted a non-Matroska output path");
     if (!h3_ffmpeg_write_av_rgb24_f32(path, rgb, FRAMES, WIDTH, HEIGHT, 24,
                                       pcm, SAMPLES, 2, 32000,
+                                      H3_VIDEO_CODEC_H264,
+                                      H3_VIDEO_PRESET_SLOW, 18,
                                       error, sizeof(error))) die(error);
     struct stat status;
     if (stat(path, &status) != 0 || status.st_size < 1000)
@@ -99,6 +137,42 @@ int main(int argc, char **argv) {
     }
     if (left_energy < 1.0 || right_energy < 1.0)
         die("decoded FFmpeg audio has no stereo signal");
+    free(decoded_pcm);
+    decoded_pcm = NULL;
+
+    /* The diagnostic path gets the exact same raw RGB and F32 PCM buffers,
+     * but its FFV1/Matroska encoding must preserve those bytes. */
+    if (!h3_ffmpeg_write_av_rgb24_f32(
+            lossless_path, rgb, FRAMES, WIDTH, HEIGHT, 24,
+            pcm, SAMPLES, 2, 32000, H3_VIDEO_CODEC_FFV1,
+            H3_VIDEO_PRESET_FAST, 37, error, sizeof(error))) die(error);
+    decoded = NULL;
+    if (!h3_ffmpeg_read_video_f32(lossless_path, WIDTH, HEIGHT, FRAMES,
+                                  &decoded, &decoded_frames,
+                                  error, sizeof(error))) die(error);
+    if (decoded_frames != 5)
+        die("lossless FFmpeg video input did not align to 5+17k frames");
+    for (int frame = 0; frame < decoded_frames; frame++)
+        for (int channel = 0; channel < 3; channel++)
+            for (int y = 0; y < HEIGHT; y++)
+                for (int x = 0; x < WIDTH; x++) {
+                    size_t pixel = (size_t)y * WIDTH + (size_t)x;
+                    size_t input = ((size_t)frame * HEIGHT * WIDTH + pixel) * 3 +
+                                   (size_t)channel;
+                    size_t output = ((size_t)channel * decoded_frames +
+                                     (size_t)frame) * WIDTH * HEIGHT + pixel;
+                    float expected = (float)rgb[input] / 255.0f;
+                    if (fabsf(decoded[output] - expected) > 1e-7f)
+                        die("lossless FFV1 did not preserve RGB pixels");
+                }
+    free(decoded);
+    decoded = NULL;
+    if (!h3_ffmpeg_read_audio_f32(lossless_path, SAMPLES, 1,
+                                  &decoded_pcm, &decoded_samples,
+                                  error, sizeof(error))) die(error);
+    if (decoded_samples != SAMPLES ||
+        memcmp(decoded_pcm, pcm, (size_t)2 * SAMPLES * sizeof(*pcm)))
+        die("lossless Matroska did not preserve F32 PCM");
     free(decoded_pcm);
     printf("ok: concurrent FFmpeg video/PCM pipes created %s (%lld bytes)\n",
            path, (long long)status.st_size);

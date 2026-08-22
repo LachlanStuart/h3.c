@@ -1,5 +1,6 @@
 #include "h3.h"
 #include "h3_cli.h"
+#include "h3_ffmpeg.h"
 #include "h3_host.h"
 #include "h3_terminal.h"
 
@@ -21,7 +22,7 @@ static void usage(const char *program) {
         "Options:\n"
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
-        "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
+        "  -o, --output PATH      Output media (default: outputs/h3.mp4)\n"
         "      --width N          Output width (default: 864)\n"
         "      --height N         Output height (default: 480)\n"
         "      --render-width N   Lower internal model width (optional)\n"
@@ -30,6 +31,10 @@ static void usage(const char *program) {
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
         "      --steps N          Denoising passes (default: 20)\n"
         "      --sampler S        Sampler: res (default) or euler\n"
+        "      --video-codec C    Video codec: h264 (default) or ffv1 (.mkv)\n"
+        "      --video-preset P  libx264 preset (default: slow)\n"
+        "      --video-crf N     libx264 CRF 0..51 (default: 18)\n"
+        "      --lossless-output PATH  Also write FFV1 RGB/PCM Matroska (.mkv)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
@@ -80,6 +85,25 @@ static h3_sampler parse_sampler(const char *value) {
     if (!strcmp(value, "res")) return H3_SAMPLER_RES;
     if (!strcmp(value, "euler")) return H3_SAMPLER_EULER;
     fprintf(stderr, "h3: sampler must be res or euler\n");
+    exit(2);
+}
+
+static h3_video_codec parse_video_codec(const char *value) {
+    if (!strcmp(value, "h264")) return H3_VIDEO_CODEC_H264;
+    if (!strcmp(value, "ffv1")) return H3_VIDEO_CODEC_FFV1;
+    fprintf(stderr, "h3: video codec must be h264 or ffv1\n");
+    exit(2);
+}
+
+static h3_video_preset parse_video_preset(const char *value) {
+    for (int preset = H3_VIDEO_PRESET_ULTRAFAST;
+         preset <= H3_VIDEO_PRESET_VERYSLOW; preset++) {
+        if (!strcmp(value, h3_video_preset_name((h3_video_preset)preset)))
+            return (h3_video_preset)preset;
+    }
+    fprintf(stderr,
+        "h3: video preset must be ultrafast, superfast, veryfast, faster, "
+        "fast, medium, slow, slower, or veryslow\n");
     exit(2);
 }
 
@@ -253,6 +277,8 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_SAMPLER, OPT_REUSE,
+           OPT_VIDEO_CODEC, OPT_VIDEO_PRESET, OPT_VIDEO_CRF,
+           OPT_LOSSLESS_OUTPUT,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -286,6 +312,10 @@ int main(int argc, char **argv) {
         {"seconds", required_argument, NULL, OPT_SECONDS},
         {"steps", required_argument, NULL, OPT_STEPS},
         {"sampler", required_argument, NULL, OPT_SAMPLER},
+        {"video-codec", required_argument, NULL, OPT_VIDEO_CODEC},
+        {"video-preset", required_argument, NULL, OPT_VIDEO_PRESET},
+        {"video-crf", required_argument, NULL, OPT_VIDEO_CRF},
+        {"lossless-output", required_argument, NULL, OPT_LOSSLESS_OUTPUT},
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
@@ -372,6 +402,22 @@ int main(int argc, char **argv) {
                 break;
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
             case OPT_SAMPLER: params.sampler = parse_sampler(optarg); break;
+            case OPT_VIDEO_CODEC:
+                params.video_codec = parse_video_codec(optarg);
+                break;
+            case OPT_VIDEO_PRESET:
+                params.video_preset = parse_video_preset(optarg);
+                break;
+            case OPT_VIDEO_CRF:
+                params.video_crf = parse_int(optarg, "video CRF");
+                if (params.video_crf > 51) {
+                    fprintf(stderr, "h3: video CRF must be in [0, 51]\n");
+                    return 2;
+                }
+                break;
+            case OPT_LOSSLESS_OUTPUT:
+                params.lossless_output_path = optarg;
+                break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;

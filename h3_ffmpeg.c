@@ -24,6 +24,47 @@ static const char *ffprobe_program(void) {
     return override && *override ? override : "ffprobe";
 }
 
+const char *h3_video_preset_name(h3_video_preset preset) {
+    static const char *const names[] = {
+        "ultrafast", "superfast", "veryfast", "faster", "fast",
+        "medium", "slow", "slower", "veryslow"
+    };
+    if (preset < H3_VIDEO_PRESET_ULTRAFAST ||
+        preset > H3_VIDEO_PRESET_VERYSLOW) return NULL;
+    return names[preset];
+}
+
+int h3_video_settings_valid(h3_video_codec codec, h3_video_preset preset,
+                            int crf) {
+    return (codec == H3_VIDEO_CODEC_H264 || codec == H3_VIDEO_CODEC_FFV1) &&
+           h3_video_preset_name(preset) != NULL && crf >= 0 && crf <= 51;
+}
+
+int h3_ffmpeg_video_plan_build(h3_video_codec codec,
+                               h3_video_preset preset, int crf,
+                               h3_ffmpeg_video_plan *plan) {
+    if (!plan || !h3_video_settings_valid(codec, preset, crf)) return 0;
+    memset(plan, 0, sizeof(*plan));
+    if (codec == H3_VIDEO_CODEC_H264) {
+        plan->video_codec = "libx264";
+        plan->preset = h3_video_preset_name(preset);
+        plan->pixel_format = "yuv420p";
+        plan->audio_codec = "aac";
+        snprintf(plan->crf, sizeof(plan->crf), "%d", crf);
+    } else {
+        plan->video_codec = "ffv1";
+        plan->pixel_format = "rgb24";
+        plan->audio_codec = "pcm_f32le";
+        plan->container = "matroska";
+    }
+    return 1;
+}
+
+static int has_mkv_extension(const char *path) {
+    size_t length = path ? strlen(path) : 0;
+    return length >= 4 && !strcmp(path + length - 4, ".mkv");
+}
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -506,10 +547,13 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
 
 int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
                           int frame_count, int width, int height, int fps,
+                          h3_video_codec codec, h3_video_preset preset, int crf,
                           char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!path || !*path || !frames || frame_count < 1 || width < 2 ||
-        height < 2 || fps < 1 || width % 2 || height % 2) {
+        height < 2 || fps < 1 || width % 2 || height % 2 ||
+        !h3_video_settings_valid(codec, preset, crf) ||
+        (codec == H3_VIDEO_CODEC_FFV1 && !has_mkv_extension(path))) {
         fail(error, error_size, "invalid FFmpeg RGB output arguments");
         return 0;
     }
@@ -528,14 +572,33 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
     char size[64], rate[32];
     snprintf(size, sizeof(size), "%dx%d", width, height);
     snprintf(rate, sizeof(rate), "%d", fps);
-    char *arguments[] = {
+    h3_ffmpeg_video_plan plan;
+    if (!h3_ffmpeg_video_plan_build(codec, preset, crf, &plan)) {
+        fail(error, error_size, "invalid FFmpeg video settings");
+        close(stream[0]);
+        close(stream[1]);
+        return 0;
+    }
+    char *h264_arguments[] = {
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", size, "-framerate", rate,
-        "-i", "pipe:0", "-an", "-c:v", "libx264",
-        "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-i", "pipe:0", "-an", "-c:v", (char *)plan.video_codec,
+        "-preset", (char *)plan.preset, "-crf", plan.crf,
+        "-pix_fmt", (char *)plan.pixel_format,
         "-movflags", "+faststart", (char *)path, NULL
     };
+    char *ffv1_arguments[] = {
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", size, "-framerate", rate,
+        "-i", "pipe:0", "-an", "-c:v", (char *)plan.video_codec,
+        "-level", "3", "-g", "1", "-pix_fmt", (char *)plan.pixel_format,
+        "-f", (char *)plan.container,
+        (char *)path, NULL
+    };
+    char **arguments = codec == H3_VIDEO_CODEC_FFV1 ?
+        ffv1_arguments : h264_arguments;
     posix_spawn_file_actions_t actions;
     int code = posix_spawn_file_actions_init(&actions);
     if (!code) code = posix_spawn_file_actions_adddup2(&actions, stream[0], STDIN_FILENO);
@@ -614,11 +677,15 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
                                  int frame_count, int width, int height,
                                  int fps, const float *pcm, int samples,
                                  int channels, int sample_rate,
+                                 h3_video_codec codec,
+                                 h3_video_preset preset, int crf,
                                  char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!path || !*path || !frames || frame_count < 1 || width < 2 ||
         height < 2 || fps < 1 || width % 2 || height % 2 || !pcm ||
-        samples < 1 || channels < 1 || sample_rate < 1) {
+        samples < 1 || channels < 1 || sample_rate < 1 ||
+        !h3_video_settings_valid(codec, preset, crf) ||
+        (codec == H3_VIDEO_CODEC_FFV1 && !has_mkv_extension(path))) {
         fail(error, error_size, "invalid FFmpeg A/V output arguments");
         return 0;
     }
@@ -664,7 +731,15 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
     snprintf(audio_rate, sizeof(audio_rate), "%d", sample_rate);
     snprintf(audio_channels, sizeof(audio_channels), "%d", channels);
     snprintf(audio_input, sizeof(audio_input), "pipe:%d", audio_target);
-    char *arguments[] = {
+    h3_ffmpeg_video_plan plan;
+    if (!h3_ffmpeg_video_plan_build(codec, preset, crf, &plan)) {
+        fail(error, error_size, "invalid FFmpeg video settings");
+        close(video_pipe[0]); close(video_pipe[1]);
+        close(audio_pipe[0]); close(audio_pipe[1]);
+        free(interleaved);
+        return 0;
+    }
+    char *h264_arguments[] = {
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", size, "-framerate", rate,
@@ -672,10 +747,26 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         "-f", "f32le", "-ar", audio_rate, "-ac", audio_channels,
         "-i", audio_input,
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-c:v", (char *)plan.video_codec, "-preset", (char *)plan.preset,
+        "-crf", plan.crf, "-pix_fmt", (char *)plan.pixel_format,
+        "-c:a", (char *)plan.audio_codec, "-b:a", "192k",
         "-movflags", "+faststart", (char *)path, NULL
     };
+    char *ffv1_arguments[] = {
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", size, "-framerate", rate,
+        "-i", "pipe:0",
+        "-f", "f32le", "-ar", audio_rate, "-ac", audio_channels,
+        "-i", audio_input,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", (char *)plan.video_codec, "-level", "3", "-g", "1",
+        "-pix_fmt", (char *)plan.pixel_format,
+        "-c:a", (char *)plan.audio_codec, "-f", (char *)plan.container,
+        (char *)path, NULL
+    };
+    char **arguments = codec == H3_VIDEO_CODEC_FFV1 ?
+        ffv1_arguments : h264_arguments;
     posix_spawn_file_actions_t actions;
     int code = posix_spawn_file_actions_init(&actions);
     if (!code) code = posix_spawn_file_actions_adddup2(

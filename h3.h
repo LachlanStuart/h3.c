@@ -51,6 +51,28 @@ typedef enum {
     H3_SAMPLER_EULER = 1
 } h3_sampler;
 
+/* H.264 is the portable delivery format. FFV1 is an RGB lossless diagnostic
+ * format and must be written to a Matroska (.mkv) container. */
+typedef enum {
+    H3_VIDEO_CODEC_H264 = 0,
+    H3_VIDEO_CODEC_FFV1 = 1
+} h3_video_codec;
+
+/* These names map to libx264's documented preset values. They are an enum
+ * rather than caller-supplied FFmpeg arguments so process spawning remains
+ * fixed and safe. */
+typedef enum {
+    H3_VIDEO_PRESET_ULTRAFAST = 0,
+    H3_VIDEO_PRESET_SUPERFAST,
+    H3_VIDEO_PRESET_VERYFAST,
+    H3_VIDEO_PRESET_FASTER,
+    H3_VIDEO_PRESET_FAST,
+    H3_VIDEO_PRESET_MEDIUM,
+    H3_VIDEO_PRESET_SLOW,
+    H3_VIDEO_PRESET_SLOWER,
+    H3_VIDEO_PRESET_VERYSLOW
+} h3_video_preset;
+
 typedef struct {
     int width;
     int height;
@@ -75,6 +97,13 @@ typedef struct {
     h3_sampler sampler;
     uint64_t seed;
     const char *output_path;
+    /* Optionally emit a second FFV1/Matroska diagnostic from these exact
+     * generated RGB and PCM buffers. Must differ from output_path. */
+    const char *lossless_output_path;
+    h3_video_codec video_codec;
+    h3_video_preset video_preset;
+    /* libx264 CRF in [0, 51]. Ignored for FFV1. */
+    int video_crf;
     const char *first_frame;
     const char *last_frame;
     const h3_reference *references;
@@ -135,9 +164,14 @@ typedef struct {
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
-    H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    H3_SAMPLER_RES, UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    .width = H3_DEFAULT_WIDTH, .height = H3_DEFAULT_HEIGHT, \
+    .frames = H3_DEFAULT_FRAMES, .steps = H3_DEFAULT_STEPS, \
+    .sampler = H3_SAMPLER_RES, .seed = UINT64_C(42), \
+    .video_codec = H3_VIDEO_CODEC_H264, \
+    .video_preset = H3_VIDEO_PRESET_SLOW, .video_crf = 18, \
+    .reference_image_size = H3_REFERENCE_IMAGE_MATCH, \
+    .denoise_reuse = 1, .dit_layers = H3_DEFAULT_DIT_LAYERS, \
+    .core_reuse = 1 \
 }
 
 typedef struct {
