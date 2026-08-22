@@ -1370,6 +1370,8 @@ int h3_video_vae_decode(const char *weight_directory,
     vae.output_frames = latent_time == 2 ? 5 : FIRST_CHUNK_FRAMES;
     vae.patches = (uint32_t)(CHUNK_LATENT_TIME * latent_height * latent_width);
     vae.sequence = vae.patches + SUFFIX;
+    vae.fp16 = !(getenv("H3_VIDEO_DECODER_FP16") &&
+                 !strcmp(getenv("H3_VIDEO_DECODER_FP16"), "0"));
     float latent_mean[LATENT_CHANNELS], latent_std[LATENT_CHANNELS];
     if (!load_latent_normalization(weight_directory, latent_mean, latent_std,
                                    error, error_size)) return 0;
@@ -1397,14 +1399,32 @@ int h3_video_vae_decode(const char *weight_directory,
     vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu)
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");
-    int ok = vae.gpu &&
-        load_input_weights(&vae, error, error_size) &&
-        prepare_input(&vae, normalized_latent, latent_mean, latent_std,
-                      error, error_size) &&
-        prepare_rope(&vae, error, error_size) &&
-        allocate_activations(&vae, error, error_size) &&
-        run_decoder(&vae, progress, progress_opaque, error, error_size) &&
-        unpack_frames(&vae, output, error, error_size);
+    int ok;
+    if (vae.fp16) {
+        /* The one-tile API historically streamed blocks. Native FP16 keeps
+         * the complete decoder resident so all weights can be converted once
+         * and every block shares the same no-host-transfer execution path. */
+        ok = vae.gpu &&
+            load_resident_weights(&vae, progress, progress_opaque,
+                                  error, error_size) &&
+            convert_resident_weights_fp16(&vae, error, error_size) &&
+            prepare_input(&vae, normalized_latent, latent_mean, latent_std,
+                          error, error_size) &&
+            prepare_rope(&vae, error, error_size) &&
+            allocate_activations(&vae, error, error_size) &&
+            run_resident_tile(&vae, progress, progress_opaque,
+                              error, error_size) &&
+            unpack_frames(&vae, output, error, error_size);
+    } else {
+        ok = vae.gpu &&
+            load_input_weights(&vae, error, error_size) &&
+            prepare_input(&vae, normalized_latent, latent_mean, latent_std,
+                          error, error_size) &&
+            prepare_rope(&vae, error, error_size) &&
+            allocate_activations(&vae, error, error_size) &&
+            run_decoder(&vae, progress, progress_opaque, error, error_size) &&
+            unpack_frames(&vae, output, error, error_size);
+    }
     if (!ok) h3_video_frames_free(output);
     cleanup(&vae);
     return ok;

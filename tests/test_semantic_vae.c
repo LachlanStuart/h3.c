@@ -145,6 +145,13 @@ int main(int argc, char **argv) {
                              &got, error, sizeof(error))) die(error);
     if (got.frames != FRAMES || got.height != HEIGHT || got.width != WIDTH)
         die("semantic VAE returned the wrong shape");
+    /* LATENT_T is seven, so this exercises h3_video_vae_decode's direct
+     * one-tile route rather than the two-token diagnostic or tiled decoder.
+     * The FP16 route has one resident-weight conversion and one decode
+     * submission; sequence packing is a compute kernel, never a blit. */
+    if (got.gpu_stats.submissions != 2 || got.gpu_stats.blit_copies != 0 ||
+        got.gpu_stats.host_tensor_reads != 1)
+        die("seven-token direct FP16 VAE violated its GPU transfer contract");
     double maximum = 0.0, scale = 0.0, square_error = 0.0, square_value = 0.0;
     for (int frame = 0; frame < FRAMES; frame++)
         for (int y = 0; y < HEIGHT; y++)
