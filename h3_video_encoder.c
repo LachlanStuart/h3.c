@@ -84,6 +84,16 @@ typedef struct {
     int *overlaps;
 } tile_axis;
 
+/* A tile forward is encoded into one Metal command buffer.  Scratch buffers
+ * therefore have to remain resident until that command buffer completes; the
+ * old per-layer submit made immediate frees safe, but also serialized every
+ * convolution on the host. */
+typedef struct {
+    h3_gpu_tensor **items;
+    size_t count;
+    size_t capacity;
+} tensor_arena;
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -102,6 +112,37 @@ static int gpu_op(encoder_context *encoder, int ok, char *error,
 static void free_tensor(h3_gpu_tensor **tensor) {
     h3_gpu_tensor_free(*tensor);
     *tensor = NULL;
+}
+
+static void tensor_arena_free(tensor_arena *arena) {
+    if (!arena) return;
+    for (size_t index = 0; index < arena->count; index++)
+        h3_gpu_tensor_free(arena->items[index]);
+    free(arena->items);
+    memset(arena, 0, sizeof(*arena));
+}
+
+static h3_gpu_tensor *tensor_arena_own(tensor_arena *arena,
+                                       h3_gpu_tensor *tensor) {
+    if (!tensor) return NULL;
+    if (arena->count == arena->capacity) {
+        size_t next = arena->capacity ? arena->capacity * 2 : 64;
+        h3_gpu_tensor **grown = realloc(arena->items,
+                                        next * sizeof(*grown));
+        if (!grown) {
+            h3_gpu_tensor_free(tensor);
+            return NULL;
+        }
+        arena->items = grown;
+        arena->capacity = next;
+    }
+    arena->items[arena->count++] = tensor;
+    return tensor;
+}
+
+static h3_gpu_tensor *tensor_arena_new_f32(tensor_arena *arena, h3_gpu *gpu,
+                                            size_t elements) {
+    return tensor_arena_own(arena, h3_gpu_tensor_new_f32(gpu, elements));
 }
 
 static void free_conv(encoder_conv *conv) {
@@ -389,6 +430,7 @@ static int conv_op(encoder_context *encoder, h3_gpu_tensor *output,
 }
 
 static h3_gpu_tensor *run_conv(encoder_context *encoder,
+                               tensor_arena *arena,
                                h3_gpu_tensor *input,
                                const encoder_conv *conv,
                                uint32_t depth, uint32_t height, uint32_t width,
@@ -404,34 +446,28 @@ static h3_gpu_tensor *run_conv(encoder_context *encoder,
     h3_gpu_tensor *padded = NULL;
     if (conv->depth_front || conv->height_before || conv->height_after ||
         conv->width_before || conv->width_after)
-        padded = h3_gpu_tensor_new_f32(
-            encoder->gpu, tensor_elements(padded_d, padded_h, padded_w,
-                                           conv->input_channels));
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(
-        encoder->gpu, tensor_elements(*output_depth, *output_height,
-                                      *output_width, conv->output_channels));
+        padded = tensor_arena_new_f32(
+            arena, encoder->gpu,
+            tensor_elements(padded_d, padded_h, padded_w,
+                            conv->input_channels));
+    h3_gpu_tensor *output = tensor_arena_new_f32(
+        arena, encoder->gpu,
+        tensor_elements(*output_depth, *output_height,
+                        *output_width, conv->output_channels));
     int ok = output && (!((conv->depth_front || conv->height_before ||
                            conv->height_after || conv->width_before ||
                            conv->width_after)) || padded);
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder convolution");
-    } else {
-        ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                    "begin visual encoder convolution") &&
-             conv_op(encoder, output, input, conv, depth, height, width, padded,
-                     error, error_size) &&
-             gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                    "submit visual encoder convolution");
-    }
-    h3_gpu_tensor_free(padded);
-    if (!ok) {
-        h3_gpu_tensor_free(output);
-        return NULL;
-    }
+    } else
+        ok = conv_op(encoder, output, input, conv, depth, height, width, padded,
+                     error, error_size);
+    if (!ok) return NULL;
     return output;
 }
 
 static h3_gpu_tensor *run_block(encoder_context *encoder,
+                                tensor_arena *arena,
                                 h3_gpu_tensor *input,
                                 const encoder_block *block, uint32_t depth,
                                 uint32_t height, uint32_t width,
@@ -444,23 +480,25 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
                                         input_channels);
     size_t pad2_count = tensor_elements(depth + 2, height + 2, width + 2,
                                         output_channels);
-    h3_gpu_tensor *norm1 = h3_gpu_tensor_new_f32(encoder->gpu, input_count);
-    h3_gpu_tensor *pad1 = h3_gpu_tensor_new_f32(encoder->gpu, pad1_count);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *norm2 = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *pad2 = h3_gpu_tensor_new_f32(encoder->gpu, pad2_count);
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
+    h3_gpu_tensor *norm1 = tensor_arena_new_f32(arena, encoder->gpu,
+                                                 input_count);
+    h3_gpu_tensor *pad1 = tensor_arena_new_f32(arena, encoder->gpu, pad1_count);
+    h3_gpu_tensor *hidden = tensor_arena_new_f32(arena, encoder->gpu,
+                                                  output_count);
+    h3_gpu_tensor *norm2 = tensor_arena_new_f32(arena, encoder->gpu,
+                                                 output_count);
+    h3_gpu_tensor *pad2 = tensor_arena_new_f32(arena, encoder->gpu, pad2_count);
+    h3_gpu_tensor *output = tensor_arena_new_f32(arena, encoder->gpu,
+                                                  output_count);
     h3_gpu_tensor *shortcut = block->has_shortcut ?
-        h3_gpu_tensor_new_f32(encoder->gpu, output_count) : NULL;
+        tensor_arena_new_f32(arena, encoder->gpu, output_count) : NULL;
     int ok = norm1 && pad1 && hidden && norm2 && pad2 && output &&
              (!block->has_shortcut || shortcut);
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder residual block");
         goto done;
     }
-    ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                "begin visual encoder residual block") &&
-         gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
+    ok = gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
              encoder->gpu, norm1, input, block->norm1.weight, block->norm1.bias,
              1, depth, height, width, input_channels, GROUPS, 1e-6f),
              error, error_size, "visual encoder group norm 1") &&
@@ -482,20 +520,8 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
         encoder->gpu, output, residual, output, 1.0f, 1.0f,
         (uint32_t)output_count), error, error_size,
         "visual encoder residual add");
-    if (ok) ok = gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                        "submit visual encoder residual block");
-
 done:
-    h3_gpu_tensor_free(norm1);
-    h3_gpu_tensor_free(pad1);
-    h3_gpu_tensor_free(hidden);
-    h3_gpu_tensor_free(norm2);
-    h3_gpu_tensor_free(pad2);
-    h3_gpu_tensor_free(shortcut);
-    if (!ok) {
-        h3_gpu_tensor_free(output);
-        return NULL;
-    }
+    if (!ok) return NULL;
     return output;
 }
 
@@ -522,73 +548,79 @@ static h3_gpu_tensor *encode_tile_quant(encoder_context *encoder,
                     normalized[destination++] =
                         (pixels[source] - mean[channel]) / deviation[channel];
                 }
-    h3_gpu_tensor *hidden = h3_gpu_tensor_from_f32(
-        encoder->gpu, normalized, pixel_count);
+    tensor_arena arena = {0};
+    h3_gpu_tensor *hidden = tensor_arena_own(
+        &arena, h3_gpu_tensor_from_f32(encoder->gpu, normalized, pixel_count));
     free(normalized);
     if (!hidden) {
         fail(error, error_size, "cannot allocate visual encoder pixels");
+        tensor_arena_free(&arena);
         return NULL;
     }
+    int began = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
+                       "begin visual encoder tile");
+    if (!began) {
+        tensor_arena_free(&arena);
+        return NULL;
+    }
+    h3_gpu_tensor *quant = NULL;
+    int ok = 1;
     uint32_t depth = (uint32_t)frames, h = (uint32_t)height, w = (uint32_t)width;
     uint32_t next_d, next_h, next_w;
-    h3_gpu_tensor *next = run_conv(encoder, hidden, &encoder->conv_in,
+    h3_gpu_tensor *next = run_conv(encoder, &arena, hidden, &encoder->conv_in,
                                    depth, h, w, &next_d, &next_h, &next_w,
                                    error, error_size);
-    free_tensor(&hidden);
     hidden = next;
-    if (!hidden) return NULL;
+    if (!hidden) goto done;
     depth = next_d; h = next_h; w = next_w;
     uint32_t previous = 128;
     for (int level = 0; level < LEVELS && hidden; level++) {
         uint32_t channels = level_channels[level];
         for (int block = 0; block < BLOCKS && hidden; block++) {
             uint32_t input_channels = block ? channels : previous;
-            next = run_block(encoder, hidden,
+            next = run_block(encoder, &arena, hidden,
                              &encoder->levels[level].blocks[block], depth, h, w,
                              input_channels, channels, error, error_size);
-            free_tensor(&hidden);
             hidden = next;
         }
         if (hidden && encoder->levels[level].has_downsample) {
-            next = run_conv(encoder, hidden,
+            next = run_conv(encoder, &arena, hidden,
                             &encoder->levels[level].downsample, depth, h, w,
                             &next_d, &next_h, &next_w, error, error_size);
-            free_tensor(&hidden);
             hidden = next;
             depth = next_d; h = next_h; w = next_w;
         }
         previous = channels;
     }
-    if (!hidden) return NULL;
+    if (!hidden) goto done;
 
     size_t hidden_count = tensor_elements(depth, h, w, 1024);
     size_t padded_count = tensor_elements(depth + 2, h + 2, w + 2, 1024);
     size_t moment_count = tensor_elements(depth, h, w, MOMENT_CHANNELS);
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_f32(encoder->gpu, hidden_count);
-    h3_gpu_tensor *padded = h3_gpu_tensor_new_f32(encoder->gpu, padded_count);
-    h3_gpu_tensor *moments = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
-    h3_gpu_tensor *quant = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
-    int ok = norm && padded && moments && quant;
+    h3_gpu_tensor *norm = tensor_arena_new_f32(&arena, encoder->gpu,
+                                                hidden_count);
+    h3_gpu_tensor *padded = tensor_arena_new_f32(&arena, encoder->gpu,
+                                                  padded_count);
+    h3_gpu_tensor *moments = tensor_arena_new_f32(&arena, encoder->gpu,
+                                                   moment_count);
+    quant = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
+    ok = norm && padded && moments && quant;
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder output");
     } else {
-        ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                    "begin visual encoder output") &&
-             gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
+        ok = gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
                  encoder->gpu, norm, hidden, encoder->norm_out.weight,
                  encoder->norm_out.bias, 1, depth, h, w, 1024, GROUPS, 1e-6f),
                  error, error_size, "visual encoder output norm") &&
              conv_op(encoder, moments, norm, &encoder->conv_out, depth, h, w,
                      padded, error, error_size) &&
              conv_op(encoder, quant, moments, &encoder->quant, depth, h, w,
-                     NULL, error, error_size) &&
-             gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                    "submit visual encoder output");
+                     NULL, error, error_size);
     }
-    free_tensor(&hidden);
-    h3_gpu_tensor_free(norm);
-    h3_gpu_tensor_free(padded);
-    h3_gpu_tensor_free(moments);
+done:
+    if (!gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
+                "submit visual encoder tile")) ok = 0;
+    tensor_arena_free(&arena);
     if (!ok) {
         h3_gpu_tensor_free(quant);
         return NULL;

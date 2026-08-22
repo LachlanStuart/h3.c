@@ -93,7 +93,9 @@ int main(int argc, char **argv) {
         die("native visual encoder exceeds MLX parity bound");
     int tiles = axis_tiles(height) * axis_tiles(width);
     if (got.gpu_stats.mps_conv_dispatches != (uint64_t)(34 * tiles) ||
-        got.gpu_stats.submissions != (uint64_t)(18 * tiles))
+        got.gpu_stats.submissions != (uint64_t)tiles ||
+        got.gpu_stats.host_tensor_reads != (uint64_t)tiles ||
+        got.gpu_stats.host_tensor_writes != 0)
         die("native visual encoder dispatch structure changed unexpectedly");
     h3_video_latent_free(&got);
     h3_st_free_header(&fixture);
