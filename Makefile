@@ -105,7 +105,8 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
-	h3_real_multimodal_text_test h3_real_ref_video_text_test
+	h3_real_multimodal_text_test h3_real_ref_video_text_test \
+	h3_semantic_vae_test
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -149,6 +150,12 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		./h3_real_video_encoder_test; \
 	else \
 		echo "skip: released visual encoder weights/fixture are not installed"; \
+	fi
+	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors && \
+	         test -f misc/fixtures/h3_real_video_vae_256x256x39_f32.safetensors; then \
+		./h3_semantic_vae_test --resident-preview MiniMax-H3; \
+	else \
+		echo "skip: resident video VAE progress fixture is not installed"; \
 	fi
 	@if test -f MiniMax-H3/Ref2VA/video_vae/source/model.safetensors && \
 	         test -f misc/fixtures/h3_real_video_encoder_video_22x64.safetensors; then \

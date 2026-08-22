@@ -422,6 +422,10 @@ python3 tools/fold_turbo_lora.py \
   --out ./MiniMax-H3-turbo/FL2VA/transformer
 ```
 
+The output directory must not already exist. The tool validates every adapter
+pair and target shape first, builds in a sibling staging directory, and only
+publishes the completed checkpoint after all patches pass their parity checks.
+
 Point `-d` at a model directory whose `FL2VA/transformer` contains the folded
 tree; everything else can be symlinked to the original snapshot. Sample with
 `--steps 5` or `--steps 6` and no other speed flags. The distilled schedule
@@ -566,9 +570,10 @@ same-cost spatial-RoPE adaptation described above; it remains a fast composition
 preview rather than a substitute for a 512- or 768-class final render.
 The video VAE defaults to a 256-pixel spatial tile and 64-pixel minimum
 overlap, matching the released checkpoint config. Set `H3_VAE_TILE_PIXELS`
-to a multiple of 16 from 256 through 512 to override the tile size for
+to a multiple of 16 from 256 through 320 to override the tile size for
 profiling. A value of 320 reproduces the previous automatic plan for the
-measured 576x1024 case.
+measured 576x1024 case; larger values are rejected because they can produce
+the grid/quilt artifact documented in PR #14.
 
 ### Weight residency and streamed prompt encoding
 

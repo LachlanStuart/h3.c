@@ -260,17 +260,32 @@ static void test_safetensors(void) {
     const char header_json[] =
         "{\"x\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]},"
         "\"scalar\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[24,26]}}";
-    uint64_t length = sizeof(header_json) - 1;
+    uint64_t json_length = sizeof(header_json) - 1;
+    uint64_t length = json_length;
     unsigned char prefix[8];
     for (unsigned index = 0; index < 8; index++) prefix[index] = (unsigned char)(length >> (8 * index));
     unsigned char payload[26] = {0};
     write_all(descriptor, prefix, sizeof(prefix));
     write_all(descriptor, header_json, (size_t)length);
     write_all(descriptor, payload, sizeof(payload));
-    CHECK(close(descriptor) == 0);
 
     h3_st_header header;
     char error[256];
+    CHECK(!h3_st_read_header(path, &header, error, sizeof(error)));
+    CHECK(strstr(error, "data section starts misaligned") != NULL);
+
+    CHECK(ftruncate(descriptor, 0) == 0);
+    CHECK(lseek(descriptor, 0, SEEK_SET) == 0);
+    length = (json_length + 7) & ~(uint64_t)7;
+    for (unsigned index = 0; index < 8; index++)
+        prefix[index] = (unsigned char)(length >> (8 * index));
+    unsigned char padding[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
+    write_all(descriptor, prefix, sizeof(prefix));
+    write_all(descriptor, header_json, (size_t)json_length);
+    write_all(descriptor, padding, (size_t)(length - json_length));
+    write_all(descriptor, payload, sizeof(payload));
+    CHECK(close(descriptor) == 0);
+
     CHECK(h3_st_read_header(path, &header, error, sizeof(error)));
     CHECK(header.tensor_count == 2);
     const h3_st_tensor *x = h3_st_find(&header, "x");

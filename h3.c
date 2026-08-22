@@ -665,6 +665,11 @@ static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "video VAE load", completed, total);
 }
 
+static void h3_vae_decode_progress_bridge(int completed, int total,
+                                          void *opaque) {
+    h3_progress_emit(opaque, "video VAE decode", completed, total);
+}
+
 static void h3_preview_vae_progress_bridge(int completed, int total,
                                            void *opaque) {
     h3_progress_emit(opaque, "preview VAE load", completed, total);
@@ -1614,15 +1619,22 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    int video_ok = preview_decoder ?
-        h3_video_vae_decoder_decode(
+    int video_ok;
+    if (preview_decoder) {
+        h3_video_vae_decoder_set_progress(
+            preview_decoder, h3_vae_decode_progress_bridge, &progress);
+        video_ok = h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
-            detail, sizeof(detail)) :
-        h3_video_vae_decode(
+            detail, sizeof(detail));
+        /* A cached decoder outlives this generation's stack progress state. */
+        h3_video_vae_decoder_set_progress(preview_decoder, NULL, NULL);
+    } else {
+        video_ok = h3_video_vae_decode(
             vae_path, "h3_shaders.metal", video,
             temporal.video_t, latent_h, latent_w,
             h3_vae_progress_bridge, &progress, &frames,
             detail, sizeof(detail));
+    }
     if (!video_ok) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;

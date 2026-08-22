@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static void usage(const char *program) {
     fprintf(stderr,
@@ -151,7 +152,17 @@ typedef struct {
     int display_failed;
     const char *frames_dir;
     int frame_write_failed;
+    struct timespec render_begin;
+    int render_clock_active;
 } cli_state;
+
+static double cli_elapsed(const cli_state *state) {
+    struct timespec now;
+    if (!state || !state->render_clock_active ||
+        clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
+    return (double)(now.tv_sec - state->render_begin.tv_sec) +
+        (double)(now.tv_nsec - state->render_begin.tv_nsec) / 1e9;
+}
 
 static int cli_progress(const char *phase, int completed, int total,
                         void *opaque) {
@@ -165,7 +176,8 @@ static int cli_progress(const char *phase, int completed, int total,
     state->completed = completed;
     state->total = total;
     state->active = completed < total;
-    fprintf(stderr, "\r%-25s %4d/%-4d", phase, completed, total);
+    fprintf(stderr, "\r[+%9.3fs] %-25s %4d/%-4d",
+            cli_elapsed(state), phase, completed, total);
     if (!state->active) fputc('\n', stderr);
     fflush(stderr);
     return 0;
@@ -210,12 +222,14 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
     }
     if (preview)
         fprintf(stderr,
-                "h3: denoise preview %d/%d, video frame %d/%d via %s\n",
+                "[+%9.3fs] h3: denoise preview %d/%d, "
+                "video frame %d/%d via %s\n", cli_elapsed(state),
                 frame->denoise_step + 1, frame->denoise_steps,
                 frame->frame_index + 1, frame->frame_count,
                 h3_terminal_protocol_name(state->terminal));
     else
-        fprintf(stderr, "h3: frame %d/%d via %s\n", frame->frame_index + 1,
+        fprintf(stderr, "[+%9.3fs] h3: frame %d/%d via %s\n",
+                cli_elapsed(state), frame->frame_index + 1,
                 frame->frame_count,
                 h3_terminal_protocol_name(state->terminal));
     char error[256];
@@ -313,7 +327,11 @@ int main(int argc, char **argv) {
     h3_params params = H3_PARAMS_DEFAULT;
     h3_reference references[12];
     size_t reference_count = 0;
-    cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0, NULL, 0};
+    cli_state cli = {
+        .completed = -1,
+        .total = -1,
+        .terminal = H3_TERM_NONE
+    };
     int show = 0;
     int profile = 0;
     int info = 0;
@@ -510,6 +528,8 @@ int main(int argc, char **argv) {
                 params.preview_denoise = 1;
             }
         }
+        cli.render_clock_active =
+            clock_gettime(CLOCK_MONOTONIC, &cli.render_begin) == 0;
         h3_result *result = h3_generate(ctx, prompt, &params);
         if (!result) {
             if (cli.active) fputc('\n', stderr);

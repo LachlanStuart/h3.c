@@ -42,7 +42,17 @@ typedef struct {
     int completed;
     int total;
     int display_failed;
+    struct timespec render_begin;
+    int render_clock_active;
 } h3_cli_state;
+
+static double cli_elapsed(const h3_cli_state *state) {
+    struct timespec now;
+    if (!state || !state->render_clock_active ||
+        clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
+    return (double)(now.tv_sec - state->render_begin.tv_sec) +
+        (double)(now.tv_nsec - state->render_begin.tv_nsec) / 1e9;
+}
 
 static char *skip_spaces(char *text) {
     while (*text && isspace((unsigned char)*text)) text++;
@@ -119,7 +129,8 @@ static int cli_progress(const char *phase, int completed, int total,
     state->completed = completed;
     state->total = total;
     state->progress_active = completed < total;
-    fprintf(stderr, "\r%-25s %4d/%-4d", phase, completed, total);
+    fprintf(stderr, "\r[+%9.3fs] %-25s %4d/%-4d",
+            cli_elapsed(state), phase, completed, total);
     if (!state->progress_active) fputc('\n', stderr);
     fflush(stderr);
     return 0;
@@ -134,7 +145,8 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
         state->progress_active = 0;
     }
     if (frame->denoise_step >= 0)
-        fprintf(stderr, "h3: preview %d/%d\n", frame->denoise_step + 1,
+        fprintf(stderr, "[+%9.3fs] h3: preview %d/%d\n",
+                cli_elapsed(state), frame->denoise_step + 1,
                 frame->denoise_steps);
     char error[256];
     if (!h3_terminal_display_rgb24(state->terminal, frame->rgb,
@@ -445,8 +457,9 @@ static int generate(h3_cli_state *state, const char *prompt) {
     state->display_failed = 0;
     printf("Seed: %" PRIu64 "\n", params.seed);
     fflush(stdout);
-    struct timespec begin, end;
-    clock_gettime(CLOCK_MONOTONIC, &begin);
+    struct timespec end;
+    state->render_clock_active =
+        clock_gettime(CLOCK_MONOTONIC, &state->render_begin) == 0;
     h3_result *result = h3_generate(state->ctx, prompt, &params);
     clock_gettime(CLOCK_MONOTONIC, &end);
     if (!result) {
@@ -455,8 +468,9 @@ static int generate(h3_cli_state *state, const char *prompt) {
         return 0;
     }
     h3_result_free(result);
-    double elapsed = (double)(end.tv_sec - begin.tv_sec) +
-        (double)(end.tv_nsec - begin.tv_nsec) / 1e9;
+    double elapsed = state->render_clock_active ?
+        (double)(end.tv_sec - state->render_begin.tv_sec) +
+        (double)(end.tv_nsec - state->render_begin.tv_nsec) / 1e9 : 0.0;
     snprintf(state->last_output, sizeof(state->last_output), "%s", output);
     free(state->last_prompt);
     state->last_prompt = strdup(prompt);

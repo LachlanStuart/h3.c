@@ -99,9 +99,9 @@ struct h3_video_vae_decoder {
     float latent_std[LATENT_CHANNELS];
     h3_video_vae_progress progress;
     void *progress_opaque;
-    /* Spatial tiles each run the full block stack, so a raw per-tile count
-     * would restart the bar once per tile; these carry the tile's place in
-     * the whole decode so the reported figure only moves forward. */
+    /* Every temporal-chunk/spatial-tile pair runs the full block stack. These
+     * carry that work item's place in the whole decode so progress never
+     * restarts between tiles or chunks. */
     int progress_tile;
     int progress_tiles;
 };
@@ -854,6 +854,8 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
         return 0;
     }
     int tile_count = decoder->y_axis.count * decoder->x_axis.count;
+    int chunk_count = selected_frame >= 0 ? 1 : (latent_time - 2) / 5;
+    int progress_chunk = selected_frame >= 0 ? 0 : chunk;
     float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
     if (!tiles) {
         fail(error, error_size, "out of memory retaining video VAE tiles");
@@ -861,10 +863,11 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
     }
     int frame_count = selected_frame >= 0 ? 1 : FIRST_CHUNK_FRAMES;
     int ok = 1;
-    decoder->progress_tiles = tile_count;
+    decoder->progress_tiles = chunk_count * tile_count;
     for (int tile_y = 0; tile_y < decoder->y_axis.count && ok; tile_y++)
         for (int tile_x = 0; tile_x < decoder->x_axis.count && ok; tile_x++) {
             decoder->progress_tile =
+                progress_chunk * tile_count +
                 tile_y * decoder->x_axis.count + tile_x;
             float *input = extract_latent_tile(
                 normalized_latent, latent_time, decoder->latent_h,

@@ -42,6 +42,25 @@ static void progress(int completed, int total, void *opaque) {
         fprintf(stderr, "semantic VAE: %d/%d blocks\n", completed, total);
 }
 
+typedef struct {
+    int previous;
+    int total;
+    int calls;
+    int invalid;
+} progress_trace;
+
+static void trace_progress(int completed, int total, void *opaque) {
+    progress_trace *trace = opaque;
+    if (!trace || completed <= trace->previous || total < completed ||
+        (trace->total && trace->total != total)) {
+        if (trace) trace->invalid = 1;
+        return;
+    }
+    trace->previous = completed;
+    trace->total = total;
+    trace->calls++;
+}
+
 static void test_resident_preview(const char *model_root) {
     enum {
         TEST_T = 12,
@@ -82,9 +101,14 @@ static void test_resident_preview(const char *model_root) {
         die("resident VAE preview differs from the complete decoder frame");
     h3_video_frames_free(&preview);
     h3_video_frames resident;
+    progress_trace trace = {0};
+    h3_video_vae_decoder_set_progress(decoder, trace_progress, &trace);
     if (!h3_video_vae_decoder_decode(
             decoder, latent, TEST_T, &resident,
             error, sizeof(error))) die(error);
+    h3_video_vae_decoder_set_progress(decoder, NULL, NULL);
+    if (trace.invalid || trace.calls < 2 || trace.previous != trace.total)
+        die("resident VAE progress did not advance across temporal chunks");
     if (resident.frames != ordinary.frames ||
         resident.height != ordinary.height ||
         resident.width != ordinary.width ||
