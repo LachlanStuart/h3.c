@@ -35,6 +35,10 @@ static void usage(const char *program) {
         "      --video-preset P  libx264 preset (default: slow)\n"
         "      --video-crf N     libx264 CRF 0..51 (default: 18)\n"
         "      --lossless-output PATH  Also write FFV1 RGB/PCM Matroska (.mkv)\n"
+        "      --refine-video PATH  Restart-refine this MP4 (experimental)\n"
+        "      --restart-steps N   Number of final schedule transitions\n"
+        "      --restart-schedule-steps M  Base serving schedule length\n"
+        "      --freeze-audio      Keep decoded input audio fixed in attention\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
@@ -279,6 +283,8 @@ int main(int argc, char **argv) {
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_SAMPLER, OPT_REUSE,
            OPT_VIDEO_CODEC, OPT_VIDEO_PRESET, OPT_VIDEO_CRF,
            OPT_LOSSLESS_OUTPUT,
+           OPT_REFINE_VIDEO, OPT_RESTART_STEPS, OPT_RESTART_SCHEDULE_STEPS,
+           OPT_FREEZE_AUDIO,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -316,6 +322,10 @@ int main(int argc, char **argv) {
         {"video-preset", required_argument, NULL, OPT_VIDEO_PRESET},
         {"video-crf", required_argument, NULL, OPT_VIDEO_CRF},
         {"lossless-output", required_argument, NULL, OPT_LOSSLESS_OUTPUT},
+        {"refine-video", required_argument, NULL, OPT_REFINE_VIDEO},
+        {"restart-steps", required_argument, NULL, OPT_RESTART_STEPS},
+        {"restart-schedule-steps", required_argument, NULL, OPT_RESTART_SCHEDULE_STEPS},
+        {"freeze-audio", no_argument, NULL, OPT_FREEZE_AUDIO},
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
@@ -418,6 +428,10 @@ int main(int argc, char **argv) {
             case OPT_LOSSLESS_OUTPUT:
                 params.lossless_output_path = optarg;
                 break;
+            case OPT_REFINE_VIDEO: params.refine_video_path = optarg; break;
+            case OPT_RESTART_STEPS: params.restart_steps = parse_int(optarg, "restart steps"); break;
+            case OPT_RESTART_SCHEDULE_STEPS: params.restart_schedule_steps = parse_int(optarg, "restart schedule steps"); break;
+            case OPT_FREEZE_AUDIO: params.freeze_audio = 1; break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;

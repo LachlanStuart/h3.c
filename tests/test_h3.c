@@ -311,6 +311,36 @@ static void test_schedule(void) {
     }
     CHECK(!h3_serving_schedule_build(1, &schedule));
     CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
+
+    h3_sigma_schedule full, restart;
+    int start = -1;
+    CHECK(h3_serving_schedule_build(6, &full));
+    CHECK(h3_restart_schedule_build(6, 2, &restart, &start));
+    CHECK(start == 4 && restart.steps == 6);
+    for (int index = 0; index <= 6; index++) {
+        CHECK(restart.video[index] == full.video[index]);
+        CHECK(restart.audio[index] == 0.0f);
+    }
+    CHECK(h3_restart_schedule_build(3, 1, &restart, &start) && start == 2);
+    CHECK(h3_restart_schedule_build(12, 1, &restart, &start) && start == 11);
+    CHECK(!h3_restart_schedule_build(6, 0, &restart, &start));
+    CHECK(!h3_restart_schedule_build(6, 7, &restart, &start));
+
+    float clean[] = {-1.0f, -0.25f, 0.5f, 1.25f};
+    float a[4], b[4];
+    h3_rng first, second;
+    h3_rng_seed(&first, UINT64_C(123));
+    h3_rng_seed(&second, UINT64_C(123));
+    h3_rng_fill_normal(&first, a, 4);
+    h3_rng_fill_normal(&second, b, 4);
+    for (int index = 0; index < 4; index++) {
+        CHECK(a[index] == b[index]);
+        a[index] = (1.0f - full.video[4]) * clean[index] +
+                   full.video[4] * a[index];
+        b[index] = (1.0f - full.video[4]) * clean[index] +
+                   full.video[4] * b[index];
+        CHECK(a[index] == b[index]);
+    }
 }
 
 static void test_dit_reuse_schedule(void) {

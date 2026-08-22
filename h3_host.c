@@ -164,6 +164,17 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+int h3_restart_schedule_build(int schedule_steps, int restart_steps,
+                              h3_sigma_schedule *schedule, int *start_step) {
+    if (!schedule || !start_step || restart_steps < 1 ||
+        restart_steps > schedule_steps ||
+        !h3_serving_schedule_build(schedule_steps, schedule)) return 0;
+    for (int index = 0; index <= schedule_steps; index++)
+        schedule->audio[index] = 0.0f;
+    *start_step = schedule_steps - restart_steps;
+    return 1;
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;

@@ -304,9 +304,11 @@ int h3_ffmpeg_read_image_f32(const char *path, int width, int height,
     return 1;
 }
 
-int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
-                             int max_frames, float **pixels, int *frames,
-                             char *error, size_t error_size) {
+static int h3_ffmpeg_read_video_f32_scaled(const char *path, int width,
+                                            int height, int max_frames,
+                                            const char *scale_flags,
+                                            float **pixels, int *frames,
+                                            char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (pixels) *pixels = NULL;
     if (frames) *frames = 0;
@@ -333,7 +335,8 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
     }
     char filter[256], frame_limit[32];
     snprintf(filter, sizeof(filter),
-             "fps=24,scale=%d:%d:flags=lanczos,setsar=1", width, height);
+             "fps=24,scale=%d:%d:flags=%s,setsar=1", width, height,
+             scale_flags);
     snprintf(frame_limit, sizeof(frame_limit), "%d", max_frames);
     int stream[2];
     if (pipe(stream) != 0) {
@@ -427,6 +430,22 @@ int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
     return 1;
 }
 
+int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
+                             int max_frames, float **pixels, int *frames,
+                             char *error, size_t error_size) {
+    return h3_ffmpeg_read_video_f32_scaled(path, width, height, max_frames,
+                                            "lanczos", pixels, frames,
+                                            error, error_size);
+}
+
+int h3_ffmpeg_read_video_f32_bicubic(const char *path, int width, int height,
+                                     int max_frames, float **pixels, int *frames,
+                                     char *error, size_t error_size) {
+    return h3_ffmpeg_read_video_f32_scaled(path, width, height, max_frames,
+                                            "bicubic", pixels, frames,
+                                            error, error_size);
+}
+
 int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
                              int truncate_at_limit,
                              float **pcm, int *samples,
@@ -435,7 +454,7 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
     if (error && error_size) error[0] = '\0';
     if (pcm) *pcm = NULL;
     if (samples) *samples = 0;
-    if (!path || !*path || !pcm || !samples || max_samples < MIN_SAMPLES ||
+    if (!path || !*path || !pcm || !samples || max_samples < 1 ||
         max_samples > AUDIO_RATE * 15 ||
         (truncate_at_limit != 0 && truncate_at_limit != 1)) {
         fail(error, error_size, "invalid FFmpeg audio input arguments");
@@ -520,7 +539,7 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
         return 0;
     }
     int sample_count = (int)(received / frame_bytes);
-    if (sample_count < MIN_SAMPLES) {
+    if (!truncate_at_limit && sample_count < MIN_SAMPLES) {
         free(interleaved);
         fail(error, error_size,
              "reference audio requires at least 2 seconds at 32 kHz");
@@ -634,6 +653,64 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         if (ok) fail(error, error_size, "FFmpeg exited with status %d",
                      WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 0;
+    }
+    return ok;
+}
+
+int h3_ffmpeg_write_rgb24_with_source_audio(const char *path,
+                          const uint8_t *frames, int frame_count,
+                          int width, int height, int fps,
+                          const char *source_audio_path,
+                          h3_video_preset preset, int crf,
+                          char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!path || !*path || !frames || !source_audio_path || !*source_audio_path ||
+        frame_count < 1 || width < 2 || height < 2 || fps < 1 || width % 2 ||
+        height % 2 || !h3_video_settings_valid(H3_VIDEO_CODEC_H264, preset, crf)) {
+        fail(error, error_size, "invalid FFmpeg source-audio mux arguments");
+        return 0;
+    }
+    size_t pixels = (size_t)width * (size_t)height;
+    if (pixels > SIZE_MAX / 3 || (size_t)frame_count > SIZE_MAX / (pixels * 3) ||
+        !make_parents(path, error, error_size)) return 0;
+    int stream[2];
+    if (pipe(stream) != 0) {
+        fail(error, error_size, "cannot create FFmpeg pipe: %s", strerror(errno));
+        return 0;
+    }
+    char size[64], rate[32], crf_text[16];
+    snprintf(size, sizeof(size), "%dx%d", width, height);
+    snprintf(rate, sizeof(rate), "%d", fps);
+    snprintf(crf_text, sizeof(crf_text), "%d", crf);
+    const char *preset_name = h3_video_preset_name(preset);
+    char *arguments[] = {"ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgb24", "-video_size", size,
+        "-framerate", rate, "-i", "pipe:0", "-i", (char *)source_audio_path,
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset",
+        (char *)preset_name, "-crf", crf_text, "-pix_fmt", "yuv420p",
+        "-c:a", "copy", "-shortest", "-movflags", "+faststart", (char *)path, NULL};
+    posix_spawn_file_actions_t actions;
+    int code = posix_spawn_file_actions_init(&actions);
+    if (!code) code = posix_spawn_file_actions_adddup2(&actions, stream[0], STDIN_FILENO);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[0]);
+    if (!code) code = posix_spawn_file_actions_addclose(&actions, stream[1]);
+    pid_t child = -1;
+    if (!code) code = posix_spawnp(&child, ffmpeg_program(), &actions, NULL,
+                                    arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(stream[0]);
+    if (code) { close(stream[1]); fail(error, error_size, "cannot start FFmpeg: %s", strerror(code)); return 0; }
+    struct sigaction ignore, previous;
+    memset(&ignore, 0, sizeof(ignore)); ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask); sigaction(SIGPIPE, &ignore, &previous);
+    int ok = write_all(stream[1], frames, (size_t)frame_count * pixels * 3,
+                       error, error_size);
+    close(stream[1]); sigaction(SIGPIPE, &previous, NULL);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) { if (errno != EINTR) return 0; }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (ok) fail(error, error_size, "FFmpeg source-audio mux failed");
         return 0;
     }
     return ok;

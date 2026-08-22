@@ -27,6 +27,10 @@ int h3_ffmpeg_read_image_f32(const char *path, int width, int height,
 int h3_ffmpeg_read_video_f32(const char *path, int width, int height,
                              int max_frames, float **pixels, int *frames,
                              char *error, size_t error_size);
+/* As above, but use FFmpeg's bicubic spatial resize for restart refinement. */
+int h3_ffmpeg_read_video_f32_bicubic(const char *path, int width, int height,
+                                     int max_frames, float **pixels, int *frames,
+                                     char *error, size_t error_size);
 
 /* Decode the first audio stream as channel-major stereo F32 at 32 kHz.
  * max_samples bounds allocation. truncate_at_limit is used for a video's
@@ -63,6 +67,15 @@ int h3_ffmpeg_write_rgb24(const char *path, const uint8_t *frames,
                           int frame_count, int width, int height, int fps,
                           h3_video_codec codec, h3_video_preset preset,
                           int crf,
+                          char *error, size_t error_size);
+/* Encode raw RGB video while stream-copying the source MP4's first audio
+ * stream. Used by restart refinement so audio is not decoded/re-encoded at
+ * the delivery boundary. H.264 only. */
+int h3_ffmpeg_write_rgb24_with_source_audio(const char *path,
+                          const uint8_t *frames, int frame_count,
+                          int width, int height, int fps,
+                          const char *source_audio_path,
+                          h3_video_preset preset, int crf,
                           char *error, size_t error_size);
 
 /* Encode RGB24 video and channel-major F32 PCM through two concurrent pipes.

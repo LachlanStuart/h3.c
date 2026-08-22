@@ -2778,6 +2778,77 @@ static int denoise_res_gpu(h3_dit *dit, float *video_latent,
     return ok;
 }
 
+int h3_dit_restart_refine(h3_dit *dit, float *video_latent,
+                          const float *frozen_audio, int start_step,
+                          h3_dit_progress progress, void *progress_opaque,
+                          char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!dit || !video_latent || !frozen_audio || start_step < 0 ||
+        start_step >= dit->sigmas.steps ||
+        !ensure_previous_denoised(dit, error, error_size)) {
+        fail(error, error_size, "invalid restart refinement arguments");
+        return 0;
+    }
+    size_t video_count = (size_t)dit->video_rows * VIDEO_PATCH;
+    size_t audio_count = (size_t)dit->audio_rows * AUDIO_CHANNELS;
+    size_t video_offset = (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t audio_offset = (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    float *video_rows = malloc(video_count * sizeof(*video_rows));
+    float *audio_rows = malloc(audio_count * sizeof(*audio_rows));
+    if (!video_rows || !audio_rows ||
+        !h3_dit_patchify_video(video_latent, VIDEO_CHANNELS, dit->latent_t,
+            dit->latent_h, dit->latent_w, video_rows, video_count) ||
+        !h3_dit_pack_audio(frozen_audio, AUDIO_CHANNELS, dit->audio_t,
+                          audio_rows, audio_count) ||
+        !h3_gpu_tensor_write_f32_range(dit->video_input, video_offset,
+                                      video_rows, video_count) ||
+        !h3_gpu_tensor_write_f32_range(dit->audio_input, audio_offset,
+                                      audio_rows, audio_count) ||
+        !h3_gpu_begin(dit->gpu)) {
+        free(video_rows); free(audio_rows);
+        fail(error, error_size, "cannot initialize GPU restart refinement");
+        return 0;
+    }
+    free(audio_rows);
+    int ok = 1;
+    for (int step = start_step; ok && step < dit->sigmas.steps; step++) {
+        float decay = 0.0f, h = 0.0f, b1 = 0.0f, b2 = 0.0f;
+        int multistep = 0;
+        report(progress, progress_opaque, "restart refine enqueue",
+               step - start_step, dit->sigmas.steps - start_step);
+        if (step != start_step &&
+            !res_coefficients(dit->sigmas.video, step, dit->sigmas.steps,
+                              &decay, &h, &b1, &b2, &multistep)) {
+            fail(error, error_size, "cannot derive restart RES coefficients");
+            ok = 0;
+            break;
+        }
+        /* The restart has no x0 at step-1. Bootstrap with the Euler branch
+         * in the resident RES kernel; later transitions retain x0 history. */
+        ok = encode_forward(dit, step, 0, 0, 0, error, error_size) &&
+            gpu_op(dit, h3_gpu_res_velocity_bf16(
+                dit->gpu, dit->video_input, video_offset,
+                dit->video_output_bf16, dit->previous_video_denoised,
+                (uint32_t)video_count, dit->sigmas.video[step],
+                dit->sigmas.video[step + 1], decay, h, b1, b2,
+                step == start_step ? 0 : multistep), error, error_size,
+                "GPU restart video transition");
+        if (ok) report(progress, progress_opaque, "restart refine enqueue",
+                       step - start_step + 1, dit->sigmas.steps - start_step);
+    }
+    if (ok) ok = h3_gpu_submit(dit->gpu);
+    if (ok) ok = h3_gpu_tensor_read_f32_range(dit->video_input, video_offset,
+                                               video_rows, video_count) &&
+                 h3_dit_unpatchify_video(video_rows, VIDEO_CHANNELS,
+                    dit->latent_t, dit->latent_h, dit->latent_w,
+                    video_latent, h3_dit_video_elements(dit));
+    free(video_rows);
+    if (!ok && (!error || !*error))
+        fail(error, error_size, "GPU restart refinement failed");
+    h3_gpu_profile_mark(dit->gpu, "restart video-only RES");
+    return ok;
+}
+
 static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                              float *audio_latent, int reuse_interval,
                              h3_dit_progress progress, void *progress_opaque,

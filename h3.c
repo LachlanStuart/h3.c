@@ -165,13 +165,16 @@ static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
                              int render_width, int render_height) {
     h3_key key = {0};
+    int schedule_steps = params->refine_video_path ?
+        params->restart_schedule_steps : params->steps;
     if (!h3_key_append(
             &key,
-            "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
+            "%s|shape=%dx%dx%d|steps=%d|restart=%d|layers=%d|reuse-core=%d|reduce=%d"
             "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
-            params->steps, params->dit_layers, params->core_reuse,
+            schedule_steps, params->refine_video_path != NULL,
+            params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
@@ -522,6 +525,29 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (params->sampler != H3_SAMPLER_RES &&
         params->sampler != H3_SAMPLER_EULER) {
         h3_set_error(ctx, "unknown sampler");
+        return 0;
+    }
+    if (params->refine_video_path) {
+        if (!*params->refine_video_path || params->sampler != H3_SAMPLER_RES ||
+            !params->freeze_audio || params->restart_schedule_steps < 2 ||
+            params->restart_schedule_steps > H3_MAX_STEPS ||
+            params->restart_steps < 1 ||
+            params->restart_steps > params->restart_schedule_steps) {
+            h3_set_error(ctx, "restart refinement requires --sampler res, "
+                "--freeze-audio, and 1 <= restart steps <= schedule steps");
+            return 0;
+        }
+        if (params->video_codec != H3_VIDEO_CODEC_H264) {
+            h3_set_error(ctx, "restart refinement requires H.264 to stream-copy audio");
+            return 0;
+        }
+        if (params->lossless_output_path && *params->lossless_output_path) {
+            h3_set_error(ctx, "restart refinement does not emit lossless artifacts");
+            return 0;
+        }
+    } else if (params->restart_steps || params->restart_schedule_steps ||
+               params->freeze_audio) {
+        h3_set_error(ctx, "restart options require --refine-video");
         return 0;
     }
     if (!h3_video_settings_valid(params->video_codec, params->video_preset,
@@ -1499,10 +1525,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
+    int refine = params->refine_video_path != NULL;
+    int schedule_steps = refine ? params->restart_schedule_steps : params->steps;
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    int restart_start = 0;
+    if (refine ? !h3_restart_schedule_build(schedule_steps,
+                params->restart_steps, &sigmas, &restart_start) :
+            !h3_serving_schedule_build(schedule_steps, &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
+    }
+    if (refine) {
+        int start = restart_start;
+        fprintf(stderr, "h3: restart refinement video schedule M=%d N=%d indices %d..%d\n",
+                sigmas.steps, params->restart_steps, start, sigmas.steps);
+        for (int step = start; step <= sigmas.steps; step++)
+            fprintf(stderr, "h3: restart sigma[%d] video=%.9g audio=%.9g\n",
+                    step, sigmas.video[step], sigmas.audio[step]);
     }
     float spatial_rope_scale = !params->use_reference_rope &&
         render_width == 256 && render_height == 256 ? 0.5f : 1.0f;
@@ -1610,14 +1649,67 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory allocating joint H3 noise");
         goto cleanup;
     }
-    /* The released server initializes each modality from a separate generator
-     * carrying the same requested seed. */
-    h3_rng video_rng, audio_rng;
-    h3_rng_seed(&video_rng, params->seed);
-    h3_rng_seed(&audio_rng, params->seed);
-    h3_rng_fill_normal(&video_rng, video, video_count);
-    h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    int denoised = params->sampler == H3_SAMPLER_RES ?
+    if (refine) {
+        float *source_rgb = NULL, *source_pcm = NULL;
+        int source_frames = 0, source_samples = 0;
+        h3_video_latent source_video = {0};
+        h3_audio_latent source_audio = {0};
+        int expected_samples = (int)llround((double)temporal.frame_count *
+                                             32000.0 / H3_FPS);
+        if (!h3_ffmpeg_read_video_f32_bicubic(params->refine_video_path,
+                params->width, params->height, temporal.frame_count,
+                &source_rgb, &source_frames, detail, sizeof(detail)) ||
+            source_frames != temporal.frame_count ||
+            !h3_ffmpeg_read_audio_f32(params->refine_video_path,
+                expected_samples, 1, &source_pcm, &source_samples,
+                detail, sizeof(detail)) || source_samples != expected_samples ||
+            !h3_video_vae_encode(vae_path, "h3_shaders.metal", source_rgb,
+                source_frames, params->height, params->width,
+                h3_video_encoder_progress_bridge, &progress, &source_video,
+                detail, sizeof(detail)) ||
+            !h3_audio_vae_encode(audio_vae_path, "h3_shaders.metal", source_pcm,
+                source_samples, h3_audio_vae_progress_bridge, &progress,
+                &source_audio, detail, sizeof(detail)) ||
+            source_video.time != temporal.video_t || source_video.height != latent_h ||
+            source_video.width != latent_w || source_audio.length != temporal.audio_t ||
+            source_audio.channels != 32 || source_audio.stereo != 2) {
+            free(source_rgb); free(source_pcm); h3_video_latent_free(&source_video);
+            h3_audio_latent_free(&source_audio);
+            h3_set_error(ctx, "%s", detail[0] ? detail :
+                         "restart input VAE geometry mismatch");
+            goto cleanup;
+        }
+        memcpy(video, source_video.values, video_count * sizeof(*video));
+        memcpy(audio, source_audio.values, audio_count * sizeof(*audio));
+        h3_rng noise; h3_rng_seed(&noise, params->seed);
+        float *restart_noise = malloc(video_count * sizeof(*restart_noise));
+        int start = restart_start;
+        if (!restart_noise) {
+            free(source_rgb); free(source_pcm); h3_video_latent_free(&source_video);
+            h3_audio_latent_free(&source_audio);
+            h3_set_error(ctx, "out of memory allocating restart video noise");
+            goto cleanup;
+        }
+        h3_rng_fill_normal(&noise, restart_noise, video_count);
+        for (size_t index = 0; index < video_count; index++)
+            video[index] = (1.0f - sigmas.video[start]) * video[index] +
+                           sigmas.video[start] * restart_noise[index];
+        free(restart_noise); free(source_rgb); h3_video_latent_free(&source_video);
+        waveform.channels = 2; waveform.samples = source_samples;
+        waveform.sample_rate = 32000; waveform.pcm = source_pcm;
+        h3_audio_latent_free(&source_audio);
+    } else {
+        /* The released server initializes each modality from a separate generator
+         * carrying the same requested seed. */
+        h3_rng video_rng, audio_rng;
+        h3_rng_seed(&video_rng, params->seed);
+        h3_rng_seed(&audio_rng, params->seed);
+        h3_rng_fill_normal(&video_rng, video, video_count);
+        h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    }
+    int denoised = refine ? h3_dit_restart_refine(dit, video, audio,
+            restart_start, h3_dit_progress_bridge,
+            &progress, detail, sizeof(detail)) : params->sampler == H3_SAMPLER_RES ?
         h3_dit_denoise(dit, video, audio, h3_dit_progress_bridge, &progress,
                        detail, sizeof(detail)) :
         h3_dit_denoise_euler_preview(
@@ -1639,8 +1731,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
-    h3_progress_emit(&progress, "audio VAE", 0, 7);
-    if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
+    if (!refine) h3_progress_emit(&progress, "audio VAE", 0, 7);
+    if (!refine && !h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
                              &progress, &waveform, detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
@@ -1722,7 +1814,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (params->output_path && *params->output_path) {
         h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
-        if (!h3_ffmpeg_write_av_rgb24_f32(
+        if (refine ? !h3_ffmpeg_write_rgb24_with_source_audio(
+                params->output_path, rgb8, frames.frames, output_width,
+                output_height, H3_FPS, params->refine_video_path,
+                params->video_preset, params->video_crf, detail, sizeof(detail)) :
+            !h3_ffmpeg_write_av_rgb24_f32(
                 params->output_path, rgb8, frames.frames, output_width,
                 output_height, H3_FPS, waveform.pcm, waveform.samples,
                 waveform.channels, waveform.sample_rate, params->video_codec,
