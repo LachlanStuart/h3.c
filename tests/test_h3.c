@@ -4,6 +4,7 @@
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
+#include "h3_video_encoder.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -59,6 +60,69 @@ static int gpu_res_coefficients(const float *sigmas, int step, int steps,
 static uint32_t test_prng(uint32_t *state) {
     *state = *state * 1664525u + 1013904223u;
     return *state;
+}
+
+static void test_ref2va_temporal_stitch(void) {
+    enum { CHANNELS = 24, CHUNK_T = 1, TILE_H = 4, TILE_W = 4,
+           FULL_T = 2, FULL_H = 6, FULL_W = 6, KEEP_H = 2, KEEP_W = 2 };
+    char error[256];
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
+    CHECK(gpu != NULL);
+    size_t tile_elements = (size_t)CHUNK_T * TILE_H * TILE_W * 48;
+    size_t staged_elements = (size_t)CHANNELS * FULL_T * FULL_H * FULL_W;
+    size_t final_elements = (size_t)CHANNELS * CHUNK_T * FULL_H * FULL_W;
+    float *current = malloc(tile_elements * sizeof(*current));
+    float *above = malloc(tile_elements * sizeof(*above));
+    float *left = malloc(tile_elements * sizeof(*left));
+    float *mean = calloc(CHANNELS, sizeof(*mean));
+    float *std = malloc(CHANNELS * sizeof(*std));
+    float *got = malloc(final_elements * sizeof(*got));
+    CHECK(current && above && left && mean && std && got);
+    for (int channel = 0; channel < CHANNELS; channel++) std[channel] = 1.0f;
+    for (size_t index = 0; index < tile_elements; index++) {
+        int channel = (int)(index % 48);
+        current[index] = 100.0f + (float)channel;
+        above[index] = 200.0f + (float)channel;
+        left[index] = 300.0f + (float)channel;
+    }
+    h3_gpu_tensor *current_gpu = h3_gpu_tensor_from_f32(gpu, current, tile_elements);
+    h3_gpu_tensor *above_gpu = h3_gpu_tensor_from_f32(gpu, above, tile_elements);
+    h3_gpu_tensor *left_gpu = h3_gpu_tensor_from_f32(gpu, left, tile_elements);
+    h3_gpu_tensor *mean_gpu = h3_gpu_tensor_from_f32(gpu, mean, CHANNELS);
+    h3_gpu_tensor *std_gpu = h3_gpu_tensor_from_f32(gpu, std, CHANNELS);
+    h3_gpu_tensor *staged_gpu = h3_gpu_tensor_new_f32(gpu, staged_elements);
+    h3_gpu_tensor *final_gpu = h3_gpu_tensor_new_f32(gpu, final_elements);
+    CHECK(current_gpu && above_gpu && left_gpu && mean_gpu && std_gpu &&
+          staged_gpu && final_gpu);
+    h3_gpu_stats before, after;
+    CHECK(h3_gpu_get_stats(gpu, &before));
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_vae_encoder_stitch_latent_f32(
+        gpu, staged_gpu, current_gpu, above_gpu, left_gpu, mean_gpu, std_gpu,
+        0, CHUNK_T, FULL_T, FULL_H, FULL_W, TILE_H, TILE_W, 2, 2,
+        2, 2, KEEP_H, KEEP_W));
+    CHECK(h3_gpu_vae_encoder_temporal_take_f32(
+        gpu, final_gpu, staged_gpu, FULL_T, CHUNK_T, FULL_H, FULL_W));
+    CHECK(h3_gpu_submit(gpu));
+    CHECK(h3_gpu_get_stats(gpu, &after));
+    CHECK(after.host_tensor_reads == before.host_tensor_reads);
+    CHECK(after.host_tensor_writes == before.host_tensor_writes);
+    CHECK(after.blit_copies == before.blit_copies);
+    CHECK(h3_gpu_tensor_read_f32(final_gpu, got, final_elements));
+    for (int channel = 0; channel < CHANNELS; channel++)
+        for (int y = 0; y < KEEP_H; y++)
+            for (int x = 0; x < KEEP_W; x++) {
+                float expected = y == 0 ? (x == 0 ? 300.0f : 250.0f) :
+                                 (x == 0 ? 300.0f : 225.0f);
+                size_t index = (((size_t)channel * CHUNK_T) * FULL_H +
+                                (size_t)(2 + y)) * FULL_W + (size_t)(2 + x);
+                CHECK(close_enough(got[index], expected + (float)channel, 1e-6));
+            }
+    h3_gpu_tensor_free(current_gpu); h3_gpu_tensor_free(above_gpu);
+    h3_gpu_tensor_free(left_gpu); h3_gpu_tensor_free(mean_gpu);
+    h3_gpu_tensor_free(std_gpu); h3_gpu_tensor_free(staged_gpu);
+    h3_gpu_tensor_free(final_gpu); h3_gpu_free(gpu);
+    free(current); free(above); free(left); free(mean); free(std); free(got);
 }
 
 static void test_gpu_res_solver(void) {
@@ -232,6 +296,22 @@ static void test_temporal_and_canvas(void) {
     CHECK(h3_video_encoder_latent_t(5) == 2);
     CHECK(h3_video_encoder_latent_t(22) == 6);
     CHECK(h3_video_encoder_latent_t(39) == 10);
+    const struct { int frames, chunks, padded, encoded, latent; } encode_cases[] = {
+        {5, 1, 12, 5, 2}, {22, 2, 12, 10, 7}, {39, 3, 12, 15, 12},
+        {56, 4, 12, 20, 17}, {124, 8, 12, 40, 37}
+    };
+    for (size_t index = 0;
+         index < sizeof(encode_cases) / sizeof(encode_cases[0]); index++) {
+        h3_ref2va_video_encode_plan plan;
+        CHECK(h3_ref2va_video_encode_plan_build(encode_cases[index].frames,
+                                                &plan));
+        CHECK(plan.chunks == encode_cases[index].chunks);
+        CHECK(plan.padded_frames == encode_cases[index].padded);
+        CHECK(plan.encoded_tokens == encode_cases[index].encoded);
+        CHECK(plan.latent_tokens == encode_cases[index].latent);
+        CHECK(plan.latent_tokens == h3_video_latent_t(encode_cases[index].frames));
+    }
+    CHECK(!h3_ref2va_video_encode_plan_build(0, NULL));
     int width, height;
     CHECK(h3_adapt_canvas(1920, 1080, &width, &height));
     CHECK(width == 1344 && height == 768);
@@ -700,6 +780,7 @@ static void test_terminal_zoom(void) {
 }
 
 int main(void) {
+    test_ref2va_temporal_stitch();
     test_temporal_and_canvas();
     test_schedule();
     test_dit_reuse_schedule();

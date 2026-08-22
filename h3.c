@@ -1684,7 +1684,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         source_samples = expected_samples;
-        if (!h3_video_vae_encode(vae_path, "h3_shaders.metal", source_rgb,
+        if (!h3_video_vae_encode_ref2va_temporal(
+                vae_path, "h3_shaders.metal", source_rgb,
                 source_frames, params->height, params->width,
                 h3_video_encoder_progress_bridge, &progress, &source_video,
                 detail, sizeof(detail)) ||

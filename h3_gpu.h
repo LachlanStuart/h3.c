@@ -291,6 +291,29 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t depth, uint32_t height, uint32_t width,
                       uint32_t channels, uint32_t groups, float epsilon);
+/* Normalize channels-last encoder moments and stitch a temporal chunk into a
+ * channel-major [24,T,H,W] latent entirely on Metal. */
+int h3_gpu_vae_encoder_stitch_latent_f32(
+                      h3_gpu *gpu, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *current,
+                      const h3_gpu_tensor *above,
+                      const h3_gpu_tensor *left,
+                      const h3_gpu_tensor *mean,
+                      const h3_gpu_tensor *std,
+                      uint32_t time_offset, uint32_t chunk_time,
+                      uint32_t full_time, uint32_t full_height,
+                      uint32_t full_width, uint32_t tile_height,
+                      uint32_t tile_width, uint32_t destination_y,
+                      uint32_t destination_x, uint32_t overlap_y,
+                      uint32_t overlap_x, uint32_t keep_height,
+                      uint32_t keep_width);
+/* Retain the first `destination_time` temporal tokens of a channel-major
+ * latent when its source channel stride is wider. */
+int h3_gpu_vae_encoder_temporal_take_f32(
+                      h3_gpu *gpu, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *source, uint32_t source_time,
+                      uint32_t destination_time, uint32_t height,
+                      uint32_t width);
 
 /* Portable BF16 storage path. Arithmetic accumulates in F32 and rounds at
  * operation boundaries, matching the released checkpoint's compute dtype. */

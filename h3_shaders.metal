@@ -539,6 +539,87 @@ struct vae_encoder_norm_args {
     float epsilon;
 };
 
+struct vae_encoder_stitch_args {
+    uint time_offset;
+    uint chunk_time;
+    uint full_time;
+    uint full_height;
+    uint full_width;
+    uint tile_height;
+    uint tile_width;
+    uint destination_y;
+    uint destination_x;
+    uint overlap_y;
+    uint overlap_x;
+    uint keep_height;
+    uint keep_width;
+    uint has_above;
+    uint has_left;
+};
+
+kernel void h3_vae_encoder_stitch_latent_f32(
+                            device const float *current [[buffer(0)]],
+                            device const float *above [[buffer(1)]],
+                            device const float *left [[buffer(2)]],
+                            device const float *mean [[buffer(3)]],
+                            device const float *std [[buffer(4)]],
+                            device float *output [[buffer(5)]],
+                            constant vae_encoder_stitch_args &args [[buffer(6)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint x = gid.x;
+    uint y = gid.y;
+    uint plane = gid.z;
+    if (x >= args.keep_width || y >= args.keep_height ||
+        plane >= args.chunk_time * 24) return;
+    uint channel = plane % 24;
+    uint time = plane / 24;
+    size_t current_index = (((size_t)time * args.tile_height + y) *
+                            args.tile_width + x) * 48 + channel;
+    float value = current[current_index];
+    if (args.has_above && y < args.overlap_y) {
+        uint above_y = args.tile_height - args.overlap_y + y;
+        size_t above_index = (((size_t)time * args.tile_height + above_y) *
+                              args.tile_width + x) * 48 + channel;
+        float weight = float(y) / float(args.overlap_y);
+        value = above[above_index] * (1.0f - weight) + value * weight;
+    }
+    if (args.has_left && x < args.overlap_x) {
+        uint left_x = args.tile_width - args.overlap_x + x;
+        size_t left_index = (((size_t)time * args.tile_height + y) *
+                             args.tile_width + left_x) * 48 + channel;
+        float weight = float(x) / float(args.overlap_x);
+        value = left[left_index] * (1.0f - weight) + value * weight;
+    }
+    size_t destination = (((size_t)channel * args.full_time +
+                           args.time_offset + time) * args.full_height +
+                          args.destination_y + y) * args.full_width +
+                         args.destination_x + x;
+    output[destination] = (value - mean[channel]) / std[channel];
+}
+
+struct vae_encoder_take_args {
+    uint source_time;
+    uint destination_time;
+    uint height;
+    uint width;
+};
+
+kernel void h3_vae_encoder_temporal_take_f32(
+                            device const float *source [[buffer(0)]],
+                            device float *destination [[buffer(1)]],
+                            constant vae_encoder_take_args &args [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    uint plane = args.destination_time * args.height * args.width;
+    uint channel = gid / plane;
+    uint rem = gid % plane;
+    uint time = rem / (args.height * args.width);
+    uint spatial = rem % (args.height * args.width);
+    if (channel >= 24) return;
+    size_t source_index = ((size_t)channel * args.source_time + time) *
+                          args.height * args.width + spatial;
+    destination[gid] = source[source_index];
+}
+
 kernel void h3_vae_encoder_group_norm_silu_f32(
                             device const float *input [[buffer(0)]],
                             device const float *weight [[buffer(1)]],

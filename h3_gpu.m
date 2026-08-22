@@ -461,7 +461,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
             @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
-            @"h3_vae_encoder_group_norm_silu_f32"
+            @"h3_vae_encoder_group_norm_silu_f32",
+            @"h3_vae_encoder_stitch_latent_f32",
+            @"h3_vae_encoder_temporal_take_f32"
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
@@ -1064,6 +1066,15 @@ typedef struct {
     uint32_t batch, depth, height, width, channels, groups;
     float epsilon;
 } vae_encoder_norm_args;
+typedef struct {
+    uint32_t time_offset, chunk_time, full_time, full_height, full_width;
+    uint32_t tile_height, tile_width, destination_y, destination_x;
+    uint32_t overlap_y, overlap_x, keep_height, keep_width;
+    uint32_t has_above, has_left;
+} vae_encoder_stitch_args;
+typedef struct {
+    uint32_t source_time, destination_time, height, width;
+} vae_encoder_take_args;
 typedef struct { uint32_t rows, width; } swiglu_args;
 typedef struct { uint32_t elements, approximate; } gelu_bf16_args;
 typedef struct { uint32_t tokens, vocab_size, width; } embedding_args;
@@ -2377,6 +2388,92 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
             [encoder setBuffer:TENSOR(bias).buffer offset:0 atIndex:2];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
+int h3_gpu_vae_encoder_stitch_latent_f32(
+                      h3_gpu *opaque, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *current,
+                      const h3_gpu_tensor *above,
+                      const h3_gpu_tensor *left,
+                      const h3_gpu_tensor *mean,
+                      const h3_gpu_tensor *std,
+                      uint32_t time_offset, uint32_t chunk_time,
+                      uint32_t full_time, uint32_t full_height,
+                      uint32_t full_width, uint32_t tile_height,
+                      uint32_t tile_width, uint32_t destination_y,
+                      uint32_t destination_x, uint32_t overlap_y,
+                      uint32_t overlap_x, uint32_t keep_height,
+                      uint32_t keep_width) {
+    H3GPU *gpu = GPU(opaque);
+    const h3_gpu_tensor *above_source = above ? above : current;
+    const h3_gpu_tensor *left_source = left ? left : current;
+    size_t tile_elements = (size_t)chunk_time * tile_height * tile_width * 48;
+    size_t output_elements = (size_t)24 * full_time * full_height * full_width;
+    if (!chunk_time || !full_time || time_offset > full_time ||
+        chunk_time > full_time - time_offset || !full_height || !full_width ||
+        !tile_height || !tile_width || !keep_height || !keep_width ||
+        destination_y > full_height || keep_height > full_height - destination_y ||
+        destination_x > full_width || keep_width > full_width - destination_x ||
+        overlap_y > tile_height || overlap_x > tile_width ||
+        !h3_gpu_require_elements(gpu, current, tile_elements,
+                                 @"VAE encoder stitch current") ||
+        TENSOR(current).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, above_source, tile_elements,
+                                 @"VAE encoder stitch above") ||
+        TENSOR(above_source).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, left_source, tile_elements,
+                                 @"VAE encoder stitch left") ||
+        TENSOR(left_source).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, mean, 24, @"VAE encoder latent mean") ||
+        TENSOR(mean).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, std, 24, @"VAE encoder latent std") ||
+        TENSOR(std).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, destination, output_elements,
+                                 @"VAE encoder stitch output") ||
+        TENSOR(destination).dtype != H3_GPU_F32) return 0;
+    vae_encoder_stitch_args args = {
+        time_offset, chunk_time, full_time, full_height, full_width,
+        tile_height, tile_width, destination_y, destination_x,
+        overlap_y, overlap_x, keep_height, keep_width,
+        above != NULL, left != NULL
+    };
+    return h3_gpu_dispatch_3d(gpu, @"h3_vae_encoder_stitch_latent_f32",
+        MTLSizeMake(keep_width, keep_height, (NSUInteger)chunk_time * 24),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(current).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(above_source).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(left_source).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(mean).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(std).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(destination).buffer offset:0 atIndex:5];
+            [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        });
+}
+
+int h3_gpu_vae_encoder_temporal_take_f32(
+                      h3_gpu *opaque, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *source, uint32_t source_time,
+                      uint32_t destination_time, uint32_t height,
+                      uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    size_t source_elements = (size_t)24 * source_time * height * width;
+    size_t destination_elements = (size_t)24 * destination_time * height * width;
+    if (!source_time || !destination_time || destination_time > source_time ||
+        !height || !width || destination_elements > UINT32_MAX ||
+        !h3_gpu_require_elements(gpu, source, source_elements,
+                                 @"VAE encoder temporal source") ||
+        TENSOR(source).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, destination, destination_elements,
+                                 @"VAE encoder temporal destination") ||
+        TENSOR(destination).dtype != H3_GPU_F32) return 0;
+    vae_encoder_take_args args = {source_time, destination_time, height, width};
+    return h3_gpu_dispatch_1d(gpu, @"h3_vae_encoder_temporal_take_f32",
+        (uint32_t)destination_elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(source).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(destination).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
         });
 }
 
