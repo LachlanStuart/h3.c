@@ -451,6 +451,9 @@ int h3_ffmpeg_read_audio_f32(const char *path, int max_samples,
                              float **pcm, int *samples,
                              char *error, size_t error_size) {
     enum { AUDIO_RATE = 32000, AUDIO_CHANNELS = 2, MIN_SAMPLES = 64000 };
+    /* Standalone audio references pass truncate_at_limit=0 and retain the
+     * 64k minimum below.  Restart source soundtracks intentionally use an
+     * exact, potentially shorter AudioVAE grid with truncation enabled. */
     if (error && error_size) error[0] = '\0';
     if (pcm) *pcm = NULL;
     if (samples) *samples = 0;

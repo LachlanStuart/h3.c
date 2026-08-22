@@ -16,6 +16,7 @@ int main(int argc, char **argv) {
     enum { WIDTH = 32, HEIGHT = 32, FRAMES = 8, SAMPLES = 64000 };
     const char *path = argc > 1 ? argv[1] : "/tmp/h3-av-mux-test.mp4";
     const char *lossless_path = "/tmp/h3-av-mux-lossless-test.mkv";
+    const char *source_audio_path = "/tmp/h3-av-source-audio-test.mp4";
     h3_ffmpeg_video_plan plan;
     if (strcmp(h3_video_preset_name(H3_VIDEO_PRESET_SLOW), "slow") ||
         strcmp(h3_video_preset_name(H3_VIDEO_PRESET_FAST), "fast") ||
@@ -119,6 +120,19 @@ int main(int argc, char **argv) {
             die("decoded FFmpeg video contains invalid pixels");
     }
     free(decoded);
+    decoded = NULL;
+    if (!h3_ffmpeg_read_video_f32_bicubic(path, WIDTH, HEIGHT, FRAMES,
+                                           &decoded, &decoded_frames,
+                                           error, sizeof(error))) die(error);
+    if (decoded_frames != 5)
+        die("bicubic FFmpeg video input did not align to 5+17k frames");
+    for (size_t index = 0; index < decoded_values; index++) {
+        if (!isfinite(decoded[index]) || decoded[index] < 0.0f ||
+            decoded[index] > 1.0f)
+            die("bicubic decoded FFmpeg video contains invalid pixels");
+    }
+    free(decoded);
+    decoded = NULL;
     float *decoded_pcm = NULL;
     int decoded_samples = 0;
     if (!h3_ffmpeg_read_audio_f32(path, SAMPLES, 1,
@@ -137,6 +151,28 @@ int main(int argc, char **argv) {
     }
     if (left_energy < 1.0 || right_energy < 1.0)
         die("decoded FFmpeg audio has no stereo signal");
+    free(decoded_pcm);
+    decoded_pcm = NULL;
+
+    /* Restart refinement uses bicubic RGB input and must preserve this
+     * original source soundtrack rather than encode the frozen model audio. */
+    if (!h3_ffmpeg_write_rgb24_with_source_audio(
+            source_audio_path, rgb, FRAMES, WIDTH, HEIGHT, 24, path,
+            H3_VIDEO_PRESET_SLOW, 18, error, sizeof(error))) die(error);
+    if (!h3_ffmpeg_read_audio_f32(source_audio_path, 8000, 1,
+                                  &decoded_pcm, &decoded_samples,
+                                  error, sizeof(error))) die(error);
+    if (decoded_samples != 8000)
+        die("source-audio mux did not provide the bounded soundtrack");
+    left_energy = 0.0;
+    right_energy = 0.0;
+    for (int sample = 0; sample < decoded_samples; sample++) {
+        left_energy += (double)decoded_pcm[sample] * decoded_pcm[sample];
+        right_energy += (double)decoded_pcm[decoded_samples + sample] *
+                        decoded_pcm[decoded_samples + sample];
+    }
+    if (left_energy < 0.01 || right_energy < 0.01)
+        die("source-audio mux has no copied stereo signal");
     free(decoded_pcm);
     decoded_pcm = NULL;
 

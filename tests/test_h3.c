@@ -325,6 +325,22 @@ static void test_schedule(void) {
     CHECK(h3_restart_schedule_build(12, 1, &restart, &start) && start == 11);
     CHECK(!h3_restart_schedule_build(6, 0, &restart, &start));
     CHECK(!h3_restart_schedule_build(6, 7, &restart, &start));
+    CHECK(h3_restart_audio_samples(22) == 29600);
+    CHECK(h3_restart_audio_samples(56) == 74400);
+    CHECK(h3_restart_canvas_valid(1216, 704, 0, 0));
+    CHECK(!h3_restart_canvas_valid(1216, 704, 608, 352));
+    CHECK(h3_paths_alias("same-path", "same-path"));
+    CHECK(!h3_paths_alias("different-left", "different-right"));
+    char alias_source[] = "/tmp/h3-path-alias-XXXXXX";
+    int alias_fd = mkstemp(alias_source);
+    CHECK(alias_fd >= 0);
+    close(alias_fd);
+    char alias_link[sizeof(alias_source) + 8];
+    snprintf(alias_link, sizeof(alias_link), "%s-link", alias_source);
+    CHECK(link(alias_source, alias_link) == 0);
+    CHECK(h3_paths_alias(alias_source, alias_link));
+    CHECK(unlink(alias_link) == 0);
+    CHECK(unlink(alias_source) == 0);
 
     float clean[] = {-1.0f, -0.25f, 0.5f, 1.25f};
     float a[4], b[4];

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const int h3_frame_per_token[5] = {1, 4, 4, 4, 4};
 static const double h3_frame_rescale = 5.0 / 3.0;
@@ -173,6 +174,26 @@ int h3_restart_schedule_build(int schedule_steps, int restart_steps,
         schedule->audio[index] = 0.0f;
     *start_step = schedule_steps - restart_steps;
     return 1;
+}
+
+int h3_restart_audio_samples(int requested_frames) {
+    h3_temporal_shape temporal = h3_temporal(requested_frames);
+    if (temporal.audio_t < 1 || temporal.audio_t > INT_MAX / 800) return 0;
+    return temporal.audio_t * 800;
+}
+
+int h3_restart_canvas_valid(int width, int height,
+                            int render_width, int render_height) {
+    return width > 0 && height > 0 && !render_width && !render_height;
+}
+
+int h3_paths_alias(const char *left, const char *right) {
+    if (!left || !*left || !right || !*right) return 0;
+    if (!strcmp(left, right)) return 1;
+    struct stat left_status, right_status;
+    return stat(left, &left_status) == 0 && stat(right, &right_status) == 0 &&
+           left_status.st_dev == right_status.st_dev &&
+           left_status.st_ino == right_status.st_ino;
 }
 
 typedef struct {

@@ -537,12 +537,25 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
                 "--freeze-audio, and 1 <= restart steps <= schedule steps");
             return 0;
         }
+        if (!h3_restart_canvas_valid(params->width, params->height,
+                                     params->render_width,
+                                     params->render_height)) {
+            h3_set_error(ctx,
+                "restart refinement requires the final canvas; do not set render-width/height");
+            return 0;
+        }
         if (params->video_codec != H3_VIDEO_CODEC_H264) {
             h3_set_error(ctx, "restart refinement requires H.264 to stream-copy audio");
             return 0;
         }
         if (params->lossless_output_path && *params->lossless_output_path) {
             h3_set_error(ctx, "restart refinement does not emit lossless artifacts");
+            return 0;
+        }
+        if (params->output_path && *params->output_path &&
+            h3_paths_alias(params->output_path, params->refine_video_path)) {
+            h3_set_error(ctx,
+                "restart refinement output must not alias the source video");
             return 0;
         }
     } else if (params->restart_steps || params->restart_schedule_steps ||
@@ -1654,8 +1667,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         int source_frames = 0, source_samples = 0;
         h3_video_latent source_video = {0};
         h3_audio_latent source_audio = {0};
-        int expected_samples = (int)llround((double)temporal.frame_count *
-                                             32000.0 / H3_FPS);
+        int expected_samples = h3_restart_audio_samples(temporal.frame_count);
         if (!h3_ffmpeg_read_video_f32_bicubic(params->refine_video_path,
                 params->width, params->height, temporal.frame_count,
                 &source_rgb, &source_frames, detail, sizeof(detail)) ||

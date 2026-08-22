@@ -117,6 +117,14 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
 /* Full M-step serving video schedule plus frozen-zero audio schedule. */
 int h3_restart_schedule_build(int schedule_steps, int restart_steps,
                               h3_sigma_schedule *schedule, int *start_step);
+/* Restart audio is encoded on the exact target AudioVAE latent grid. */
+int h3_restart_audio_samples(int requested_frames);
+/* Restart operates at the final VideoVAE/DiT canvas; no internal canvas. */
+int h3_restart_canvas_valid(int width, int height,
+                            int render_width, int render_height);
+/* True for equal spellings or existing filesystem aliases (for example a
+ * hard-link).  Refinement must never let FFmpeg overwrite its source. */
+int h3_paths_alias(const char *left, const char *right);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);
