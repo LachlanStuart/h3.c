@@ -66,6 +66,9 @@ h3_real_video_encoder_test: tests/test_real_video_encoder.o $(LIB_OBJ)
 h3_video_encoder_ablation_test: tests/test_video_encoder_ablation.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_video_encoder_fp16_test: tests/test_video_encoder_fp16.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -110,12 +113,14 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_convrot_tests h3_tokenizer_tests 
 	h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 	h3_real_audio_encoder_test \
 	h3_av_mux_test \
-	h3_real_video_encoder_test h3_real_qwen_vision_test \
+	h3_real_video_encoder_test h3_video_encoder_fp16_test \
+	h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test \
 	h3_semantic_vae_test
 
 	./h3_tests
 	./h3_convrot_tests
+	./h3_video_encoder_fp16_test
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \
@@ -229,6 +234,7 @@ clean:
 		h3_real_audio_encoder_test \
 		h3_av_mux_test \
 		h3_real_video_encoder_test h3_video_encoder_ablation_test \
+		h3_video_encoder_fp16_test \
 		h3_real_qwen_vision_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \

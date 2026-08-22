@@ -48,6 +48,7 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_new_f16(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
                                       size_t elements);
@@ -155,6 +156,10 @@ int h3_gpu_linear_rank8_f16_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *weight,
                             const h3_gpu_tensor *bias, uint32_t rows,
                             uint32_t output_dim);
+int h3_gpu_cast_f32_to_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_cast_f16_to_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset,
                      const h3_gpu_tensor *source, size_t source_offset,
@@ -296,7 +301,29 @@ int h3_gpu_vae_encoder_pad_f32(
                     uint32_t channels, uint32_t depth_front,
                     uint32_t height_before, uint32_t height_after,
                     uint32_t width_before, uint32_t width_after);
+/* Normalize channel-major RGB pixels in F32 and write channels-last FP16 in
+ * one GPU pass. This is the encoder's sole source activation conversion. */
+int h3_gpu_vae_encoder_normalize_pixels_f16(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width);
+int h3_gpu_vae_encoder_pad_f16(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t channels, uint32_t depth_front,
+                      uint32_t height_before, uint32_t height_after,
+                      uint32_t width_before, uint32_t width_after);
 int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t input_channels, uint32_t output_channels,
+                      uint32_t kernel_depth, uint32_t kernel_height,
+                      uint32_t kernel_width, uint32_t stride_depth,
+                      uint32_t stride_height, uint32_t stride_width);
+int h3_gpu_conv3d_f16(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t batch,
@@ -312,9 +339,30 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t depth, uint32_t height, uint32_t width,
                       uint32_t channels, uint32_t groups, float epsilon);
+int h3_gpu_vae_encoder_group_norm_silu_f16(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t channels, uint32_t groups, float epsilon);
 /* Normalize channels-last encoder moments and stitch a temporal chunk into a
  * channel-major [24,T,H,W] latent entirely on Metal. */
 int h3_gpu_vae_encoder_stitch_latent_f32(
+                      h3_gpu *gpu, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *current,
+                      const h3_gpu_tensor *above,
+                      const h3_gpu_tensor *left,
+                      const h3_gpu_tensor *mean,
+                      const h3_gpu_tensor *std,
+                      uint32_t time_offset, uint32_t chunk_time,
+                      uint32_t full_time, uint32_t full_height,
+                      uint32_t full_width, uint32_t tile_height,
+                      uint32_t tile_width, uint32_t destination_y,
+                      uint32_t destination_x, uint32_t overlap_y,
+                      uint32_t overlap_x, uint32_t keep_height,
+                      uint32_t keep_width);
+int h3_gpu_vae_encoder_stitch_latent_f16(
                       h3_gpu *gpu, h3_gpu_tensor *destination,
                       const h3_gpu_tensor *current,
                       const h3_gpu_tensor *above,
@@ -600,6 +648,9 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
+int h3_gpu_add_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                   const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                   uint32_t elements);
 int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);

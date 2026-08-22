@@ -45,21 +45,47 @@ static float *read_f32(const char *path, size_t count) {
     return values;
 }
 
+static float *read_rgb24(const char *path, int frames, int height, int width) {
+    size_t count = (size_t)3 * (size_t)frames * (size_t)height * (size_t)width;
+    unsigned char *packed = malloc(count);
+    float *values = malloc(count * sizeof(*values));
+    FILE *file = fopen(path, "rb");
+    if (!packed || !values || !file || fread(packed, 1, count, file) != count ||
+        fgetc(file) != EOF || fclose(file)) die("cannot read RGB24 fixture");
+    for (int time = 0; time < frames; time++)
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                for (int channel = 0; channel < 3; channel++) {
+                    size_t source = (((size_t)time * height + y) * width + x) *
+                                    3 + (size_t)channel;
+                    size_t destination = (((size_t)channel * frames + time) *
+                                          height + y) * width + x;
+                    values[destination] = (float)packed[source] / 255.0f;
+                }
+    free(packed);
+    return values;
+}
+
 static void compare(const char *label, const float *got, const float *want,
                     size_t count, double max_limit, double l2_limit) {
-    double maximum = 0.0, error = 0.0, value = 0.0;
+    double maximum = 0.0, absolute = 0.0, error = 0.0, value = 0.0;
     uint64_t different = 0;
     for (size_t index = 0; index < count; index++) {
         if (!isfinite(got[index])) die("encoder produced a non-finite value");
         double delta = (double)got[index] - (double)want[index];
         if (fabs(delta) > maximum) maximum = fabs(delta);
+        absolute += fabs(delta);
         error += delta * delta;
         value += (double)want[index] * (double)want[index];
         if (memcmp(got + index, want + index, sizeof(*got))) different++;
     }
+    double mae = absolute / (double)count;
+    double rmse = sqrt(error / (double)count);
     double relative_l2 = sqrt(error / (value > 1e-24 ? value : 1e-24));
-    printf("%s: max-abs=%.9g rel-L2=%.9g differing=%llu/%zu\n", label,
-           maximum, relative_l2, (unsigned long long)different, count);
+    double psnr = rmse > 0.0 ? 20.0 * log10(1.0 / rmse) : INFINITY;
+    printf("%s: max-abs=%.9g mae=%.9g rmse=%.9g psnr=%.6g "
+           "rel-L2=%.9g differing=%llu/%zu\n", label, maximum, mae, rmse,
+           psnr, relative_l2, (unsigned long long)different, count);
     if (maximum > max_limit || relative_l2 > l2_limit)
         die("oracle comparison exceeded its numerical tolerance");
 }
@@ -69,6 +95,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s WEIGHTS (--write|--compare) ORACLE "
                 "FRAMES HEIGHT WIDTH EXPECTED_SUBMISSIONS [DECODED_ORACLE]\n",
                 argv[0]);
+        fprintf(stderr, "optional env: H3_TEST_RGB24, H3_TEST_ACTUAL_LATENT, "
+                "H3_TEST_ACTUAL_DECODED\n");
         return 2;
     }
     const char *weights = argv[1];
@@ -81,13 +109,16 @@ int main(int argc, char **argv) {
     if (height % 16 || width % 16) die("geometry must be divisible by 16");
     size_t pixel_count = (size_t)3 * (size_t)frames * (size_t)height *
                          (size_t)width;
-    float *pixels = malloc(pixel_count * sizeof(*pixels));
+    const char *rgb24_path = getenv("H3_TEST_RGB24");
+    float *pixels = rgb24_path ? read_rgb24(rgb24_path, frames, height, width) :
+                                 malloc(pixel_count * sizeof(*pixels));
     if (!pixels) die("cannot allocate synthetic pixels");
-    for (size_t index = 0; index < pixel_count; index++) {
-        uint32_t bits = (uint32_t)index * UINT32_C(1664525) +
-                        UINT32_C(1013904223);
-        pixels[index] = (float)(bits >> 8) * (1.0f / 16777215.0f);
-    }
+    if (!rgb24_path)
+        for (size_t index = 0; index < pixel_count; index++) {
+            uint32_t bits = (uint32_t)index * UINT32_C(1664525) +
+                            UINT32_C(1013904223);
+            pixels[index] = (float)(bits >> 8) * (1.0f / 16777215.0f);
+        }
     char error[512];
     h3_video_latent latent;
     double started = now();
@@ -102,27 +133,37 @@ int main(int argc, char **argv) {
         latent.width != width / 16) die("Ref2VA temporal geometry changed");
     if (latent.gpu_stats.submissions != (uint64_t)expected_submissions)
         die("unexpected command-buffer submission count");
-    if (latent.gpu_stats.host_tensor_reads != 1 ||
-        latent.gpu_stats.host_tensor_writes != 0)
+    size_t latent_count = (size_t)24 * (size_t)latent.time *
+                          (size_t)latent.height * (size_t)latent.width;
+    if (latent.gpu_stats.blit_copies != 0 ||
+        latent.gpu_stats.host_tensor_reads != 1 ||
+        latent.gpu_stats.host_tensor_writes != 0 ||
+        latent.gpu_stats.host_tensor_read_bytes !=
+            latent_count * sizeof(*latent.values) ||
+        latent.gpu_stats.host_tensor_write_bytes != 0)
         die("unexpected host tensor transfer count");
-    printf("encoder: wall=%.3fs gpu=%.3fs wait=%.3fs submissions=%llu "
-           "host-rw=%llu/%llu bytes=%llu/%llu peak=%.3fGiB alloc=%.3fGiB "
+    printf("encoder: wall=%.3fs encode=%.3fs gpu=%.3fs wait=%.3fs "
+           "submissions=%llu "
+           "blits=%llu host-rw=%llu/%llu bytes=%llu/%llu "
+           "peak=%llu(%.3fGiB) alloc=%llu(%.3fGiB) "
            "conv=%llu direct=%llu shape=24x%dx%dx%d chunks=%d pad=%d\n",
-           elapsed, latent.gpu_stats.gpu_seconds,
+           elapsed, latent.gpu_stats.command_encode_seconds,
+           latent.gpu_stats.gpu_seconds,
            latent.gpu_stats.command_wait_seconds,
            (unsigned long long)latent.gpu_stats.submissions,
+           (unsigned long long)latent.gpu_stats.blit_copies,
            (unsigned long long)latent.gpu_stats.host_tensor_reads,
            (unsigned long long)latent.gpu_stats.host_tensor_writes,
            (unsigned long long)latent.gpu_stats.host_tensor_read_bytes,
            (unsigned long long)latent.gpu_stats.host_tensor_write_bytes,
+           (unsigned long long)latent.gpu_stats.peak_live_bytes,
            (double)latent.gpu_stats.peak_live_bytes / (1024.0 * 1024.0 * 1024.0),
+           (unsigned long long)latent.gpu_stats.allocated_bytes,
            (double)latent.gpu_stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0),
            (unsigned long long)latent.gpu_stats.mps_conv_dispatches,
            (unsigned long long)latent.gpu_stats.direct_dispatches,
            latent.time, latent.height, latent.width, plan.chunks,
            plan.padded_frames);
-    size_t latent_count = (size_t)24 * (size_t)latent.time *
-                          (size_t)latent.height * (size_t)latent.width;
     double max_limit = 1e-6, l2_limit = 1e-7;
     const char *limit = getenv("H3_TEST_MAX_ABS");
     if (limit) max_limit = strtod(limit, NULL);
@@ -136,6 +177,8 @@ int main(int argc, char **argv) {
                 max_limit, l2_limit);
         free(want);
     }
+    const char *actual_latent = getenv("H3_TEST_ACTUAL_LATENT");
+    if (actual_latent) write_f32(actual_latent, latent.values, latent_count);
     if (argc == 9) {
         h3_video_frames decoded;
         started = now();
@@ -155,10 +198,19 @@ int main(int argc, char **argv) {
             write_f32(argv[8], decoded.rgb, decoded_count);
         } else {
             float *want = read_f32(argv[8], decoded_count);
+            double decoded_max_limit = max_limit;
+            double decoded_l2_limit = l2_limit;
+            limit = getenv("H3_TEST_DECODE_MAX_ABS");
+            if (limit) decoded_max_limit = strtod(limit, NULL);
+            limit = getenv("H3_TEST_DECODE_REL_L2");
+            if (limit) decoded_l2_limit = strtod(limit, NULL);
             compare("decoded oracle", decoded.rgb, want, decoded_count,
-                    max_limit, l2_limit);
+                    decoded_max_limit, decoded_l2_limit);
             free(want);
         }
+        const char *actual_decoded = getenv("H3_TEST_ACTUAL_DECODED");
+        if (actual_decoded)
+            write_f32(actual_decoded, decoded.rgb, decoded_count);
         h3_video_frames_free(&decoded);
     }
     h3_video_latent_free(&latent);

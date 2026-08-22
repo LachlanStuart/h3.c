@@ -758,6 +758,19 @@ references. Audio inputs are 2-15 seconds, at most three are
 accepted, their total decoded duration is capped at 15 seconds, and a standalone
 audio reference must be combined with an image or video reference.
 
+The VideoVAE encoder chains every tile forward into one Metal command buffer;
+Ref2VA temporal encoding adds one stitch submission per 17-frame chunk and one
+final drop-three submission. Scratch activations remain resident until their
+tile completes, trading higher peak unified memory for the removal of per-layer
+host waits. The encoder uses FP16 by default, matching ComfyUI's supported and
+default MiniMax H3 VideoVAE working precision. Set
+`H3_VIDEO_ENCODER_FP16=0` for the retained F32 comparison path. The FP16 path
+converts the F32 checkpoint weights once on Metal,
+normalizes/reorders each uploaded F32 source tile directly into FP16, and keeps
+padding, FP32-accumulating GroupNorm+SiLU, Float16 Conv3D, residual, and quant
+activations resident in native half storage. Temporal overlap, moment-to-latent
+normalization, and the returned latent remain F32.
+
 The native audio encoder matches the corrected MLX oracle at relative L2
 `3.59e-6` on a real two-second stereo fixture. The correction is important: the
 original MLX reshape interleaved left/right samples, whereas the official
