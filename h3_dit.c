@@ -195,6 +195,12 @@ struct h3_dit {
     h3_gpu_tensor *video_output_bf16;
     h3_gpu_tensor *previous_audio_velocity;
     h3_gpu_tensor *previous_video_velocity;
+    /* RES retains the preceding x_0 estimate in F32.  These are deliberately
+     * separate from the BF16 DiT final-head outputs: preserving the estimate
+     * at F32 matches the host solver and lets the next update stay entirely
+     * GPU resident. */
+    h3_gpu_tensor *previous_audio_denoised;
+    h3_gpu_tensor *previous_video_denoised;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -2610,6 +2616,168 @@ static int ensure_previous_velocities(h3_dit *dit, char *error,
     return 0;
 }
 
+static int ensure_previous_denoised(h3_dit *dit, char *error,
+                                    size_t error_size) {
+    if (dit->previous_video_denoised && dit->previous_audio_denoised) return 1;
+    free_tensor(&dit->previous_video_denoised);
+    free_tensor(&dit->previous_audio_denoised);
+    dit->previous_video_denoised = h3_gpu_tensor_new_f32(
+        dit->gpu, (size_t)dit->video_rows * VIDEO_PATCH);
+    dit->previous_audio_denoised = h3_gpu_tensor_new_f32(
+        dit->gpu, (size_t)dit->audio_rows * AUDIO_CHANNELS);
+    if (dit->previous_video_denoised && dit->previous_audio_denoised) return 1;
+    free_tensor(&dit->previous_video_denoised);
+    free_tensor(&dit->previous_audio_denoised);
+    fail(error, error_size, "cannot allocate GPU RES denoised history: %s",
+         h3_gpu_error(dit->gpu));
+    return 0;
+}
+
+/* Keep scalar schedule arithmetic on the host.  It is a handful of doubles
+ * per step, exactly mirrors h3_res_step(), and avoids making every tensor
+ * element repeat transcendental work. */
+static int res_coefficients(const float *sigmas, int step, int total_steps,
+                            float *decay, float *h, float *b1, float *b2,
+                            int *use_multistep) {
+    if (!sigmas || !decay || !h || !b1 || !b2 || !use_multistep ||
+        step < 0 || step >= total_steps || total_steps < 1 ||
+        !(sigmas[step] > sigmas[step + 1]) || sigmas[step + 1] < 0.0f)
+        return 0;
+    *use_multistep = step > 0 && sigmas[step + 1] != 0.0f;
+    *decay = 0.0f;
+    *h = 0.0f;
+    *b1 = 0.0f;
+    *b2 = 0.0f;
+    if (!*use_multistep) return 1;
+    double current = -log((double)sigmas[step]);
+    double next = -log((double)sigmas[step + 1]);
+    double previous = -log((double)sigmas[step - 1]);
+    double local_h = next - current;
+    double c2 = (previous - current) / local_h;
+    double phi1 = expm1(-local_h) / -local_h;
+    double phi2 = (phi1 - 1.0) / -local_h;
+    double local_b1 = phi1 - phi2 / c2;
+    double local_b2 = phi2 / c2;
+    if (!isfinite(local_h) || !isfinite(local_b1) || !isfinite(local_b2))
+        return 0;
+    *decay = (float)exp(-local_h);
+    *h = (float)local_h;
+    *b1 = (float)local_b1;
+    *b2 = (float)local_b2;
+    return isfinite(*decay);
+}
+
+/* GPU RES keeps the mutable samples in the generated ranges of video_input and
+ * audio_input.  DiT final heads already produce BF16 velocity directly on the
+ * GPU.  A single kernel per modality calculates x_0, applies RES and saves
+ * x_0 for the next step, so the only tensor boundary crossings are initial
+ * packing/uploads and final readback/unpacking. */
+static int denoise_res_gpu(h3_dit *dit, float *video_latent,
+                           float *audio_latent, h3_dit_progress progress,
+                           void *progress_opaque, char *error,
+                           size_t error_size) {
+    size_t video_count = (size_t)dit->video_rows * VIDEO_PATCH;
+    size_t audio_count = (size_t)dit->audio_rows * AUDIO_CHANNELS;
+    size_t video_offset = (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t audio_offset = (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (video_count > UINT32_MAX || audio_count > UINT32_MAX ||
+        video_offset > UINT32_MAX - video_count ||
+        audio_offset > UINT32_MAX - audio_count ||
+        !ensure_previous_denoised(dit, error, error_size)) return 0;
+
+    float *video_rows = malloc(video_count * sizeof(*video_rows));
+    float *audio_rows = malloc(audio_count * sizeof(*audio_rows));
+    if (!video_rows || !audio_rows) {
+        fail(error, error_size, "out of memory packing GPU RES latents");
+        free(video_rows);
+        free(audio_rows);
+        return 0;
+    }
+    /* From this mark to the closing sampler mark, an ordinary resident run
+     * must show exactly two host tensor writes and two reads—one per modality.
+     * The profile counters are intentionally part of the regression contract. */
+    h3_gpu_profile_mark(dit->gpu, "GPU RES sampler start");
+    int ok = h3_dit_patchify_video(video_latent, VIDEO_CHANNELS,
+        dit->latent_t, dit->latent_h, dit->latent_w, video_rows, video_count) &&
+        h3_dit_pack_audio(audio_latent, AUDIO_CHANNELS, dit->audio_t,
+                          audio_rows, audio_count) &&
+        h3_gpu_tensor_write_f32_range(dit->video_input, video_offset,
+                                      video_rows, video_count) &&
+        h3_gpu_tensor_write_f32_range(dit->audio_input, audio_offset,
+                                      audio_rows, audio_count);
+    if (!ok) fail(error, error_size, "cannot pack/write GPU RES latents");
+
+    int command_active = 0;
+    for (int step = 0; ok && step < dit->sigmas.steps; step++) {
+        float video_decay, video_h, video_b1, video_b2;
+        float audio_decay, audio_h, audio_b1, audio_b2;
+        int video_multistep, audio_multistep;
+        report(progress, progress_opaque, "denoise enqueue", step,
+               dit->sigmas.steps);
+        if (!command_active) {
+            ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                        "begin GPU RES command chain");
+            command_active = ok;
+        }
+        if (!ok || !res_coefficients(dit->sigmas.video, step,
+                                     dit->sigmas.steps, &video_decay,
+                                     &video_h, &video_b1, &video_b2,
+                                     &video_multistep) ||
+            !res_coefficients(dit->sigmas.audio, step,
+                              dit->sigmas.steps, &audio_decay, &audio_h,
+                              &audio_b1, &audio_b2, &audio_multistep)) {
+            if (ok) fail(error, error_size,
+                         "cannot derive GPU RES schedule coefficients at step %d",
+                         step);
+            break;
+        }
+        /* Command splitting may commit a root command for MPSGraph resource
+         * pressure, but h3_gpu_continue never waits; all denoising tensor
+         * dependencies remain queued on the same Metal command queue. */
+        ok = encode_forward(dit, step, 0, 0, 0, error, error_size) &&
+            gpu_op(dit, h3_gpu_res_velocity_bf16(
+                dit->gpu, dit->video_input, video_offset,
+                dit->video_output_bf16, dit->previous_video_denoised,
+                (uint32_t)video_count, dit->sigmas.video[step],
+                dit->sigmas.video[step + 1], video_decay, video_h,
+                video_b1, video_b2, video_multistep), error, error_size,
+                "GPU video RES step") &&
+            gpu_op(dit, h3_gpu_res_velocity_bf16(
+                dit->gpu, dit->audio_input, audio_offset,
+                dit->audio_output_bf16, dit->previous_audio_denoised,
+                (uint32_t)audio_count, dit->sigmas.audio[step],
+                dit->sigmas.audio[step + 1], audio_decay, audio_h,
+                audio_b1, audio_b2, audio_multistep), error, error_size,
+                "GPU audio RES step");
+        if (ok) report(progress, progress_opaque, "denoise enqueue", step + 1,
+                       dit->sigmas.steps);
+    }
+    if (ok && command_active)
+        ok = gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                    "submit GPU RES denoise");
+    if (ok) ok = h3_gpu_tensor_read_f32_range(
+                     dit->video_input, video_offset, video_rows, video_count) &&
+                 h3_gpu_tensor_read_f32_range(
+                     dit->audio_input, audio_offset, audio_rows, audio_count);
+    if (!ok && (!error || !*error))
+        fail(error, error_size, "cannot read GPU RES latents");
+    if (ok) ok = h3_dit_unpatchify_video(
+                     video_rows, VIDEO_CHANNELS, dit->latent_t, dit->latent_h,
+                     dit->latent_w, video_latent,
+                     h3_dit_video_elements(dit)) &&
+                 h3_dit_unpack_audio(audio_rows, AUDIO_CHANNELS, dit->audio_t,
+                                     audio_latent,
+                                     h3_dit_audio_elements(dit));
+    if (!ok && (!error || !*error))
+        fail(error, error_size, "cannot unpack GPU RES latents");
+    free(video_rows);
+    free(audio_rows);
+    if (ok) report(progress, progress_opaque, "denoise", dit->sigmas.steps,
+                   dit->sigmas.steps);
+    h3_gpu_profile_mark(dit->gpu, "GPU RES denoise");
+    return ok;
+}
+
 static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                              float *audio_latent, int reuse_interval,
                              h3_dit_progress progress, void *progress_opaque,
@@ -2799,6 +2967,14 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
         fail(error, error_size, "invalid DiT denoising arguments");
         return 0;
     }
+    /* Keep the existing host path as an explicit, readily selectable oracle
+     * for numerical A/B work.  GPU RES follows the same availability policy as
+     * GPU Euler unless H3_CPU_RES_SAMPLER asks for the reference solver. */
+    const char *cpu_res = getenv("H3_CPU_RES_SAMPLER");
+    if (gpu_sampler_requested(dit) &&
+        !(cpu_res && *cpu_res && strcmp(cpu_res, "0")))
+        return denoise_res_gpu(dit, video_latent, audio_latent, progress,
+                               progress_opaque, error, error_size);
     size_t video_count = h3_dit_video_elements(dit);
     size_t audio_count = h3_dit_audio_elements(dit);
     float *video_velocity = malloc(video_count * sizeof(*video_velocity));
@@ -3064,6 +3240,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_output);
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
+    FREE(previous_audio_denoised); FREE(previous_video_denoised);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {

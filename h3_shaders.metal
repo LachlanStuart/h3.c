@@ -4319,6 +4319,46 @@ kernel void h3_euler_bf16(device float *sample [[buffer(0)]],
     sample[sample_index] = fma(args.delta, velocity, sample[sample_index]);
 }
 
+/* Keep the RES state entirely in shared Metal buffers.  In particular, do not
+ * split the denoised calculation and the history copy into separate passes:
+ * both depend only on the old sample/history at this index and can be safely
+ * replaced after the new sample has been calculated. */
+struct h3_res_velocity_args {
+    uint sample_offset;
+    uint elements;
+    float sigma;
+    float sigma_next;
+    float decay;
+    float h;
+    float b1;
+    float b2;
+    uint use_multistep;
+};
+
+kernel void h3_res_velocity_bf16(device float *sample [[buffer(0)]],
+                                  device const ushort *velocity [[buffer(1)]],
+                                  device float *history [[buffer(2)]],
+                                  constant h3_res_velocity_args &args
+                                      [[buffer(3)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.elements) return;
+    uint sample_index = args.sample_offset + gid;
+    float current = sample[sample_index];
+    float denoised = fma(args.sigma, h3_bf16_to_f32(velocity[gid]), current);
+    float next;
+    if (args.use_multistep) {
+        next = args.decay * current + args.h *
+            fma(args.b2, history[gid], args.b1 * denoised);
+    } else {
+        /* (x - (x + sigma v)) / sigma == -v, but retain the same expression
+         * as the CPU reference so first/terminal-step equivalence is obvious. */
+        next = current + ((current - denoised) / args.sigma) *
+            (args.sigma_next - args.sigma);
+    }
+    history[gid] = denoised;
+    sample[sample_index] = next;
+}
+
 kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
                               device const ushort *up [[buffer(1)]],
                               device ushort *output [[buffer(2)]],

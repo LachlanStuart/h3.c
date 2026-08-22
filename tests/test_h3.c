@@ -1,5 +1,6 @@
 #include "h3_host.h"
 #include "h3_dit.h"
+#include "h3_gpu.h"
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
@@ -23,6 +24,196 @@ static int tests_run;
 
 static int close_enough(double value, double expected, double tolerance) {
     return fabs(value - expected) <= tolerance;
+}
+
+static float bf16_to_f32(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static int gpu_res_coefficients(const float *sigmas, int step, int steps,
+                                float *decay, float *h, float *b1,
+                                float *b2, int *multistep) {
+    if (!sigmas || !decay || !h || !b1 || !b2 || !multistep || step < 0 ||
+        step >= steps || !(sigmas[step] > sigmas[step + 1])) return 0;
+    *multistep = step > 0 && sigmas[step + 1] != 0.0f;
+    *decay = *h = *b1 = *b2 = 0.0f;
+    if (!*multistep) return 1;
+    double t = -log((double)sigmas[step]);
+    double next = -log((double)sigmas[step + 1]);
+    double previous = -log((double)sigmas[step - 1]);
+    double local_h = next - t;
+    double c2 = (previous - t) / local_h;
+    double phi1 = expm1(-local_h) / -local_h;
+    double phi2 = (phi1 - 1.0) / -local_h;
+    *decay = (float)exp(-local_h);
+    *h = (float)local_h;
+    *b1 = (float)(phi1 - phi2 / c2);
+    *b2 = (float)(phi2 / c2);
+    return isfinite(*decay) && isfinite(*h) && isfinite(*b1) &&
+        isfinite(*b2);
+}
+
+static uint32_t test_prng(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state;
+}
+
+static void test_gpu_res_solver(void) {
+    enum { COUNT = 257 };
+    char error[256];
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
+    if (!gpu) fprintf(stderr, "GPU RES test setup: %s\n", error);
+    CHECK(gpu != NULL);
+    float *host_sample = malloc(COUNT * sizeof(*host_sample));
+    float *host_velocity = malloc(COUNT * sizeof(*host_velocity));
+    float *host_denoised = malloc(COUNT * sizeof(*host_denoised));
+    float *host_old = malloc(COUNT * sizeof(*host_old));
+    float *host_next = malloc(COUNT * sizeof(*host_next));
+    float *got = malloc(COUNT * sizeof(*got));
+    uint16_t *bf16 = malloc(COUNT * sizeof(*bf16));
+    CHECK(host_sample && host_velocity && host_denoised && host_old &&
+          host_next && got && bf16);
+    h3_gpu_tensor *sample = h3_gpu_tensor_new_f32(gpu, COUNT);
+    h3_gpu_tensor *velocity_f32 = h3_gpu_tensor_new_f32(gpu, COUNT);
+    h3_gpu_tensor *velocity = h3_gpu_tensor_new_bf16(gpu, COUNT);
+    h3_gpu_tensor *history = h3_gpu_tensor_new_f32(gpu, COUNT);
+    CHECK(sample && velocity_f32 && velocity && history);
+    double worst_randomized_error = 0.0;
+    uint32_t seed = 0x2c1b3c6du;
+    for (size_t index = 0; index < COUNT; index++) {
+        host_velocity[index] = ((float)(test_prng(&seed) >> 8) /
+                                16777216.0f - 0.5f) * 3.0f;
+    }
+    CHECK(h3_gpu_tensor_write_f32(velocity_f32, host_velocity, COUNT));
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_cast_f32_to_bf16(gpu, velocity, velocity_f32, COUNT));
+    CHECK(h3_gpu_submit(gpu));
+    CHECK(h3_gpu_tensor_read_bf16(velocity, bf16, COUNT));
+    for (size_t index = 0; index < COUNT; index++)
+        host_velocity[index] = bf16_to_f32(bf16[index]);
+
+    const int cases[] = {4, 7, 10, 20};
+    for (size_t case_index = 0;
+         case_index < sizeof(cases) / sizeof(*cases); case_index++) {
+        h3_sigma_schedule schedule;
+        CHECK(h3_serving_schedule_build(cases[case_index], &schedule));
+        const float *grids[] = {schedule.video, schedule.audio};
+        for (size_t grid_index = 0; grid_index < 2; grid_index++) {
+            const float *sigmas = grids[grid_index];
+            const int selected_steps[] = {0, cases[case_index] / 2,
+                                          cases[case_index] - 1};
+            for (size_t selected = 0; selected < 3; selected++) {
+                int step = selected_steps[selected];
+                for (size_t index = 0; index < COUNT; index++) {
+                    host_sample[index] = ((float)(test_prng(&seed) >> 8) /
+                                          16777216.0f - 0.5f) * 4.0f;
+                    host_old[index] = ((float)(test_prng(&seed) >> 8) /
+                                       16777216.0f - 0.5f) * 4.0f;
+                }
+                float decay, h, b1, b2;
+                int multistep;
+                CHECK(gpu_res_coefficients(sigmas, step, cases[case_index],
+                                           &decay, &h, &b1, &b2, &multistep));
+                CHECK(h3_res_velocity_step(host_next, host_sample,
+                                           host_velocity, host_denoised,
+                                           multistep ? host_old : NULL, COUNT,
+                                           sigmas, step, cases[case_index]));
+                CHECK(h3_gpu_tensor_write_f32(sample, host_sample, COUNT));
+                CHECK(h3_gpu_tensor_write_f32(history, host_old, COUNT));
+                h3_gpu_stats before, after;
+                CHECK(h3_gpu_get_stats(gpu, &before));
+                CHECK(h3_gpu_begin(gpu));
+                CHECK(h3_gpu_res_velocity_bf16(
+                    gpu, sample, 0, velocity, history, COUNT, sigmas[step],
+                    sigmas[step + 1], decay, h, b1, b2, multistep));
+                CHECK(h3_gpu_submit(gpu));
+                CHECK(h3_gpu_get_stats(gpu, &after));
+                CHECK(after.submissions == before.submissions + 1);
+                CHECK(after.blit_copies == before.blit_copies);
+                CHECK(after.direct_dispatches == before.direct_dispatches + 1);
+                CHECK(after.host_tensor_reads == before.host_tensor_reads);
+                CHECK(after.host_tensor_writes == before.host_tensor_writes);
+                CHECK(after.host_tensor_read_bytes ==
+                      before.host_tensor_read_bytes);
+                CHECK(after.host_tensor_write_bytes ==
+                      before.host_tensor_write_bytes);
+                CHECK(h3_gpu_tensor_read_f32(sample, got, COUNT));
+                double maximum = 0.0;
+                for (size_t index = 0; index < COUNT; index++) {
+                    double delta = fabs((double)got[index] - host_next[index]);
+                    if (delta > maximum) maximum = delta;
+                }
+                if (maximum > worst_randomized_error)
+                    worst_randomized_error = maximum;
+                /* Scalar coefficients are rounded to F32 for Metal, while
+                 * the host oracle evaluates its element arithmetic in double.
+                 * This measured 1.1e-6 max on the seeded randomized matrix;
+                 * 5e-5 leaves a narrow, architecture-stable safety margin. */
+                CHECK(maximum < 5e-5);
+            }
+        }
+    }
+
+    /* A constant velocity remains an exact endpoint invariant for both native
+     * schedules.  Keep every step in one submitted command chain: any hidden
+     * per-step synchronization would make this counter assertion fail. */
+    for (size_t case_index = 0;
+         case_index < sizeof(cases) / sizeof(*cases); case_index++) {
+        h3_sigma_schedule schedule;
+        CHECK(h3_serving_schedule_build(cases[case_index], &schedule));
+        const float *grids[] = {schedule.video, schedule.audio};
+        for (size_t grid_index = 0; grid_index < 2; grid_index++) {
+            const float *sigmas = grids[grid_index];
+            for (size_t index = 0; index < COUNT; index++) {
+                host_sample[index] = 1.0f;
+                host_velocity[index] = 0.5f;
+            }
+            CHECK(h3_gpu_tensor_write_f32(velocity_f32, host_velocity, COUNT));
+            CHECK(h3_gpu_begin(gpu));
+            CHECK(h3_gpu_cast_f32_to_bf16(gpu, velocity, velocity_f32, COUNT));
+            CHECK(h3_gpu_submit(gpu));
+            CHECK(h3_gpu_tensor_write_f32(sample, host_sample, COUNT));
+            CHECK(h3_gpu_tensor_write_f32(history, host_sample, COUNT));
+            h3_gpu_stats before, after;
+            CHECK(h3_gpu_get_stats(gpu, &before));
+            CHECK(h3_gpu_begin(gpu));
+            for (int step = 0; step < cases[case_index]; step++) {
+                float decay, h, b1, b2;
+                int multistep;
+                CHECK(gpu_res_coefficients(sigmas, step, cases[case_index],
+                                           &decay, &h, &b1, &b2, &multistep));
+                CHECK(h3_gpu_res_velocity_bf16(
+                    gpu, sample, 0, velocity, history, COUNT, sigmas[step],
+                    sigmas[step + 1], decay, h, b1, b2, multistep));
+            }
+            CHECK(h3_gpu_submit(gpu));
+            CHECK(h3_gpu_get_stats(gpu, &after));
+            CHECK(after.submissions == before.submissions + 1);
+            CHECK(after.blit_copies == before.blit_copies);
+            CHECK(after.direct_dispatches == before.direct_dispatches +
+                  (uint64_t)cases[case_index]);
+            CHECK(after.host_tensor_reads == before.host_tensor_reads);
+            CHECK(after.host_tensor_writes == before.host_tensor_writes);
+            CHECK(after.host_tensor_read_bytes == before.host_tensor_read_bytes);
+            CHECK(after.host_tensor_write_bytes ==
+                  before.host_tensor_write_bytes);
+            CHECK(h3_gpu_tensor_read_f32(sample, got, COUNT));
+            for (size_t index = 0; index < COUNT; index++)
+                CHECK(close_enough(got[index], 1.5, 5e-5));
+        }
+    }
+    h3_gpu_tensor_free(sample);
+    h3_gpu_tensor_free(velocity_f32);
+    h3_gpu_tensor_free(velocity);
+    h3_gpu_tensor_free(history);
+    h3_gpu_free(gpu);
+    free(host_sample); free(host_velocity); free(host_denoised);
+    free(host_old); free(host_next); free(got); free(bf16);
+    printf("GPU RES randomized host parity: max absolute %.9g\n",
+           worst_randomized_error);
 }
 
 static void test_temporal_and_canvas(void) {
@@ -444,6 +635,7 @@ int main(void) {
     test_layout_ref2va();
     test_safetensors();
     test_rng_and_solver();
+    test_gpu_res_solver();
     test_rgb_resize();
     test_dit_row_conversions();
     test_metal_probe();

@@ -25,6 +25,12 @@ typedef struct {
     uint64_t mps_sdpa_dispatches;
     uint64_t blit_copies;
     uint64_t submissions;
+    /* CPU access to shared Metal buffers.  These counters make sampler
+     * boundary crossings observable in a profile rather than inferred. */
+    uint64_t host_tensor_reads;
+    uint64_t host_tensor_writes;
+    uint64_t host_tensor_read_bytes;
+    uint64_t host_tensor_write_bytes;
     double command_encode_seconds;
     double command_wait_seconds;
     /* Root MTLCommandBuffer timestamps; MPSGraph may schedule child buffers,
@@ -606,6 +612,22 @@ int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
                       size_t sample_offset, const h3_gpu_tensor *last,
                       const h3_gpu_tensor *previous, uint32_t elements,
                       float delta, float ratio);
+/* Apply one RES step without materialising a host-side velocity or denoised
+ * tensor. `sample` holds the full F32 input tensor; the generated range begins
+ * at sample_offset. `velocity` is the DiT's BF16 final head and `history`
+ * retains the preceding denoised estimate in F32.  The scalar coefficients are
+ * deliberately computed by the host from the exact serving schedule.
+ *
+ * When use_multistep is false this performs the first/terminal Euler-equivalent
+ * RES update.  In either case it replaces history with x_t + sigma * velocity.
+ */
+int h3_gpu_res_velocity_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
+                             size_t sample_offset,
+                             const h3_gpu_tensor *velocity,
+                             h3_gpu_tensor *history, uint32_t elements,
+                             float sigma, float sigma_next,
+                             float decay, float h, float b1, float b2,
+                             int use_multistep);
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);

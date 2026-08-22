@@ -192,7 +192,8 @@ static void h3_gpu_profile_emit(H3GPU *gpu, NSString *phase,
         "h3 profile: %-24s %-14s wall=%8.3fs encode=%7.3fs "
         "wait=%8.3fs root-gpu=%7.3fs "
         "peak=%7.3fGiB alloc=%7.3fGiB submissions=%llu "
-        "direct=%llu linear=%llu conv=%llu attention=%llu\n",
+        "direct=%llu linear=%llu conv=%llu attention=%llu "
+        "host-rw=%llu/%llu (%0.3f/%0.3fMiB)\n",
         label.UTF8String, phase.UTF8String, wall,
         value.command_encode_seconds - start.command_encode_seconds,
         value.command_wait_seconds - start.command_wait_seconds,
@@ -210,7 +211,17 @@ static void h3_gpu_profile_emit(H3GPU *gpu, NSString *phase,
         (unsigned long long)h3_gpu_counter_delta(value.mps_conv_dispatches,
                                                  start.mps_conv_dispatches),
         (unsigned long long)h3_gpu_counter_delta(value.mps_sdpa_dispatches,
-                                                 start.mps_sdpa_dispatches));
+                                                 start.mps_sdpa_dispatches),
+        (unsigned long long)h3_gpu_counter_delta(value.host_tensor_reads,
+                                                 start.host_tensor_reads),
+        (unsigned long long)h3_gpu_counter_delta(value.host_tensor_writes,
+                                                 start.host_tensor_writes),
+        (double)h3_gpu_counter_delta(value.host_tensor_read_bytes,
+                                     start.host_tensor_read_bytes) /
+            (1024.0 * 1024.0),
+        (double)h3_gpu_counter_delta(value.host_tensor_write_bytes,
+                                     start.host_tensor_write_bytes) /
+            (1024.0 * 1024.0));
 }
 
 static void h3_gpu_set_error(H3GPU *gpu, NSString *format, ...) {
@@ -444,7 +455,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
             @"h3_token_expand_delta_bf16",
             @"h3_token_expand_adaln_bf16",
-            @"h3_euler_bf16", @"h3_silu_mul_bf16",
+            @"h3_euler_bf16", @"h3_res_velocity_bf16", @"h3_silu_mul_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
             @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
@@ -844,6 +855,13 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
     const unsigned char *source = TENSOR(tensor).buffer.contents;
     memcpy(values, source + source_offset * sizeof(float),
            elements * sizeof(float));
+    H3GPU *gpu = TENSOR(tensor).owner;
+    if (gpu) {
+        h3_gpu_stats stats = gpu.stats;
+        stats.host_tensor_reads++;
+        stats.host_tensor_read_bytes += elements * sizeof(float);
+        gpu.stats = stats;
+    }
     return 1;
 }
 
@@ -852,6 +870,13 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_BF16 ||
         elements > TENSOR(tensor).elements) return 0;
     memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(uint16_t));
+    H3GPU *gpu = TENSOR(tensor).owner;
+    if (gpu) {
+        h3_gpu_stats stats = gpu.stats;
+        stats.host_tensor_reads++;
+        stats.host_tensor_read_bytes += elements * sizeof(uint16_t);
+        gpu.stats = stats;
+    }
     return 1;
 }
 
@@ -869,6 +894,13 @@ int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
     unsigned char *destination = TENSOR(tensor).buffer.contents;
     memcpy(destination + destination_offset * sizeof(float), values,
            elements * sizeof(float));
+    H3GPU *gpu = TENSOR(tensor).owner;
+    if (gpu) {
+        h3_gpu_stats stats = gpu.stats;
+        stats.host_tensor_writes++;
+        stats.host_tensor_write_bytes += elements * sizeof(float);
+        gpu.stats = stats;
+    }
     return 1;
 }
 
@@ -886,6 +918,13 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
     unsigned char *destination = TENSOR(tensor).buffer.contents;
     memcpy(destination + destination_offset * sizeof(uint16_t), values,
            elements * sizeof(uint16_t));
+    H3GPU *gpu = TENSOR(tensor).owner;
+    if (gpu) {
+        h3_gpu_stats stats = gpu.stats;
+        stats.host_tensor_writes++;
+        stats.host_tensor_write_bytes += elements * sizeof(uint16_t);
+        gpu.stats = stats;
+    }
     return 1;
 }
 
@@ -1040,6 +1079,11 @@ typedef struct {
 } gqa_args;
 typedef struct { uint32_t sample_offset, elements; float delta, ratio; }
     euler_args;
+typedef struct {
+    uint32_t sample_offset, elements;
+    float sigma, sigma_next, decay, h, b1, b2;
+    uint32_t use_multistep;
+} res_velocity_args;
 
 static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
@@ -4710,6 +4754,40 @@ int h3_gpu_euler_bf16(h3_gpu *opaque, h3_gpu_tensor *sample,
             [encoder setBuffer:TENSOR(sample).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(last).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(previous).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_res_velocity_bf16(h3_gpu *opaque, h3_gpu_tensor *sample,
+                             size_t sample_offset,
+                             const h3_gpu_tensor *velocity,
+                             h3_gpu_tensor *history, uint32_t elements,
+                             float sigma, float sigma_next,
+                             float decay, float h, float b1, float b2,
+                             int use_multistep) {
+    H3GPU *gpu = GPU(opaque);
+    if (!sample || TENSOR(sample).dtype != H3_GPU_F32 ||
+        !history || TENSOR(history).dtype != H3_GPU_F32 ||
+        sample_offset > TENSOR(sample).elements ||
+        elements > TENSOR(sample).elements - sample_offset ||
+        sample_offset > UINT32_MAX || elements > UINT32_MAX - sample_offset ||
+        !h3_gpu_require_bf16(gpu, velocity, elements, @"RES velocity") ||
+        !h3_gpu_require_elements(gpu, history, elements, @"RES history") ||
+        !(sigma > sigma_next && sigma_next >= 0.0f) ||
+        !isfinite(sigma) || !isfinite(sigma_next) ||
+        (use_multistep && (!isfinite(decay) || !isfinite(h) ||
+                           !isfinite(b1) || !isfinite(b2)))) {
+        h3_gpu_set_error(gpu, @"invalid GPU RES step arguments");
+        return 0;
+    }
+    res_velocity_args args = {(uint32_t)sample_offset, elements, sigma,
+                              sigma_next, decay, h, b1, b2,
+                              use_multistep ? 1u : 0u};
+    return h3_gpu_dispatch_1d(gpu, @"h3_res_velocity_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(sample).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(velocity).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(history).buffer offset:0 atIndex:2];
             [encoder setBytes:&args length:sizeof(args) atIndex:3];
         });
 }
