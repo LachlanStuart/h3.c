@@ -29,6 +29,7 @@ static void usage(const char *program) {
         "      --frames N         Requested frames (default: 56)\n"
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
         "      --steps N          Denoising passes (default: 20)\n"
+        "      --sampler S        Sampler: res (default) or euler\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
@@ -73,6 +74,13 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static h3_sampler parse_sampler(const char *value) {
+    if (!strcmp(value, "res")) return H3_SAMPLER_RES;
+    if (!strcmp(value, "euler")) return H3_SAMPLER_EULER;
+    fprintf(stderr, "h3: sampler must be res or euler\n");
+    exit(2);
 }
 
 static int frames_from_seconds(const char *value) {
@@ -244,7 +252,7 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 
 int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
-           OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
+           OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_SAMPLER, OPT_REUSE,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -277,6 +285,7 @@ int main(int argc, char **argv) {
         {"frames", required_argument, NULL, OPT_FRAMES},
         {"seconds", required_argument, NULL, OPT_SECONDS},
         {"steps", required_argument, NULL, OPT_STEPS},
+        {"sampler", required_argument, NULL, OPT_SAMPLER},
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
@@ -362,6 +371,7 @@ int main(int argc, char **argv) {
                 seconds_given = 1;
                 break;
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
+            case OPT_SAMPLER: params.sampler = parse_sampler(optarg); break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
@@ -490,7 +500,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "h3: --seconds and --frames are mutually exclusive\n");
         return 2;
     }
-    if (prompt && params.steps >= 2 && params.steps <= 7 &&
+    if (prompt && params.sampler == H3_SAMPLER_EULER &&
+        params.steps >= 2 && params.steps <= 7 &&
         params.denoise_reuse > 1) {
         fprintf(stderr,
             "h3: warning: --reuse with only %d denoising steps leaves very "
@@ -525,7 +536,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "h3: graphical output uses %s\n",
                         h3_terminal_protocol_name(cli.terminal));
                 params.on_frame = cli_frame;
-                params.preview_denoise = 1;
+                if (params.sampler == H3_SAMPLER_EULER)
+                    params.preview_denoise = 1;
+                else
+                    fprintf(stderr, "h3: RES shows decoded frames only; "
+                            "live denoising previews require Euler\n");
             }
         }
         cli.render_clock_active =

@@ -519,6 +519,11 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "denoising steps must be in [2, 1000]");
         return 0;
     }
+    if (params->sampler != H3_SAMPLER_RES &&
+        params->sampler != H3_SAMPLER_EULER) {
+        h3_set_error(ctx, "unknown sampler");
+        return 0;
+    }
     if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
         h3_set_error(ctx, "denoise reuse must be in [1, 3]");
         return 0;
@@ -569,6 +574,14 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     if (params->preview_denoise && !params->on_frame) {
         h3_set_error(ctx, "denoising preview requires a frame callback");
+        return 0;
+    }
+    if (params->sampler == H3_SAMPLER_RES && params->preview_denoise) {
+        h3_set_error(ctx, "RES does not yet support live denoising previews");
+        return 0;
+    }
+    if (params->sampler == H3_SAMPLER_RES && params->denoise_reuse > 1) {
+        h3_set_error(ctx, "RES requires denoise reuse 1");
         return 0;
     }
     if (params->core_reuse > 1 && params->denoise_reuse > 1) {
@@ -1578,12 +1591,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
-    if (!h3_dit_denoise_euler_preview(
+    int denoised = params->sampler == H3_SAMPLER_RES ?
+        h3_dit_denoise(dit, video, audio, h3_dit_progress_bridge, &progress,
+                       detail, sizeof(detail)) :
+        h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
             preview_decoder ? h3_deliver_denoise_preview : NULL,
             preview_decoder ? &live_preview : NULL,
-            detail, sizeof(detail))) {
+            detail, sizeof(detail));
+    if (!denoised) {
         if (!live_preview.failed) h3_set_error(ctx, "%s", detail);
         if (dit_is_cached) {
             ctx->dit = NULL;

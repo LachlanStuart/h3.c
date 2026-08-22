@@ -474,9 +474,14 @@ environment variables retained for exact A/B diagnosis.
 
 ### Sampler and DiT controls
 
-The default sampler uses the released shifted video/audio schedule. `--steps`
+`--sampler res` is the local default after paired visual review; `--sampler
+euler` remains available for live denoising previews and whole-denoiser reuse.
+Both use the released shifted video/audio schedules, and both update video and
+audio. RES uses the current and previous denoised estimates on middle steps;
+the present implementation transfers its state through the host and was about
+10.5% slower in denoising in a 10-step 608x352 Ref2VA comparison. `--steps`
 always names the number of denoising passes, with terminal zero added after the
-last pass. Whole-denoiser reuse evaluates the first and last pass plus every
+last pass. Whole-denoiser reuse is Euler-only: it evaluates the first and last pass plus every
 requested interval, then extrapolates skipped video and audio velocities on
 their independent schedules. With very small step counts, keep `--reuse 1`.
 

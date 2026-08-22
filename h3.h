@@ -46,6 +46,11 @@ typedef enum {
     H3_REFERENCE_IMAGE_MAX = 1
 } h3_reference_image_size;
 
+typedef enum {
+    H3_SAMPLER_RES = 0,
+    H3_SAMPLER_EULER = 1
+} h3_sampler;
+
 typedef struct {
     int width;
     int height;
@@ -67,6 +72,7 @@ typedef struct {
     int height;
     int frames;
     int steps;
+    h3_sampler sampler;
     uint64_t seed;
     const char *output_path;
     const char *first_frame;
@@ -130,7 +136,7 @@ typedef struct {
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
+    H3_SAMPLER_RES, UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 

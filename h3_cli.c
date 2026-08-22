@@ -168,6 +168,7 @@ static void print_help(void) {
     puts("  !frames [N]              Set or show requested frames");
     puts("  !seconds [N]             Set duration at 24 fps");
     puts("  !steps [N]               Set or show denoising steps");
+    puts("  !sampler [res|euler]     Set or show the sampler");
     puts("  !reuse [N]               Set or show denoiser reuse");
     puts("  !layers [N]              Set or show active DiT blocks");
     puts("  !core-reuse [N]          Set or show core reuse");
@@ -200,9 +201,11 @@ static void print_status(const h3_cli_state *state) {
                state->params.render_height);
     printf("\nFrames: %d requested, %d generated (%.3g seconds)\n",
            state->params.frames, aligned, (double)aligned / H3_FPS);
-    printf("Steps: %d | reuse: %d | layers: %d | core reuse: %d | "
+    printf("Steps: %d | sampler: %s | reuse: %d | layers: %d | core reuse: %d | "
            "tokens: %s | weights: %s | FC2: %s\n",
-           state->params.steps, state->params.denoise_reuse,
+           state->params.steps,
+           state->params.sampler == H3_SAMPLER_RES ? "RES" : "Euler",
+           state->params.denoise_reuse,
            state->params.dit_layers, state->params.core_reuse,
            state->params.token_reduction ? "reduced" : "full",
            state->params.ssd_streaming ? "SSD BF16" : "resident",
@@ -448,8 +451,10 @@ static int generate(h3_cli_state *state, const char *prompt) {
     params.first_frame = state->first_frame;
     params.last_frame = state->last_frame;
     params.output_path = output;
-    params.preview_denoise = state->show && state->terminal != H3_TERM_NONE;
-    params.on_frame = params.preview_denoise ? cli_frame : NULL;
+    params.preview_denoise = state->show && state->terminal != H3_TERM_NONE &&
+                             params.sampler == H3_SAMPLER_EULER;
+    params.on_frame = state->show && state->terminal != H3_TERM_NONE ?
+                      cli_frame : NULL;
     params.on_progress = cli_progress;
     params.callback_opaque = state;
     state->phase[0] = '\0';
@@ -584,8 +589,27 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         }
     } else if (!strcasecmp(command, "steps")) {
         set_integer(argument, "Steps", 1, H3_MAX_STEPS, &state->params.steps);
+    } else if (!strcasecmp(command, "sampler")) {
+        if (!*argument)
+            printf("Sampler: %s\n", state->params.sampler == H3_SAMPLER_RES ?
+                   "RES" : "Euler");
+        else if (!strcasecmp(argument, "res")) {
+            state->params.sampler = H3_SAMPLER_RES;
+            state->params.denoise_reuse = 1;
+            puts("Sampler: RES (reuse reset to 1)");
+        } else if (!strcasecmp(argument, "euler")) {
+            state->params.sampler = H3_SAMPLER_EULER;
+            puts("Sampler: Euler");
+        } else {
+            fprintf(stderr, "h3: sampler must be res or euler\n");
+        }
     } else if (!strcasecmp(command, "reuse")) {
-        set_integer(argument, "Reuse", 1, 32, &state->params.denoise_reuse);
+        if (state->params.sampler == H3_SAMPLER_RES && *argument &&
+            strcmp(argument, "1"))
+            fprintf(stderr, "h3: RES requires reuse 1\n");
+        else
+            set_integer(argument, "Reuse", 1, 32,
+                        &state->params.denoise_reuse);
     } else if (!strcasecmp(command, "layers")) {
         set_integer(argument, "Layers", H3_MIN_DIT_LAYERS,
                     H3_DEFAULT_DIT_LAYERS, &state->params.dit_layers);

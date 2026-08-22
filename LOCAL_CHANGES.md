@@ -7,3 +7,9 @@
 - [PR #34](https://github.com/antirez/h3.c/pull/34) — `281d15b4a1ff4ad84ff1aaf57dce9b92a34c7db5`
 - [PR #35](https://github.com/antirez/h3.c/pull/35) — `caddf2f063db9aeed8efc45ed00862c1436f2557`
 - [PR #44](https://github.com/antirez/h3.c/pull/44) — `1e0bdcbf10c4ee981ffee96d929c2e2160c8e3a4`
+
+## Local behavior
+
+- Added an explicit `--sampler res|euler` selector and made RES the local
+  default after the paired Segment B review. Euler remains available for live
+  denoising previews and denoiser reuse; RES requires `--reuse 1`.
