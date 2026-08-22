@@ -66,13 +66,22 @@ int main(void) {
         CONV_INPUT_COUNT = CONV_D * CONV_H * CONV_W * CONV_I,
         CONV_WEIGHT_COUNT = CONV_O * CONV_I * 3 * 3 * 3,
         CONV_OUTPUT_COUNT = (CONV_D - 2) * (CONV_H - 2) *
-                            (CONV_W - 2) * CONV_O
+                            (CONV_W - 2) * CONV_O,
+        /* Decoder attention uses this exact layout: [row,head,3,dimension]. */
+        DECODER_SEQUENCE = 3, DECODER_HEADS = 2, DECODER_HEAD_DIM = 4,
+        DECODER_ROPE_HALF = 1,
+        DECODER_QKV_COUNT = DECODER_SEQUENCE * DECODER_HEADS *
+                            DECODER_HEAD_DIM * 3,
+        DECODER_Q_COUNT = DECODER_SEQUENCE * DECODER_HEADS * DECODER_HEAD_DIM,
+        DECODER_ROPE_COUNT = DECODER_SEQUENCE * DECODER_ROPE_HALF
     };
     float source[NORM_COUNT], norm_weight[NORM_C], norm_bias[NORM_C];
     float pixels[PIXEL_COUNT];
     float pad_source[PAD_D * PAD_H * PAD_W * PAD_C];
     float conv_source[CONV_INPUT_COUNT], conv_weight[CONV_WEIGHT_COUNT];
     float conv_bias[CONV_O];
+    float decoder_qkv[DECODER_QKV_COUNT], decoder_rope_cos[DECODER_ROPE_COUNT];
+    float decoder_rope_sin[DECODER_ROPE_COUNT];
     h3_gpu_tensor *source_f32 = new_f32(gpu, source, NORM_COUNT, 1);
     h3_gpu_tensor *weight_f32 = new_f32(gpu, norm_weight, NORM_C, 20);
     h3_gpu_tensor *bias_f32 = new_f32(gpu, norm_bias, NORM_C, 40);
@@ -84,6 +93,12 @@ int main(void) {
     h3_gpu_tensor *conv_weight_f32 = new_f32(
         gpu, conv_weight, CONV_WEIGHT_COUNT, 100);
     h3_gpu_tensor *conv_bias_f32 = new_f32(gpu, conv_bias, CONV_O, 120);
+    h3_gpu_tensor *decoder_qkv_f32 = new_f32(
+        gpu, decoder_qkv, DECODER_QKV_COUNT, 140);
+    h3_gpu_tensor *decoder_rope_cos_f32 = new_f32(
+        gpu, decoder_rope_cos, DECODER_ROPE_COUNT, 160);
+    h3_gpu_tensor *decoder_rope_sin_f32 = new_f32(
+        gpu, decoder_rope_sin, DECODER_ROPE_COUNT, 180);
 
 #define NEW_F16(name, count) \
     h3_gpu_tensor *name = h3_gpu_tensor_new_f16(gpu, (count)); \
@@ -112,6 +127,16 @@ int main(void) {
     NEW_F16(conv_f16, CONV_OUTPUT_COUNT);
     NEW_F32(conv_fp16_f32, CONV_OUTPUT_COUNT);
     NEW_F32(conv_f32, CONV_OUTPUT_COUNT);
+    NEW_F16(decoder_qkv_f16, DECODER_QKV_COUNT);
+    NEW_F16(decoder_query_f16, DECODER_Q_COUNT);
+    NEW_F16(decoder_key_f16, DECODER_Q_COUNT);
+    NEW_F16(decoder_value_f16, DECODER_Q_COUNT);
+    NEW_F32(decoder_query_fp16_f32, DECODER_Q_COUNT);
+    NEW_F32(decoder_key_fp16_f32, DECODER_Q_COUNT);
+    NEW_F32(decoder_value_fp16_f32, DECODER_Q_COUNT);
+    NEW_F32(decoder_query_f32, DECODER_Q_COUNT);
+    NEW_F32(decoder_key_f32, DECODER_Q_COUNT);
+    NEW_F32(decoder_value_f32, DECODER_Q_COUNT);
 
     gpu_check(gpu, h3_gpu_begin(gpu), "begin");
     gpu_check(gpu, h3_gpu_cast_f32_to_f16(
@@ -174,6 +199,28 @@ int main(void) {
     gpu_check(gpu, h3_gpu_cast_f16_to_f32(
         gpu, conv_fp16_f32, conv_f16, CONV_OUTPUT_COUNT),
         "cast Conv3D result");
+    gpu_check(gpu, h3_gpu_cast_f32_to_f16(
+        gpu, decoder_qkv_f16, decoder_qkv_f32, DECODER_QKV_COUNT),
+        "cast decoder QKV");
+    gpu_check(gpu, h3_gpu_video_qkv_rope_f32(
+        gpu, decoder_query_f32, decoder_key_f32, decoder_value_f32,
+        decoder_qkv_f32, decoder_rope_cos_f32, decoder_rope_sin_f32,
+        DECODER_SEQUENCE, DECODER_HEADS, DECODER_HEAD_DIM,
+        DECODER_ROPE_HALF, 1e-5f), "F32 decoder QKV/RoPE");
+    gpu_check(gpu, h3_gpu_video_qkv_rope_f16(
+        gpu, decoder_query_f16, decoder_key_f16, decoder_value_f16,
+        decoder_qkv_f16, decoder_rope_cos_f32, decoder_rope_sin_f32,
+        DECODER_SEQUENCE, DECODER_HEADS, DECODER_HEAD_DIM,
+        DECODER_ROPE_HALF, 1e-5f), "F16 decoder QKV/RoPE");
+    gpu_check(gpu, h3_gpu_cast_f16_to_f32(
+        gpu, decoder_query_fp16_f32, decoder_query_f16, DECODER_Q_COUNT),
+        "cast decoder query result");
+    gpu_check(gpu, h3_gpu_cast_f16_to_f32(
+        gpu, decoder_key_fp16_f32, decoder_key_f16, DECODER_Q_COUNT),
+        "cast decoder key result");
+    gpu_check(gpu, h3_gpu_cast_f16_to_f32(
+        gpu, decoder_value_fp16_f32, decoder_value_f16, DECODER_Q_COUNT),
+        "cast decoder value result");
     gpu_check(gpu, h3_gpu_submit(gpu), "submit");
 
     float got_norm[NORM_COUNT], want_norm[NORM_COUNT];
@@ -181,6 +228,9 @@ int main(void) {
     float got_pixels[PIXEL_COUNT], want_pixels[PIXEL_COUNT];
     float got_pad[PAD_OUT_COUNT], want_pad[PAD_OUT_COUNT];
     float got_conv[CONV_OUTPUT_COUNT], want_conv[CONV_OUTPUT_COUNT];
+    float got_decoder_query[DECODER_Q_COUNT], want_decoder_query[DECODER_Q_COUNT];
+    float got_decoder_key[DECODER_Q_COUNT], want_decoder_key[DECODER_Q_COUNT];
+    float got_decoder_value[DECODER_Q_COUNT], want_decoder_value[DECODER_Q_COUNT];
     if (!h3_gpu_tensor_read_f32(norm_fp16_f32, got_norm, NORM_COUNT) ||
         !h3_gpu_tensor_read_f32(norm_f32, want_norm, NORM_COUNT) ||
         !h3_gpu_tensor_read_f32(sum_fp16_f32, got_sum, NORM_COUNT) ||
@@ -190,7 +240,19 @@ int main(void) {
         !h3_gpu_tensor_read_f32(pad_fp16_f32, got_pad, PAD_OUT_COUNT) ||
         !h3_gpu_tensor_read_f32(pad_f32, want_pad, PAD_OUT_COUNT) ||
         !h3_gpu_tensor_read_f32(conv_fp16_f32, got_conv, CONV_OUTPUT_COUNT) ||
-        !h3_gpu_tensor_read_f32(conv_f32, want_conv, CONV_OUTPUT_COUNT))
+        !h3_gpu_tensor_read_f32(conv_f32, want_conv, CONV_OUTPUT_COUNT) ||
+        !h3_gpu_tensor_read_f32(decoder_query_fp16_f32, got_decoder_query,
+                                DECODER_Q_COUNT) ||
+        !h3_gpu_tensor_read_f32(decoder_query_f32, want_decoder_query,
+                                DECODER_Q_COUNT) ||
+        !h3_gpu_tensor_read_f32(decoder_key_fp16_f32, got_decoder_key,
+                                DECODER_Q_COUNT) ||
+        !h3_gpu_tensor_read_f32(decoder_key_f32, want_decoder_key,
+                                DECODER_Q_COUNT) ||
+        !h3_gpu_tensor_read_f32(decoder_value_fp16_f32, got_decoder_value,
+                                DECODER_Q_COUNT) ||
+        !h3_gpu_tensor_read_f32(decoder_value_f32, want_decoder_value,
+                                DECODER_Q_COUNT))
         fail("cannot read oracle outputs");
     const float pixel_mean[] = {0.485f, 0.456f, 0.406f};
     const float pixel_std[] = {0.229f, 0.224f, 0.225f};
@@ -213,11 +275,17 @@ int main(void) {
     compare("causal/reflect pad", got_pad, want_pad, PAD_OUT_COUNT,
             0.00025, 0.0003);
     compare("Conv3D", got_conv, want_conv, CONV_OUTPUT_COUNT, 0.01, 0.0015);
+    compare("decoder QKV/RoPE query", got_decoder_query, want_decoder_query,
+            DECODER_Q_COUNT, 0.002, 0.001);
+    compare("decoder QKV/RoPE key", got_decoder_key, want_decoder_key,
+            DECODER_Q_COUNT, 0.002, 0.001);
+    compare("decoder QKV/RoPE value", got_decoder_value, want_decoder_value,
+            DECODER_Q_COUNT, 0.00025, 0.0003);
 
     h3_gpu_stats stats;
     if (!h3_gpu_get_stats(gpu, &stats) || stats.submissions != 1 ||
         stats.blit_copies != 0 || stats.host_tensor_writes != 0 ||
-        stats.host_tensor_reads != 9)
+        stats.host_tensor_reads != 15)
         fail("unexpected submission/copy/transfer contract");
     printf("stats: submissions=%llu blits=%llu host-rw=%llu/%llu "
            "bytes=%llu/%llu peak=%.3fMiB conv=%llu direct=%llu\n",

@@ -28,6 +28,34 @@ inline ushort4 h3_f32x4_to_bf16(float4 value) {
     return ushort4(bits >> 16);
 }
 
+/* PyTorch's H3 AdaLN is deliberately in-place on BF16 activations:
+ * rms_norm writes BF16, mul_ writes BF16, and add_ writes BF16.  Preserve
+ * each of those storage boundaries locally without an extra GPU dispatch. */
+inline ushort h3_adaln_inplace_bf16(ushort input, float inverse,
+                                    ushort weight, ushort scale,
+                                    ushort shift) {
+    ushort normalized = h3_f32_to_bf16(h3_bf16_to_f32(input) * inverse *
+                                        h3_bf16_to_f32(weight));
+    ushort factor = h3_f32_to_bf16(1.0f + h3_bf16_to_f32(scale));
+    ushort scaled = h3_f32_to_bf16(h3_bf16_to_f32(normalized) *
+                                    h3_bf16_to_f32(factor));
+    return h3_f32_to_bf16(h3_bf16_to_f32(scaled) +
+                           h3_bf16_to_f32(shift));
+}
+
+inline ushort4 h3_adaln_inplace_bf16x4(ushort4 input, float inverse,
+                                       ushort4 weight, ushort4 scale,
+                                       ushort4 shift) {
+    ushort4 normalized = h3_f32x4_to_bf16(h3_bf16x4_to_f32(input) * inverse *
+                                           h3_bf16x4_to_f32(weight));
+    ushort4 factor = h3_f32x4_to_bf16(float4(1.0f) +
+                                       h3_bf16x4_to_f32(scale));
+    ushort4 scaled = h3_f32x4_to_bf16(h3_bf16x4_to_f32(normalized) *
+                                       h3_bf16x4_to_f32(factor));
+    return h3_f32x4_to_bf16(h3_bf16x4_to_f32(scaled) +
+                             h3_bf16x4_to_f32(shift));
+}
+
 struct linear_args {
     uint rows;
     uint input_dim;
@@ -75,6 +103,21 @@ kernel void h3_linear_f32(device const float *input [[buffer(0)]],
     device const float *w = weight + column * args.input_dim;
     for (uint k = 0; k < args.input_dim; k++) sum = fma(x[k], w[k], sum);
     output[row * args.output_dim + column] = sum;
+}
+
+kernel void h3_linear_f16(device const half *input [[buffer(0)]],
+                          device const half *weight [[buffer(1)]],
+                          device const half *bias [[buffer(2)]],
+                          device half *output [[buffer(3)]],
+                          constant linear_args &args [[buffer(4)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x, row = gid.y;
+    if (row >= args.rows || column >= args.output_dim) return;
+    float sum = args.has_bias ? float(bias[column]) : 0.0f;
+    device const half *x = input + row * args.input_dim;
+    device const half *w = weight + column * args.input_dim;
+    for (uint k = 0; k < args.input_dim; k++) sum = fma(float(x[k]), float(w[k]), sum);
+    output[row * args.output_dim + column] = half(sum);
 }
 
 kernel void h3_linear_f32_tiled(device const float *input [[buffer(0)]],
@@ -295,6 +338,33 @@ kernel void h3_rms_norm_f32(device const float *input [[buffer(0)]],
         output[row * args.width + column] = x[column] * inverse * weight[column];
 }
 
+/* Keep reductions in float: only stored activation/weight values are half. */
+kernel void h3_rms_norm_f16(device const half *input [[buffer(0)]],
+                            device const half *weight [[buffer(1)]],
+                            device half *output [[buffer(2)]],
+                            constant norm_args &args [[buffer(3)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 thread_position [[thread_position_in_threadgroup]],
+                            uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x, tid = thread_position.x, threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const half *x = input + row * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
+        float value = float(x[k]); local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads)
+        output[row * args.width + column] = half(float(x[column]) * inverse * float(weight[column]));
+}
+
 struct scale_add_args { uint rows; uint width; };
 
 kernel void h3_scale_add_f32(device const float *residual [[buffer(0)]],
@@ -308,6 +378,18 @@ kernel void h3_scale_add_f32(device const float *residual [[buffer(0)]],
     if (row >= args.rows || column >= args.width) return;
     uint index = row * args.width + column;
     output[index] = residual[index] + branch[index] * scale[column];
+}
+
+kernel void h3_scale_add_f16(device const half *residual [[buffer(0)]],
+                             device const half *branch [[buffer(1)]],
+                             device const half *scale [[buffer(2)]],
+                             device half *output [[buffer(3)]],
+                             constant scale_add_args &args [[buffer(4)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x, row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint index = row * args.width + column;
+    output[index] = half(float(residual[index]) + float(branch[index]) * float(scale[column]));
 }
 
 kernel void h3_layer_norm_f32(device const float *input [[buffer(0)]],
@@ -349,6 +431,43 @@ kernel void h3_layer_norm_f32(device const float *input [[buffer(0)]],
     for (uint column = tid; column < args.width; column += threads)
         output[row * args.width + column] =
             (x[column] - mean) * inverse * weight[column] + bias[column];
+}
+
+kernel void h3_layer_norm_f16(device const half *input [[buffer(0)]],
+                              device const half *weight [[buffer(1)]],
+                              device const half *bias [[buffer(2)]],
+                              device half *output [[buffer(3)]],
+                              constant norm_args &args [[buffer(4)]],
+                              uint3 group [[threadgroup_position_in_grid]],
+                              uint3 thread_position [[thread_position_in_threadgroup]],
+                              uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x, tid = thread_position.x, threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const half *x = input + row * args.width;
+    float local = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) local += float(x[k]);
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = reductions[0] / float(args.width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    local = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
+        float centered = float(x[k]) - mean; local = fma(centered, centered, local);
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads)
+        output[row * args.width + column] = half((float(x[column]) - mean) * inverse * float(weight[column]) + float(bias[column]));
 }
 
 kernel void h3_video_qkv_rope_f32(
@@ -397,6 +516,92 @@ kernel void h3_video_qkv_rope_f32(
     query[output_index] = q0;
     key[output_index] = k0;
     value[output_index] = qkv[base + args.head_dim * 2 + dimension];
+}
+
+kernel void h3_video_qkv_rope_f16(
+                            device const half *qkv [[buffer(0)]],
+                            device const float *rope_cos [[buffer(1)]],
+                            device const float *rope_sin [[buffer(2)]],
+                            device half *query [[buffer(3)]],
+                            device half *key [[buffer(4)]],
+                            device half *value [[buffer(5)]],
+                            constant qkv_args &args [[buffer(6)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint dimension = gid.x, head = gid.y, row = gid.z;
+    if (dimension >= args.head_dim || head >= args.heads || row >= args.sequence) return;
+    uint base = (row * args.heads + head) * args.head_dim * 3;
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        float q = float(qkv[base + d]);
+        float k = float(qkv[base + args.head_dim + d]);
+        q_sum = fma(q, q, q_sum); k_sum = fma(k, k, k_sum);
+    }
+    float qi = rsqrt(q_sum / float(args.head_dim) + args.epsilon);
+    float ki = rsqrt(k_sum / float(args.head_dim) + args.epsilon);
+    float q0 = float(qkv[base + dimension]) * qi;
+    float k0 = float(qkv[base + args.head_dim + dimension]) * ki;
+    if (dimension < args.rope_half) {
+        uint pair = dimension + args.rope_half;
+        float q1 = float(qkv[base + pair]) * qi;
+        float k1 = float(qkv[base + args.head_dim + pair]) * ki;
+        float c = rope_cos[row * args.rope_half + dimension];
+        float s = rope_sin[row * args.rope_half + dimension];
+        q0 = q0 * c - q1 * s; k0 = k0 * c - k1 * s;
+    } else if (dimension < args.rope_half * 2) {
+        uint pair = dimension - args.rope_half;
+        float q1 = float(qkv[base + pair]) * qi;
+        float k1 = float(qkv[base + args.head_dim + pair]) * ki;
+        float c = rope_cos[row * args.rope_half + pair];
+        float s = rope_sin[row * args.rope_half + pair];
+        q0 = q0 * c + q1 * s; k0 = k0 * c + k1 * s;
+    }
+    uint output_index = (row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = half(q0); key[output_index] = half(k0);
+    value[output_index] = qkv[base + args.head_dim * 2 + dimension];
+}
+
+struct vae_decoder_pack_args { uint patch_rows, register_rows, suffix_rows, width; };
+
+kernel void h3_video_vae_pack_f16(device const half *patches [[buffer(0)]],
+                                  device const half *registers [[buffer(1)]],
+                                  device half *output [[buffer(2)]],
+                                  constant vae_decoder_pack_args &args [[buffer(3)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x, row = gid.y;
+    uint rows = args.patch_rows + args.register_rows + args.suffix_rows;
+    if (column >= args.width || row >= rows) return;
+    uint output_index = row * args.width + column;
+    if (row < args.patch_rows) output[output_index] = patches[output_index];
+    else if (row < args.patch_rows + args.register_rows)
+        output[output_index] = registers[(row - args.patch_rows) * args.width + column];
+    else output[output_index] = half(0.0f);
+}
+
+struct vae_decoder_unpack_args { uint latent_h, latent_w, output_frames; };
+
+/* Patches are [time*H*W + y*W + x, channel*4*16*16 + time*16*16 + y*16 + x].
+ * The first decoder chunk skips the three padded history frames after frame 16. */
+kernel void h3_video_vae_unpack_rgb_f16(
+                                  device const half *projected [[buffer(0)]],
+                                  device float *rgb [[buffer(1)]],
+                                  constant vae_decoder_unpack_args &args [[buffer(2)]],
+                                  uint3 gid [[thread_position_in_grid]]) {
+    uint x = gid.x, y = gid.y, frame = gid.z;
+    uint pixel_w = args.latent_w * 16, pixel_h = args.latent_h * 16;
+    if (x >= pixel_w || y >= pixel_h || frame >= args.output_frames) return;
+    uint decoded_t = frame + 3;
+    if (args.output_frames == 22 && frame >= 17) decoded_t += 3;
+    uint patch_t = decoded_t / 4, within_t = decoded_t % 4;
+    uint patch_y = y / 16, within_y = y % 16;
+    uint patch_x = x / 16, within_x = x % 16;
+    uint patch = (patch_t * args.latent_h + patch_y) * args.latent_w + patch_x;
+    const float mean[3] = {0.485f, 0.456f, 0.406f};
+    const float deviation[3] = {0.229f, 0.224f, 0.225f};
+    uint destination = (frame * pixel_h * pixel_w + y * pixel_w + x) * 3;
+    for (uint channel = 0; channel < 3; channel++) {
+        uint component = ((channel * 4 + within_t) * 16 + within_y) * 16 + within_x;
+        rgb[destination + channel] = clamp(float(projected[patch * (3 * 4 * 16 * 16) + component]) * deviation[channel] + mean[channel], 0.0f, 1.0f);
+    }
 }
 
 struct adaln_args {
@@ -527,6 +732,18 @@ kernel void h3_swiglu_f32(device const float *fused [[buffer(0)]],
     float gate = fused[base + column];
     float up = fused[base + args.width + column];
     output[row * args.width + column] = gate / (1.0f + exp(-gate)) * up;
+}
+
+kernel void h3_swiglu_f16(device const half *fused [[buffer(0)]],
+                          device half *output [[buffer(1)]],
+                          constant swiglu_args &args [[buffer(2)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x, row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint base = row * args.width * 2;
+    float gate = float(fused[base + column]);
+    float up = float(fused[base + args.width + column]);
+    output[row * args.width + column] = half(gate / (1.0f + exp(-gate)) * up);
 }
 
 struct vae_encoder_pad_args {
@@ -3415,14 +3632,12 @@ kernel void h3_adaln_bf16(device const ushort *input [[buffer(0)]],
     float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
     uint base = row_map[row] * args.slots * args.width;
     for (uint column = tid; column < args.width; column += threads) {
-        float normalized = h3_bf16_to_f32(x[column]) * inverse *
-            h3_bf16_to_f32(weight[column]);
-        float shift = h3_bf16_to_f32(
-            modulation[base + args.shift_slot * args.width + column]);
-        float scale = h3_bf16_to_f32(
-            modulation[base + args.scale_slot * args.width + column]);
-        output[row * args.width + column] =
-            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+        ushort shift = modulation[base + args.shift_slot * args.width +
+                                  column];
+        ushort scale = modulation[base + args.scale_slot * args.width +
+                                  column];
+        output[row * args.width + column] = h3_adaln_inplace_bf16(
+            x[column], inverse, weight[column], scale, shift);
     }
 }
 
@@ -3497,15 +3712,13 @@ kernel void h3_adaln_linear_bf16(
         uint input_k = tile * 16 + tid.x;
         ushort normalized = 0;
         if (row < args.rows && input_k < args.width) {
-            float value = h3_bf16_to_f32(
-                input[row * args.width + input_k]);
-            float shift = h3_bf16_to_f32(
-                modulation[base + args.shift_slot * args.width + input_k]);
-            float scale = h3_bf16_to_f32(
-                modulation[base + args.scale_slot * args.width + input_k]);
-            float normed = value * inverse[row] *
-                h3_bf16_to_f32(norm_weight[input_k]);
-            normalized = h3_f32_to_bf16(normed * (1.0f + scale) + shift);
+            ushort shift = modulation[base + args.shift_slot * args.width +
+                                      input_k];
+            ushort scale = modulation[base + args.scale_slot * args.width +
+                                      input_k];
+            normalized = h3_adaln_inplace_bf16(
+                input[row * args.width + input_k], inverse[row],
+                norm_weight[input_k], scale, shift);
         }
         input_tile[tid.y][tid.x] = normalized;
         uint weight_k = tile * 16 + tid.y;
@@ -3594,14 +3807,12 @@ kernel void h3_gate_adaln_bf16(
     }
     float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
     for (uint column = tid; column < args.width; column += threads) {
-        float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
-            h3_bf16_to_f32(weight[column]);
-        float shift = h3_bf16_to_f32(
-            norm_modulation[base + args.shift_slot * args.width + column]);
-        float scale = h3_bf16_to_f32(
-            norm_modulation[base + args.scale_slot * args.width + column]);
-        output[row * args.width + column] =
-            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+        ushort shift = norm_modulation[base + args.shift_slot * args.width +
+                                       column];
+        ushort scale = norm_modulation[base + args.scale_slot * args.width +
+                                       column];
+        output[row * args.width + column] = h3_adaln_inplace_bf16(
+            gated_values[column], inverse, weight[column], scale, shift);
     }
 }
 
@@ -3659,14 +3870,12 @@ kernel void h3_gate_adaln_bf16_exact_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inverse = reductions[0];
     for (uint column = tid; column < args.width; column += threads) {
-        float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
-            h3_bf16_to_f32(weight[column]);
-        float shift = h3_bf16_to_f32(
-            norm_modulation[base + args.shift_slot * args.width + column]);
-        float scale = h3_bf16_to_f32(
-            norm_modulation[base + args.scale_slot * args.width + column]);
-        output[row * args.width + column] =
-            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+        ushort shift = norm_modulation[base + args.shift_slot * args.width +
+                                       column];
+        ushort scale = norm_modulation[base + args.scale_slot * args.width +
+                                       column];
+        output[row * args.width + column] = h3_adaln_inplace_bf16(
+            gated_values[column], inverse, weight[column], scale, shift);
     }
 }
 
@@ -3734,14 +3943,12 @@ kernel void h3_gate_adaln_quantize_int8_scalar(
     float inverse = reductions[0];
     float local_max = 0.0f;
     for (uint column = tid; column < args.width; column += 256) {
-        float normalized = h3_bf16_to_f32(gated_values[column]) * inverse *
-            h3_bf16_to_f32(weight[column]);
-        float shift = h3_bf16_to_f32(
-            norm_modulation[base + args.shift_slot * args.width + column]);
-        float scale = h3_bf16_to_f32(
-            norm_modulation[base + args.scale_slot * args.width + column]);
-        ushort value = h3_f32_to_bf16(
-            normalized * (1.0f + scale) + shift);
+        ushort shift = norm_modulation[base + args.shift_slot * args.width +
+                                       column];
+        ushort scale = norm_modulation[base + args.scale_slot * args.width +
+                                       column];
+        ushort value = h3_adaln_inplace_bf16(
+            gated_values[column], inverse, weight[column], scale, shift);
         gated_values[column] = value;
         local_max = max(local_max, fabs(h3_bf16_to_f32(value)));
     }
@@ -3847,12 +4054,8 @@ kernel void h3_gate_adaln_quantize_int8(
             args.shift_slot * VECTOR_WIDTH + vector];
         ushort4 scale_bits = norm_modulation4[modulation_base +
             args.scale_slot * VECTOR_WIDTH + vector];
-        float4 normalized = h3_bf16x4_to_f32(gated) * inverse *
-            h3_bf16x4_to_f32(norm_bits);
-        float4 value_float = normalized *
-            (float4(1.0f) + h3_bf16x4_to_f32(scale_bits)) +
-            h3_bf16x4_to_f32(shift_bits);
-        ushort4 value = h3_f32x4_to_bf16(value_float);
+        ushort4 value = h3_adaln_inplace_bf16x4(
+            gated, inverse, norm_bits, scale_bits, shift_bits);
         gated_values[vector] = value;
         float4 rounded = h3_bf16x4_to_f32(value);
         local_max = max(local_max,
@@ -4528,14 +4731,12 @@ kernel void h3_token_pool_adaln_bf16(
     float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
     uint base = row_map[row] * args.slots * args.width;
     for (uint column = tid; column < args.width; column += threads) {
-        float normalized = h3_bf16_to_f32(pooled_values[column]) * inverse *
-            h3_bf16_to_f32(weight[column]);
-        float shift = h3_bf16_to_f32(
-            modulation[base + args.shift_slot * args.width + column]);
-        float scale = h3_bf16_to_f32(
-            modulation[base + args.scale_slot * args.width + column]);
-        output[row * args.width + column] =
-            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+        ushort shift = modulation[base + args.shift_slot * args.width +
+                                  column];
+        ushort scale = modulation[base + args.scale_slot * args.width +
+                                  column];
+        output[row * args.width + column] = h3_adaln_inplace_bf16(
+            pooled_values[column], inverse, weight[column], scale, shift);
     }
 }
 
@@ -4655,14 +4856,12 @@ kernel void h3_token_expand_adaln_bf16(
     float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
     uint base = row_map[row] * args.slots * args.width;
     for (uint column = tid; column < args.width; column += threads) {
-        float normalized = h3_bf16_to_f32(restored_values[column]) * inverse *
-            h3_bf16_to_f32(weight[column]);
-        float shift = h3_bf16_to_f32(
-            modulation[base + args.shift_slot * args.width + column]);
-        float scale = h3_bf16_to_f32(
-            modulation[base + args.scale_slot * args.width + column]);
-        output[row * args.width + column] =
-            h3_f32_to_bf16(normalized * (1.0f + scale) + shift);
+        ushort shift = modulation[base + args.shift_slot * args.width +
+                                  column];
+        ushort scale = modulation[base + args.scale_slot * args.width +
+                                  column];
+        output[row * args.width + column] = h3_adaln_inplace_bf16(
+            restored_values[column], inverse, weight[column], scale, shift);
     }
 }
 

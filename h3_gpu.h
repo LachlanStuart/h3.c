@@ -120,6 +120,12 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t rows,
                       uint32_t input_dim, uint32_t output_dim);
+/* Native half matrix product. VideoVAE dimensions are MPSGraph sized; this
+ * API deliberately has no scalar fallback. */
+int h3_gpu_linear_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t rows,
+                      uint32_t input_dim, uint32_t output_dim);
 int h3_gpu_patch_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
                              const h3_gpu_tensor *weight,
@@ -172,6 +178,10 @@ int h3_gpu_rms_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                         const h3_gpu_tensor *input,
                         const h3_gpu_tensor *weight, uint32_t rows,
                         uint32_t width, float epsilon);
+int h3_gpu_rms_norm_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *weight, uint32_t rows,
+                        uint32_t width, float epsilon);
 int h3_gpu_adaln_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input,
                      const h3_gpu_tensor *norm_weight,
@@ -198,7 +208,14 @@ int h3_gpu_sdpa_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
                     uint32_t heads, uint32_t head_dim, float scale);
+int h3_gpu_sdpa_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                    const h3_gpu_tensor *value, uint32_t sequence,
+                    uint32_t heads, uint32_t head_dim, float scale);
 int h3_gpu_swiglu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *fused, uint32_t rows,
+                      uint32_t width);
+int h3_gpu_swiglu_f16(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *fused, uint32_t rows,
                       uint32_t width);
 int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -206,7 +223,17 @@ int h3_gpu_scale_add_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *branch,
                          const h3_gpu_tensor *scale, uint32_t rows,
                          uint32_t width);
+int h3_gpu_scale_add_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *residual,
+                         const h3_gpu_tensor *branch,
+                         const h3_gpu_tensor *scale, uint32_t rows,
+                         uint32_t width);
 int h3_gpu_layer_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *bias, uint32_t rows,
+                          uint32_t width, float epsilon);
+int h3_gpu_layer_norm_f16(h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *input,
                           const h3_gpu_tensor *weight,
                           const h3_gpu_tensor *bias, uint32_t rows,
@@ -219,6 +246,28 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, uint32_t rope_half,
                               float epsilon);
+/* QKV/outputs are half; RoPE phases and normalization reductions are float. */
+int h3_gpu_video_qkv_rope_f16(h3_gpu *gpu, h3_gpu_tensor *query,
+                              h3_gpu_tensor *key, h3_gpu_tensor *value,
+                              const h3_gpu_tensor *qkv,
+                              const h3_gpu_tensor *rope_cos,
+                              const h3_gpu_tensor *rope_sin,
+                              uint32_t sequence, uint32_t heads,
+                              uint32_t head_dim, uint32_t rope_half,
+                              float epsilon);
+/* Packs [patches,hidden] and four register rows into the decoder sequence,
+ * writing zero suffix rows directly on Metal (no blit encoder). */
+int h3_gpu_video_vae_pack_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *patches,
+                              const h3_gpu_tensor *registers,
+                              uint32_t patch_rows, uint32_t register_rows,
+                              uint32_t suffix_rows, uint32_t width);
+/* Unpatches half decoder output to final RGB. Pixel affine/clamp and output
+ * storage are float; all prior VAE tensors remain half. */
+int h3_gpu_video_vae_unpack_rgb_f16(h3_gpu *gpu, h3_gpu_tensor *rgb,
+                                    const h3_gpu_tensor *projected,
+                                    uint32_t latent_h, uint32_t latent_w,
+                                    uint32_t output_frames);
 
 /* H3 AudioVAE uses time-major [batch,length,channels] activations and stores
  * Conv1d/ConvTranspose1d weights in PyTorch OIK/IOK order respectively. */
