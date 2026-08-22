@@ -766,60 +766,6 @@ done:
     return quant;
 }
 
-static float *read_quant_latent(encoder_context *encoder,
-                                const h3_gpu_tensor *quant, int latent_time,
-                                int height, int width, char *error,
-                                size_t error_size) {
-    size_t moment_count = tensor_elements((uint32_t)latent_time,
-                                          (uint32_t)height, (uint32_t)width,
-                                          MOMENT_CHANNELS);
-    size_t latent_count = (size_t)LATENT_CHANNELS * latent_time * height * width;
-    if (encoder->fp16 && moment_count > UINT32_MAX) {
-        fail(error, error_size, "visual encoder moment conversion is too large");
-        return NULL;
-    }
-    float *raw = malloc(moment_count * sizeof(*raw));
-    float *latent = malloc(latent_count * sizeof(*latent));
-    h3_gpu_tensor *raw_f32 = NULL;
-    int read_ok = 0;
-    if (encoder->fp16 && raw) {
-        raw_f32 = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
-        read_ok = raw_f32 &&
-            gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                   "begin FP16 encoder moment conversion") &&
-            gpu_op(encoder, h3_gpu_cast_f16_to_f32(
-                encoder->gpu, raw_f32, quant, (uint32_t)moment_count),
-                error, error_size, "convert encoder moments to FP32") &&
-            gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                   "submit FP16 encoder moment conversion") &&
-            h3_gpu_tensor_read_f32(raw_f32, raw, moment_count);
-    } else if (raw) {
-        read_ok = h3_gpu_tensor_read_f32(quant, raw, moment_count);
-    }
-    if (!latent || !read_ok) {
-        h3_gpu_tensor_free(raw_f32);
-        free(raw); free(latent);
-        fail(error, error_size, "cannot read visual encoder latent");
-        return NULL;
-    }
-    for (int channel = 0; channel < LATENT_CHANNELS; channel++)
-        for (int time = 0; time < latent_time; time++)
-            for (int y = 0; y < height; y++)
-                for (int x = 0; x < width; x++) {
-                    size_t source = (((size_t)time * height + y) * width + x) *
-                                    MOMENT_CHANNELS + (size_t)channel;
-                    size_t target = (((size_t)channel * latent_time + time) *
-                                     height + y) * width + x;
-                    float value = raw[source];
-                    latent[target] =
-                        (value - encoder->latent_mean[channel]) /
-                        encoder->latent_std[channel];
-                }
-    free(raw);
-    h3_gpu_tensor_free(raw_f32);
-    return latent;
-}
-
 static void tile_axis_free(tile_axis *axis) {
     if (!axis) return;
     free(axis->starts);
@@ -939,72 +885,53 @@ int h3_ref2va_video_encode_plan_build(int frames,
     return plan->latent_tokens > 0;
 }
 
-static int stitch_latents(float **tiles, int latent_time,
-                          const tile_axis *y_axis, const tile_axis *x_axis,
-                          h3_video_latent *output, char *error,
-                          size_t error_size) {
-    int tile_h = y_axis->length / SPATIAL_RATIO;
-    int tile_w = x_axis->length / SPATIAL_RATIO;
-    int full_h = (y_axis->starts[y_axis->count - 1] + y_axis->length) /
-                 SPATIAL_RATIO;
-    int full_w = (x_axis->starts[x_axis->count - 1] + x_axis->length) /
-                 SPATIAL_RATIO;
-    size_t count = (size_t)LATENT_CHANNELS * latent_time * full_h * full_w;
-    float *values = malloc(count * sizeof(*values));
-    if (!values) {
-        fail(error, error_size, "out of memory stitching visual latents");
-        return 0;
-    }
+static int stitch_gpu_tiles(encoder_context *encoder,
+                            h3_gpu_tensor *destination,
+                            h3_gpu_tensor *const *tiles,
+                            const tile_axis *y_axis,
+                            const tile_axis *x_axis,
+                            uint32_t time_offset, uint32_t chunk_time,
+                            uint32_t full_time, uint32_t full_height,
+                            uint32_t full_width, char *error,
+                            size_t error_size) {
+    uint32_t tile_h = (uint32_t)(y_axis->length / SPATIAL_RATIO);
+    uint32_t tile_w = (uint32_t)(x_axis->length / SPATIAL_RATIO);
     for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
         for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
             int index = tile_y * x_axis->count + tile_x;
-            const float *current = tiles[index];
-            const float *above = tile_y ? tiles[index - x_axis->count] : NULL;
-            const float *left = tile_x ? tiles[index - 1] : NULL;
-            int overlap_y = tile_y ?
-                y_axis->overlaps[tile_y - 1] / SPATIAL_RATIO : 0;
-            int overlap_x = tile_x ?
-                x_axis->overlaps[tile_x - 1] / SPATIAL_RATIO : 0;
-            int keep_h = tile_h - (tile_y + 1 < y_axis->count ?
+            int above = tile_y ? index - x_axis->count : index;
+            int left = tile_x ? index - 1 : index;
+            uint32_t overlap_y = tile_y ?
+                (uint32_t)(y_axis->overlaps[tile_y - 1] / SPATIAL_RATIO) : 0;
+            uint32_t overlap_x = tile_x ?
+                (uint32_t)(x_axis->overlaps[tile_x - 1] / SPATIAL_RATIO) : 0;
+            uint32_t keep_h = tile_h - (uint32_t)(
+                tile_y + 1 < y_axis->count ?
                 y_axis->overlaps[tile_y] / SPATIAL_RATIO : 0);
-            int keep_w = tile_w - (tile_x + 1 < x_axis->count ?
+            uint32_t keep_w = tile_w - (uint32_t)(
+                tile_x + 1 < x_axis->count ?
                 x_axis->overlaps[tile_x] / SPATIAL_RATIO : 0);
-            int destination_y = y_axis->starts[tile_y] / SPATIAL_RATIO;
-            int destination_x = x_axis->starts[tile_x] / SPATIAL_RATIO;
-            for (int channel = 0; channel < LATENT_CHANNELS; channel++)
-                for (int time = 0; time < latent_time; time++)
-                    for (int y = 0; y < keep_h; y++)
-                        for (int x = 0; x < keep_w; x++) {
-                            size_t local = (((size_t)channel * latent_time + time) *
-                                            tile_h + y) * tile_w + x;
-                            float value = current[local];
-                            if (above && y < overlap_y) {
-                                size_t source = (((size_t)channel * latent_time +
-                                    time) * tile_h + tile_h - overlap_y + y) *
-                                    tile_w + x;
-                                float weight = (float)y / (float)overlap_y;
-                                value = above[source] * (1.0f - weight) +
-                                        value * weight;
-                            }
-                            if (left && x < overlap_x) {
-                                size_t source = (((size_t)channel * latent_time +
-                                    time) * tile_h + y) * tile_w +
-                                    tile_w - overlap_x + x;
-                                float weight = (float)x / (float)overlap_x;
-                                value = left[source] * (1.0f - weight) +
-                                        value * weight;
-                            }
-                            size_t destination =
-                                (((size_t)channel * latent_time + time) * full_h +
-                                  destination_y + y) * full_w +
-                                 destination_x + x;
-                            values[destination] = value;
-                        }
+            int ok = encoder->fp16 ? h3_gpu_vae_encoder_stitch_latent_f16(
+                encoder->gpu, destination, tiles[index],
+                tile_y ? tiles[above] : NULL,
+                tile_x ? tiles[left] : NULL, encoder->latent_mean_gpu,
+                encoder->latent_std_gpu, time_offset, chunk_time, full_time,
+                full_height, full_width, tile_h, tile_w,
+                (uint32_t)(y_axis->starts[tile_y] / SPATIAL_RATIO),
+                (uint32_t)(x_axis->starts[tile_x] / SPATIAL_RATIO),
+                overlap_y, overlap_x, keep_h, keep_w) :
+                h3_gpu_vae_encoder_stitch_latent_f32(
+                encoder->gpu, destination, tiles[index],
+                tile_y ? tiles[above] : NULL,
+                tile_x ? tiles[left] : NULL, encoder->latent_mean_gpu,
+                encoder->latent_std_gpu, time_offset, chunk_time, full_time,
+                full_height, full_width, tile_h, tile_w,
+                (uint32_t)(y_axis->starts[tile_y] / SPATIAL_RATIO),
+                (uint32_t)(x_axis->starts[tile_x] / SPATIAL_RATIO),
+                overlap_y, overlap_x, keep_h, keep_w);
+            if (!gpu_op(encoder, ok, error, error_size,
+                        "visual encoder latent stitch")) return 0;
         }
-    output->time = latent_time;
-    output->height = full_h;
-    output->width = full_w;
-    output->values = values;
     return 1;
 }
 
@@ -1042,7 +969,8 @@ int h3_video_vae_encode(const char *weight_directory,
          load_weights(&encoder, error, error_size) &&
          (!encoder.fp16 || prepare_fp16_weights(&encoder, error, error_size));
     int tile_count = y_axis.count * x_axis.count;
-    float **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
+    h3_gpu_tensor **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
+    h3_gpu_tensor *final = NULL;
     if (ok && !tiles) {
         fail(error, error_size, "out of memory allocating visual encoder tiles");
         ok = 0;
@@ -1054,24 +982,57 @@ int h3_video_vae_encode(const char *weight_directory,
                 pixels, frames, height, width, y_axis.starts[y], x_axis.starts[x],
                 y_axis.length, x_axis.length, error, error_size);
             int current_time = 0;
-            h3_gpu_tensor *quant = tile ? encode_tile_quant(
+            tiles[completed] = tile ? encode_tile_quant(
                 &encoder, tile, frames, y_axis.length, x_axis.length,
                 &current_time, error, error_size) : NULL;
             free(tile);
-            if (quant) tiles[completed] = read_quant_latent(
-                &encoder, quant, current_time, y_axis.length / SPATIAL_RATIO,
-                x_axis.length / SPATIAL_RATIO, error, error_size);
-            h3_gpu_tensor_free(quant);
             ok = tiles[completed] != NULL &&
                  (!latent_time || latent_time == current_time);
             if (ok) latent_time = current_time;
             if (ok && progress) progress(completed + 1, tile_count, progress_opaque);
         }
-    if (ok) ok = stitch_latents(tiles, latent_time, &y_axis, &x_axis,
-                                output, error, error_size) &&
-                 h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);
-    if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
+    int latent_h = height / SPATIAL_RATIO;
+    int latent_w = width / SPATIAL_RATIO;
+    size_t latent_count = (size_t)LATENT_CHANNELS * (size_t)latent_time *
+                          (size_t)latent_h * (size_t)latent_w;
+    if (ok && latent_count > UINT32_MAX) {
+        fail(error, error_size, "visual encoder latent is too large");
+        ok = 0;
+    }
+    if (ok) final = h3_gpu_tensor_new_f32(encoder.gpu, latent_count);
+    if (ok && !final) {
+        fail(error, error_size, "cannot allocate visual encoder latent");
+        ok = 0;
+    }
+    if (ok) ok = gpu_op(&encoder, h3_gpu_begin(encoder.gpu), error,
+                        error_size, "begin visual encoder stitch");
+    if (ok) ok = stitch_gpu_tiles(
+        &encoder, final, tiles, &y_axis, &x_axis, 0, (uint32_t)latent_time,
+        (uint32_t)latent_time, (uint32_t)latent_h, (uint32_t)latent_w,
+        error, error_size);
+    if (ok) ok = gpu_op(&encoder, h3_gpu_submit(encoder.gpu), error,
+                        error_size, "submit visual encoder stitch");
+    if (ok) {
+        output->values = malloc(latent_count * sizeof(*output->values));
+        ok = output->values && h3_gpu_tensor_read_f32(
+            final, output->values, latent_count) &&
+            h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);
+        if (!ok) fail(error, error_size, "cannot read visual encoder latent");
+        if (ok && (output->gpu_stats.host_tensor_reads != 1 ||
+                   output->gpu_stats.host_tensor_writes != 0 ||
+                   output->gpu_stats.blit_copies != 0)) {
+            fail(error, error_size,
+                 "visual encoder made an unexpected tensor transfer");
+            ok = 0;
+        }
+        output->time = latent_time;
+        output->height = latent_h;
+        output->width = latent_w;
+    }
+    if (tiles) for (int index = 0; index < tile_count; index++)
+        h3_gpu_tensor_free(tiles[index]);
     free(tiles);
+    h3_gpu_tensor_free(final);
     cleanup(&encoder);
     tile_axis_free(&y_axis);
     tile_axis_free(&x_axis);
@@ -1158,47 +1119,10 @@ int h3_video_vae_encode_ref2va_temporal(
             }
         if (ok) ok = gpu_op(&encoder, h3_gpu_begin(encoder.gpu), error,
                             error_size, "begin Ref2VA temporal stitch");
-        for (int tile_y = 0; ok && tile_y < y_axis.count; tile_y++)
-            for (int tile_x = 0; ok && tile_x < x_axis.count; tile_x++) {
-                int index = tile_y * x_axis.count + tile_x;
-                int above = tile_y ? index - x_axis.count : index;
-                int left = tile_x ? index - 1 : index;
-                uint32_t overlap_y = tile_y ?
-                    (uint32_t)(y_axis.overlaps[tile_y - 1] / SPATIAL_RATIO) : 0;
-                uint32_t overlap_x = tile_x ?
-                    (uint32_t)(x_axis.overlaps[tile_x - 1] / SPATIAL_RATIO) : 0;
-                uint32_t keep_h = (uint32_t)(y_axis.length / SPATIAL_RATIO -
-                    (tile_y + 1 < y_axis.count ?
-                     y_axis.overlaps[tile_y] / SPATIAL_RATIO : 0));
-                uint32_t keep_w = (uint32_t)(x_axis.length / SPATIAL_RATIO -
-                    (tile_x + 1 < x_axis.count ?
-                     x_axis.overlaps[tile_x] / SPATIAL_RATIO : 0));
-                int stitch_ok = encoder.fp16 ?
-                    h3_gpu_vae_encoder_stitch_latent_f16(
-                        encoder.gpu, staged, tiles[index],
-                        tile_y ? tiles[above] : NULL,
-                        tile_x ? tiles[left] : NULL, encoder.latent_mean_gpu,
-                        encoder.latent_std_gpu, (uint32_t)(chunk * 5), 5,
-                        (uint32_t)plan.encoded_tokens, (uint32_t)latent_h,
-                        (uint32_t)latent_w, (uint32_t)(y_axis.length /
-                        SPATIAL_RATIO), (uint32_t)(x_axis.length /
-                        SPATIAL_RATIO), (uint32_t)(y_axis.starts[tile_y] /
-                        SPATIAL_RATIO), (uint32_t)(x_axis.starts[tile_x] /
-                        SPATIAL_RATIO), overlap_y, overlap_x, keep_h, keep_w) :
-                    h3_gpu_vae_encoder_stitch_latent_f32(
-                        encoder.gpu, staged, tiles[index],
-                        tile_y ? tiles[above] : NULL,
-                        tile_x ? tiles[left] : NULL, encoder.latent_mean_gpu,
-                        encoder.latent_std_gpu, (uint32_t)(chunk * 5), 5,
-                        (uint32_t)plan.encoded_tokens, (uint32_t)latent_h,
-                        (uint32_t)latent_w, (uint32_t)(y_axis.length /
-                        SPATIAL_RATIO), (uint32_t)(x_axis.length /
-                        SPATIAL_RATIO), (uint32_t)(y_axis.starts[tile_y] /
-                        SPATIAL_RATIO), (uint32_t)(x_axis.starts[tile_x] /
-                        SPATIAL_RATIO), overlap_y, overlap_x, keep_h, keep_w);
-                ok = gpu_op(&encoder, stitch_ok,
-                    error, error_size, "Ref2VA temporal latent stitch");
-            }
+        if (ok) ok = stitch_gpu_tiles(
+            &encoder, staged, tiles, &y_axis, &x_axis,
+            (uint32_t)(chunk * 5), 5, (uint32_t)plan.encoded_tokens,
+            (uint32_t)latent_h, (uint32_t)latent_w, error, error_size);
         if (ok) ok = gpu_op(&encoder, h3_gpu_submit(encoder.gpu), error,
                             error_size, "submit Ref2VA temporal stitch");
         for (int index = 0; index < tile_count; index++) {
