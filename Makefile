@@ -36,6 +36,9 @@ h3_metal_tests: tests/test_metal.o $(LIB_OBJ)
 h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_convrot_tests: tests/test_convrot.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -100,7 +103,7 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
+test: h3_tests h3_metal_tests h3_bf16_tests h3_convrot_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 	h3_real_audio_encoder_test \
 	h3_av_mux_test \
@@ -109,6 +112,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_semantic_vae_test
 
 	./h3_tests
+	./h3_convrot_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \
@@ -216,6 +220,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
+		h3_convrot_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 		h3_real_audio_encoder_test \

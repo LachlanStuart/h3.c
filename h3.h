@@ -96,6 +96,9 @@ typedef struct {
     int steps;
     h3_sampler sampler;
     uint64_t seed;
+    /* Optional exact DiT safetensors file. The remaining tokenizer, text
+     * encoder, and VAEs continue to come from model_dir. */
+    const char *dit_checkpoint;
     const char *output_path;
     /* Optionally emit a second FFV1/Matroska diagnostic from these exact
      * generated RGB and PCM buffers. Must differ from output_path. */

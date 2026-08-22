@@ -887,3 +887,25 @@ at every size for A/B comparison.
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
 trees. Model phases are loaded and released separately so the 33B transformer,
 Qwen encoder, and decoders never have to coexist in unified memory.
+
+The community hybrid ConvRot checkpoint
+`minimax_h3_hybrid_fl2va_ref2va_b20-49-int8.safetensors` is supported as an
+explicit, standalone DiT override. Keep it outside the released model trees and
+select the exact file while retaining the released tokenizer, text encoder, and
+VAEs from `--model-dir`:
+
+```sh
+./h3 -d ./MiniMax-H3 \
+  --dit-checkpoint ../models/hybrid/minimax_h3_hybrid_fl2va_ref2va_b20-49-int8.safetensors \
+  -p "Use the object shown in <Picture 1>. The object rotates slowly." \
+  --ref-image reference.png \
+  --width 256 --height 256 --frames 22 --steps 4 \
+  --layers 50 --reuse 1 --core-reuse 1 --use-reference-rope \
+  -o outputs/hybrid-reference.mp4
+```
+
+This override recognizes only the checkpoint's exact ConvRot INT8 metadata and
+rank-8 AdaLN curve schema. It requires all 50 blocks, disables core reuse,
+token reduction and SSD streaming, and requires Metal INT8 TensorOps. The I8
+matrices are memory-mapped directly on M5; per-row activation rotation,
+quantization, and projection remain on the GPU.
