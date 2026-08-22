@@ -692,7 +692,9 @@ int h3_ffmpeg_write_rgb24_with_source_audio(const char *path,
         "-framerate", rate, "-i", "pipe:0", "-i", (char *)source_audio_path,
         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset",
         (char *)preset_name, "-crf", crf_text, "-pix_fmt", "yuv420p",
-        "-c:a", "copy", "-shortest", "-movflags", "+faststart", (char *)path, NULL};
+        /* The AudioVAE grid can be a little shorter than the video grid.
+         * Do not let the source audio duration trim H3's fixed frame count. */
+        "-c:a", "copy", "-movflags", "+faststart", (char *)path, NULL};
     posix_spawn_file_actions_t actions;
     int code = posix_spawn_file_actions_init(&actions);
     if (!code) code = posix_spawn_file_actions_adddup2(&actions, stream[0], STDIN_FILENO);

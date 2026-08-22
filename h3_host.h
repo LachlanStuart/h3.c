@@ -119,6 +119,12 @@ int h3_restart_schedule_build(int schedule_steps, int restart_steps,
                               h3_sigma_schedule *schedule, int *start_step);
 /* Restart audio is encoded on the exact target AudioVAE latent grid. */
 int h3_restart_audio_samples(int requested_frames);
+/* A restart source needs at least one 800-sample AudioVAE hop. */
+int h3_restart_audio_source_valid(int samples);
+/* Replace channel-major stereo PCM with an exact target-grid buffer.  Existing
+ * samples are retained per channel; a short AAC decode is zero-padded and a
+ * long one truncated. The caller retains ownership through *pcm. */
+int h3_restart_audio_fit(float **pcm, int source_samples, int target_samples);
 /* Restart operates at the final VideoVAE/DiT canvas; no internal canvas. */
 int h3_restart_canvas_valid(int width, int height,
                             int render_width, int render_height);

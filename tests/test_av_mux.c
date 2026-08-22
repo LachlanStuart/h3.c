@@ -17,6 +17,8 @@ int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "/tmp/h3-av-mux-test.mp4";
     const char *lossless_path = "/tmp/h3-av-mux-lossless-test.mkv";
     const char *source_audio_path = "/tmp/h3-av-source-audio-test.mp4";
+    const char *short_source_path = "/tmp/h3-av-short-source-test.mp4";
+    const char *long_video_path = "/tmp/h3-av-long-video-test.mp4";
     h3_ffmpeg_video_plan plan;
     if (strcmp(h3_video_preset_name(H3_VIDEO_PRESET_SLOW), "slow") ||
         strcmp(h3_video_preset_name(H3_VIDEO_PRESET_FAST), "fast") ||
@@ -175,6 +177,39 @@ int main(int argc, char **argv) {
         die("source-audio mux has no copied stereo signal");
     free(decoded_pcm);
     decoded_pcm = NULL;
+
+    /* A 56-frame H3 target is 2.333 seconds while its 93-row clean AudioVAE
+     * grid is 2.325 seconds.  Model that mismatch with a much shorter source
+     * soundtrack: stream-copy muxing must retain all 56 video frames. */
+    if (!h3_ffmpeg_write_av_rgb24_f32(
+            short_source_path, rgb, FRAMES, WIDTH, HEIGHT, 24,
+            pcm, 8000, 2, 32000, H3_VIDEO_CODEC_H264,
+            H3_VIDEO_PRESET_SLOW, 18, error, sizeof(error))) die(error);
+    enum { LONG_FRAMES = 56 };
+    uint8_t *long_rgb = malloc((size_t)WIDTH * HEIGHT * 3 * LONG_FRAMES);
+    if (!long_rgb) die("out of memory creating long video fixture");
+    for (int frame = 0; frame < LONG_FRAMES; frame++)
+        for (int y = 0; y < HEIGHT; y++)
+            for (int x = 0; x < WIDTH; x++) {
+                size_t pixel = ((size_t)frame * HEIGHT * WIDTH +
+                                (size_t)y * WIDTH + (size_t)x) * 3;
+                long_rgb[pixel] = (uint8_t)(frame * 3);
+                long_rgb[pixel + 1] = (uint8_t)(x * 8);
+                long_rgb[pixel + 2] = (uint8_t)(y * 8);
+            }
+    if (!h3_ffmpeg_write_rgb24_with_source_audio(
+            long_video_path, long_rgb, LONG_FRAMES, WIDTH, HEIGHT, 24,
+            short_source_path, H3_VIDEO_PRESET_SLOW, 18,
+            error, sizeof(error))) die(error);
+    free(long_rgb);
+    decoded = NULL;
+    if (!h3_ffmpeg_read_video_f32(long_video_path, WIDTH, HEIGHT,
+                                  LONG_FRAMES, &decoded, &decoded_frames,
+                                  error, sizeof(error))) die(error);
+    if (decoded_frames != LONG_FRAMES)
+        die("short source audio truncated the restart output video");
+    free(decoded);
+    decoded = NULL;
 
     /* The diagnostic path gets the exact same raw RGB and F32 PCM buffers,
      * but its FFV1/Matroska encoding must preserve those bytes. */

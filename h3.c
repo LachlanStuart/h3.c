@@ -1674,8 +1674,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             source_frames != temporal.frame_count ||
             !h3_ffmpeg_read_audio_f32(params->refine_video_path,
                 expected_samples, 1, &source_pcm, &source_samples,
-                detail, sizeof(detail)) || source_samples != expected_samples ||
-            !h3_video_vae_encode(vae_path, "h3_shaders.metal", source_rgb,
+                detail, sizeof(detail)) ||
+            !h3_restart_audio_source_valid(source_samples) ||
+            !h3_restart_audio_fit(&source_pcm, source_samples,
+                                  expected_samples)) {
+            free(source_rgb); free(source_pcm);
+            h3_set_error(ctx, "%s", detail[0] ? detail :
+                         "restart source audio must contain one 800-sample AudioVAE hop");
+            goto cleanup;
+        }
+        source_samples = expected_samples;
+        if (!h3_video_vae_encode(vae_path, "h3_shaders.metal", source_rgb,
                 source_frames, params->height, params->width,
                 h3_video_encoder_progress_bridge, &progress, &source_video,
                 detail, sizeof(detail)) ||

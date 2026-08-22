@@ -327,6 +327,30 @@ static void test_schedule(void) {
     CHECK(!h3_restart_schedule_build(6, 7, &restart, &start));
     CHECK(h3_restart_audio_samples(22) == 29600);
     CHECK(h3_restart_audio_samples(56) == 74400);
+    CHECK(!h3_restart_audio_source_valid(799));
+    CHECK(h3_restart_audio_source_valid(800));
+    float *restart_pcm = malloc((size_t)2 * 28672 * sizeof(*restart_pcm));
+    CHECK(restart_pcm != NULL);
+    for (int channel = 0; channel < 2; channel++)
+        for (int sample = 0; sample < 28672; sample++)
+            restart_pcm[(size_t)channel * 28672 + sample] =
+                (float)(channel * 100000 + sample);
+    CHECK(h3_restart_audio_fit(&restart_pcm, 28672, 29600));
+    for (int channel = 0; channel < 2; channel++) {
+        for (int sample = 0; sample < 28672; sample++)
+            CHECK(restart_pcm[(size_t)channel * 29600 + sample] ==
+                  (float)(channel * 100000 + sample));
+        for (int sample = 28672; sample < 29600; sample++)
+            CHECK(restart_pcm[(size_t)channel * 29600 + sample] == 0.0f);
+    }
+    free(restart_pcm);
+    restart_pcm = malloc((size_t)2 * 5 * sizeof(*restart_pcm));
+    CHECK(restart_pcm != NULL);
+    for (int index = 0; index < 10; index++) restart_pcm[index] = (float)index;
+    CHECK(h3_restart_audio_fit(&restart_pcm, 5, 3));
+    CHECK(restart_pcm[0] == 0.0f && restart_pcm[2] == 2.0f &&
+          restart_pcm[3] == 5.0f && restart_pcm[5] == 7.0f);
+    free(restart_pcm);
     CHECK(h3_restart_canvas_valid(1216, 704, 0, 0));
     CHECK(!h3_restart_canvas_valid(1216, 704, 608, 352));
     CHECK(h3_paths_alias("same-path", "same-path"));

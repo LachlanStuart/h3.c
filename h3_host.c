@@ -182,6 +182,26 @@ int h3_restart_audio_samples(int requested_frames) {
     return temporal.audio_t * 800;
 }
 
+int h3_restart_audio_source_valid(int samples) {
+    return samples >= 800;
+}
+
+int h3_restart_audio_fit(float **pcm, int source_samples, int target_samples) {
+    if (!pcm || !*pcm || source_samples < 1 || target_samples < 1 ||
+        target_samples > INT_MAX / 2) return 0;
+    if (source_samples == target_samples) return 1;
+    float *fitted = calloc((size_t)2 * (size_t)target_samples,
+                           sizeof(*fitted));
+    if (!fitted) return 0;
+    int copied = source_samples < target_samples ? source_samples : target_samples;
+    memcpy(fitted, *pcm, (size_t)copied * sizeof(*fitted));
+    memcpy(fitted + target_samples, *pcm + source_samples,
+           (size_t)copied * sizeof(*fitted));
+    free(*pcm);
+    *pcm = fitted;
+    return 1;
+}
+
 int h3_restart_canvas_valid(int width, int height,
                             int render_width, int render_height) {
     return width > 0 && height > 0 && !render_width && !render_height;
