@@ -69,6 +69,8 @@ static void test_resident_preview(const char *model_root) {
         TEST_PIXELS = 3 * TEST_FRAMES * HEIGHT * WIDTH
     };
     char error[512];
+    if (setenv("H3_VIDEO_DECODER_FP16", "1", 1))
+        die("cannot enable resident FP16 VAE test mode");
     h3_st_header fixture;
     if (!h3_st_read_header(
             "misc/fixtures/h3_real_video_vae_256x256x39_f32.safetensors",

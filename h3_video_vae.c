@@ -1079,7 +1079,7 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
         }
     if (ok && !gpu_stitch) ok = stitch_tiles(tiles, &decoder->y_axis, &decoder->x_axis,
                               frame_count, output, error, error_size);
-    for (int index = 0; index < tile_count; index++) free(tiles[index]);
+    if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
     free(tiles);
     if (!ok) h3_video_frames_free(output);
     return ok;
