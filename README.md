@@ -680,13 +680,17 @@ references. Audio inputs are 2-15 seconds, at most three are
 accepted, their total decoded duration is capped at 15 seconds, and a standalone
 audio reference must be combined with an image or video reference.
 
-The VideoVAE encoder chains every tile forward into one Metal command buffer;
-Ref2VA temporal encoding adds one stitch submission per 17-frame chunk and one
-final drop-three submission. Scratch activations remain resident until their
-tile completes, trading higher peak unified memory for the removal of per-layer
-host waits. The encoder uses FP16 by default, matching ComfyUI's supported and
-default MiniMax H3 VideoVAE working precision. Set
-`H3_VIDEO_ENCODER_FP16=0` for the retained F32 comparison path. The FP16 path
+The FP16 VideoVAE encoder batches two tile forwards per ordered Metal command
+buffer, retains each tile's scratch arena until the queued chain is fenced, and
+keeps at most six tiles' scratch state live before a bounded fence. A 608x352
+reference therefore encodes its six spatial tiles with one final stitch/fence
+instead of waiting after every tile; much larger canvases do not retain all
+tile arenas blindly. Ref2VA temporal encoding folds each chunk's spatial stitch
+into its final tile command and retains one final drop-three submission. The
+encoder uses FP16 by default, matching ComfyUI's supported and default MiniMax
+H3 VideoVAE working precision. Set `H3_VIDEO_ENCODER_FP16=0` for the retained
+F32 comparison path, or `H3_VIDEO_ENCODER_SERIAL_TILES=1` for the retained
+serial FP16 scheduling oracle. The FP16 path
 converts the F32 checkpoint weights once on Metal,
 normalizes/reorders each uploaded F32 source tile directly into FP16, and keeps
 padding, FP32-accumulating GroupNorm+SiLU, Float16 Conv3D, residual, and quant

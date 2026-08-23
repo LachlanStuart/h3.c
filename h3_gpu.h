@@ -91,6 +91,10 @@ int h3_gpu_begin(h3_gpu *gpu);
  * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
 int h3_gpu_continue(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
+/* Wait for and validate a chain previously committed with h3_gpu_continue().
+ * There must be no active command buffer.  This is the safe failure-path
+ * fence before releasing command-scoped activation arenas. */
+int h3_gpu_drain(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown

@@ -945,6 +945,35 @@ int h3_gpu_submit(h3_gpu *opaque) {
     return 1;
 }
 
+int h3_gpu_drain(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || gpu.command) return 0;
+    @autoreleasepool {
+        if (!gpu.inflightCommands.count) return 1;
+        double started = h3_gpu_now();
+        for (id<MTLCommandBuffer> pending in gpu.inflightCommands)
+            [pending waitUntilCompleted];
+        double completed = h3_gpu_now();
+        for (id<MTLCommandBuffer> pending in gpu.inflightCommands) {
+            if (pending.status == MTLCommandBufferStatusError) {
+                h3_gpu_set_error(gpu, @"Metal command failed: %@",
+                                 pending.error.localizedDescription);
+                [gpu.inflightCommands removeAllObjects];
+                return 0;
+            }
+        }
+        h3_gpu_stats stats = gpu.stats;
+        stats.command_wait_seconds += completed - started;
+        for (id<MTLCommandBuffer> pending in gpu.inflightCommands) {
+            if (pending.GPUEndTime >= pending.GPUStartTime)
+                stats.gpu_seconds += pending.GPUEndTime - pending.GPUStartTime;
+        }
+        gpu.stats = stats;
+        [gpu.inflightCommands removeAllObjects];
+    }
+    return 1;
+}
+
 const char *h3_gpu_error(const h3_gpu *opaque) {
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
     const char *message = gpu.lastError.UTF8String;
