@@ -747,6 +747,34 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
     h3_gpu_tensor *value = h3_gpu_tensor_new_bf16(gpu, (size_t)B_ROWS * INNER);
     h3_gpu_tensor *attention_heads = h3_gpu_tensor_new_bf16(
         gpu, (size_t)B_ROWS * INNER);
+    h3_gpu_tensor *oracle_attention_heads = NULL;
+    const char *oracle_directory = getenv("H3_CONVROT_BLOCK_INTERMEDIATES");
+    if (getenv("H3_CONVROT_USE_ORACLE_ATTENTION_HEADS") &&
+        oracle_directory && *oracle_directory)
+        oracle_attention_heads = load_bf16_stage_oracle(
+            gpu, oracle_directory, "attention_heads", (size_t)B_ROWS * INNER);
+    h3_gpu_tensor *oracle_query = NULL;
+    h3_gpu_tensor *oracle_key = NULL;
+    h3_gpu_tensor *oracle_value = NULL;
+    if (getenv("H3_CONVROT_USE_ORACLE_QKV") && oracle_directory &&
+        *oracle_directory) {
+        oracle_query = load_bf16_stage_oracle(
+            gpu, oracle_directory, "query", (size_t)B_ROWS * INNER);
+        oracle_key = load_bf16_stage_oracle(
+            gpu, oracle_directory, "key", (size_t)B_ROWS * INNER);
+        oracle_value = load_bf16_stage_oracle(
+            gpu, oracle_directory, "value", (size_t)B_ROWS * INNER);
+    }
+    int use_f32_sdpa = getenv("H3_F32_SDPA") != NULL;
+    uint32_t head_elements = B_ROWS * INNER;
+    h3_gpu_tensor *query_f32 = use_f32_sdpa ?
+        h3_gpu_tensor_new_f32(gpu, head_elements) : NULL;
+    h3_gpu_tensor *key_f32 = use_f32_sdpa ?
+        h3_gpu_tensor_new_f32(gpu, head_elements) : NULL;
+    h3_gpu_tensor *value_f32 = use_f32_sdpa ?
+        h3_gpu_tensor_new_f32(gpu, head_elements) : NULL;
+    h3_gpu_tensor *heads_f32 = use_f32_sdpa ?
+        h3_gpu_tensor_new_f32(gpu, head_elements) : NULL;
     h3_gpu_tensor *attention_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
     h3_gpu_tensor *after_attention = h3_gpu_tensor_new_bf16(gpu, hidden_count);
     h3_gpu_tensor *mod_mlp = h3_gpu_tensor_new_bf16(gpu, hidden_count);
@@ -761,15 +789,22 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
     h3_gpu_tensor *quantized = h3_gpu_tensor_new_i8(
         gpu, (size_t)B_ROWS * FFN);
     h3_gpu_tensor *activation_scales = h3_gpu_tensor_new_f32(gpu, B_ROWS);
+    int use_dequantized_out = getenv("H3_CONVROT_DEQUANTIZED_OUT") != NULL;
+    h3_gpu_tensor *out_bf16 = use_dequantized_out ?
+        h3_gpu_tensor_new_bf16(gpu, (size_t)HIDDEN * INNER) : NULL;
     require(time_gpu && table && features && mod_w && mod_b && modulation &&
             row_map && rope_cos && rope_sin && mod_attention && qkv && query &&
             key && value && attention_heads && attention_output &&
             after_attention && mod_mlp && fc1 && activated && mlp_output &&
-            output && rotated && quantized && activation_scales,
+            output && rotated && quantized && activation_scales &&
+            (!use_dequantized_out || out_bf16) &&
+            (!use_f32_sdpa || (query_f32 && key_f32 && value_f32 && heads_f32)),
             "cannot allocate deterministic block tensors");
 
     require(h3_gpu_begin(gpu) && h3_gpu_adaln_table_interpolate_f32(
                 gpu, features, time_gpu, table, 1, 1025) &&
+            (!use_dequantized_out || h3_gpu_dequantize_rows_i8_bf16(
+                gpu, out_bf16, out_w, out_s, HIDDEN, INNER)) &&
             h3_gpu_linear_rank8_f16_bf16(
                 gpu, modulation, features, mod_w, mod_b, 1, MODULATION) &&
             h3_gpu_adaln_bf16(
@@ -781,12 +816,38 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
             h3_gpu_qkv_rope_bf16(
                 gpu, query, key, value, qkv, q_norm, k_norm, rope_cos,
                 rope_sin, B_ROWS, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f) &&
-            h3_gpu_sdpa_bf16(
-                gpu, attention_heads, query, key, value, B_ROWS, HEADS,
-                HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)) &&
-            h3_gpu_linear_convrot_int8_bf16(
+            (use_f32_sdpa ?
+                (h3_gpu_cast_bf16_to_f32(
+                    gpu, query_f32, oracle_query ? oracle_query : query,
+                    head_elements) &&
+                 h3_gpu_cast_bf16_to_f32(
+                    gpu, key_f32, oracle_key ? oracle_key : key,
+                    head_elements) &&
+                 h3_gpu_cast_bf16_to_f32(
+                    gpu, value_f32, oracle_value ? oracle_value : value,
+                    head_elements) &&
+                 h3_gpu_sdpa_f32(
+                    gpu, heads_f32, query_f32, key_f32, value_f32, B_ROWS,
+                    HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)) &&
+                 h3_gpu_cast_f32_to_bf16(
+                    gpu, attention_heads, heads_f32, head_elements)) :
+                h3_gpu_sdpa_bf16(
+                    gpu, attention_heads, oracle_query ? oracle_query : query,
+                    oracle_key ? oracle_key : key,
+                    oracle_value ? oracle_value : value, B_ROWS, HEADS,
+                    HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM))) &&
+            (use_dequantized_out ?
+             (h3_gpu_linear_convrot_int8_bf16(
                 gpu, attention_output, rotated, quantized, activation_scales,
-                attention_heads, out_w, out_s, B_ROWS, INNER, HIDDEN) &&
+                oracle_attention_heads ? oracle_attention_heads : attention_heads,
+                out_w, out_s, B_ROWS, INNER, HIDDEN) &&
+              h3_gpu_linear_bf16(
+                gpu, attention_output, rotated, out_bf16, NULL, B_ROWS,
+                INNER, HIDDEN)) :
+             h3_gpu_linear_convrot_int8_bf16(
+                gpu, attention_output, rotated, quantized, activation_scales,
+                oracle_attention_heads ? oracle_attention_heads : attention_heads,
+                out_w, out_s, B_ROWS, INNER, HIDDEN)) &&
             h3_gpu_gate_adaln_bf16(
                 gpu, after_attention, mod_mlp, hidden, attention_output,
                 norm2, modulation, modulation, row_map, B_ROWS, HIDDEN, 6,
@@ -871,6 +932,7 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
     FREE_BLOCK_TENSOR(q_norm); FREE_BLOCK_TENSOR(k_norm);
     FREE_BLOCK_TENSOR(qkv_w); FREE_BLOCK_TENSOR(qkv_s);
     FREE_BLOCK_TENSOR(out_w); FREE_BLOCK_TENSOR(out_s);
+    FREE_BLOCK_TENSOR(out_bf16);
     FREE_BLOCK_TENSOR(fc1_w); FREE_BLOCK_TENSOR(fc1_s);
     FREE_BLOCK_TENSOR(fc2_w); FREE_BLOCK_TENSOR(fc2_s);
     FREE_BLOCK_TENSOR(time_gpu); FREE_BLOCK_TENSOR(table);
@@ -880,6 +942,11 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
     FREE_BLOCK_TENSOR(rope_sin); FREE_BLOCK_TENSOR(mod_attention);
     FREE_BLOCK_TENSOR(qkv); FREE_BLOCK_TENSOR(query); FREE_BLOCK_TENSOR(key);
     FREE_BLOCK_TENSOR(value); FREE_BLOCK_TENSOR(attention_heads);
+    FREE_BLOCK_TENSOR(oracle_attention_heads);
+    FREE_BLOCK_TENSOR(oracle_query); FREE_BLOCK_TENSOR(oracle_key);
+    FREE_BLOCK_TENSOR(oracle_value);
+    FREE_BLOCK_TENSOR(query_f32); FREE_BLOCK_TENSOR(key_f32);
+    FREE_BLOCK_TENSOR(value_f32); FREE_BLOCK_TENSOR(heads_f32);
     FREE_BLOCK_TENSOR(attention_output); FREE_BLOCK_TENSOR(after_attention);
     FREE_BLOCK_TENSOR(mod_mlp); FREE_BLOCK_TENSOR(fc1);
     FREE_BLOCK_TENSOR(activated); FREE_BLOCK_TENSOR(mlp_output);

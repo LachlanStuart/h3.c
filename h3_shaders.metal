@@ -56,6 +56,21 @@ inline ushort4 h3_adaln_inplace_bf16x4(ushort4 input, float inverse,
                              h3_bf16x4_to_f32(shift));
 }
 
+struct h3_dequantize_rows_args { uint rows; uint columns; };
+
+kernel void h3_dequantize_rows_i8_bf16(
+                                  device const int8_t *input [[buffer(0)]],
+                                  device const float *scales [[buffer(1)]],
+                                  device ushort *output [[buffer(2)]],
+                                  constant h3_dequantize_rows_args &args
+                                      [[buffer(3)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x, row = gid.y;
+    if (row >= args.rows || column >= args.columns) return;
+    output[row * args.columns + column] = h3_f32_to_bf16(
+        float(input[row * args.columns + column]) * scales[row]);
+}
+
 struct linear_args {
     uint rows;
     uint input_dim;
@@ -4154,6 +4169,104 @@ kernel void h3_qkv_rope_bf16(device const ushort *qkv [[buffer(0)]],
     query[output_index] = h3_f32_to_bf16(q0);
     key[output_index] = h3_f32_to_bf16(k0);
     value[output_index] = qkv[v_base + dimension];
+}
+
+/* Small-sequence, BF16-input/F32-accumulation SDPA reference.  It exists only
+ * as an opt-in parity path (H3_REFERENCE_SDPA); it keeps the full calculation
+ * on Metal while separating MPSGraph's attention numerics from the model. */
+struct h3_sdpa_reference_args {
+    uint sequence;
+    uint heads;
+    uint head_dim;
+    float scale;
+    uint online_softmax;
+};
+
+kernel void h3_sdpa_bf16_reference(
+                         device const ushort *query [[buffer(0)]],
+                         device const ushort *key [[buffer(1)]],
+                         device const ushort *value [[buffer(2)]],
+                         device ushort *output [[buffer(3)]],
+                         constant h3_sdpa_reference_args &args [[buffer(4)]],
+                         uint lane [[thread_index_in_threadgroup]],
+                         uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr uint MAX_SEQUENCE = 128;
+    uint query_row = group.x;
+    uint head = group.y;
+    if (query_row >= args.sequence || head >= args.heads) return;
+    threadgroup float scores[MAX_SEQUENCE];
+    threadgroup float reductions[MAX_SEQUENCE];
+    uint row_base = (query_row * args.heads + head) * args.head_dim;
+    for (uint key_row = 0; key_row < args.sequence; key_row++) {
+        uint key_base = (key_row * args.heads + head) * args.head_dim;
+        reductions[lane] = lane < args.head_dim ?
+            h3_bf16_to_f32(query[row_base + lane]) *
+            h3_bf16_to_f32(key[key_base + lane]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 64; stride; stride >>= 1) {
+            if (lane < stride) reductions[lane] += reductions[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) scores[key_row] = reductions[0] * args.scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (args.online_softmax) {
+        if (lane == 0) {
+            reductions[0] = -INFINITY;
+            reductions[1] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float accumulator = 0.0f;
+        for (uint key_row = 0; key_row < args.sequence; key_row++) {
+            if (lane == 0) {
+                float previous_maximum = reductions[0];
+                float next_maximum = max(previous_maximum, scores[key_row]);
+                reductions[2] = exp(previous_maximum - next_maximum);
+                reductions[3] = exp(scores[key_row] - next_maximum);
+                reductions[1] = reductions[1] * reductions[2] + reductions[3];
+                reductions[0] = next_maximum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < args.head_dim) {
+                uint value_base =
+                    (key_row * args.heads + head) * args.head_dim;
+                accumulator = fma(reductions[3],
+                                  h3_bf16_to_f32(value[value_base + lane]),
+                                  accumulator * reductions[2]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane < args.head_dim)
+            output[row_base + lane] = h3_f32_to_bf16(
+                accumulator / reductions[1]);
+        return;
+    }
+    if (lane == 0) {
+        float maximum = -INFINITY;
+        for (uint key_row = 0; key_row < args.sequence; key_row++)
+            maximum = max(maximum, scores[key_row]);
+        for (uint key_row = 0; key_row < args.sequence; key_row++)
+            scores[key_row] = exp(scores[key_row] - maximum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float partial_sum = 0.0f;
+    for (uint key_row = lane; key_row < args.sequence; key_row += 128)
+        partial_sum += scores[key_row];
+    reductions[lane] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 64; stride; stride >>= 1) {
+        if (lane < stride) reductions[lane] += reductions[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < args.head_dim) {
+        float result = 0.0f;
+        for (uint key_row = 0; key_row < args.sequence; key_row++) {
+            uint value_base = (key_row * args.heads + head) * args.head_dim;
+            result = fma(scores[key_row] / reductions[0],
+                         h3_bf16_to_f32(value[value_base + lane]), result);
+        }
+        output[row_base + lane] = h3_f32_to_bf16(result);
+    }
 }
 
 /* One SIMD group owns one (row, head), so a 128-thread threadgroup processes

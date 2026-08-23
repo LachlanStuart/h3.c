@@ -135,6 +135,13 @@ static H3Tensor *TENSOR(const h3_gpu_tensor *tensor) {
     return (__bridge H3Tensor *)(void *)tensor;
 }
 
+static int h3_gpu_require_bf16(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                               size_t elements, NSString *label);
+static int h3_gpu_require_i8(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                             size_t elements, NSString *label);
+static int h3_gpu_require_f32(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                              size_t elements, NSString *label);
+
 static MPSGraphTensorData *h3_gpu_graph_data(const h3_gpu_tensor *tensor,
                                              NSArray<NSNumber *> *shape,
                                              MPSDataType data_type,
@@ -437,6 +444,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_linear_f32_tiled_bf16_map",
             @"h3_cast_f32_to_bf16",
             @"h3_cast_bf16_to_f32",
+            @"h3_dequantize_rows_i8_bf16",
             @"h3_adaln_table_interpolate_f32",
             @"h3_linear_rank8_f16_bf16",
             @"h3_cast_f32_to_f16",
@@ -455,6 +463,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
             @"h3_qkv_rope_bf16", @"h3_qkv_rope_bf16_coop",
             @"h3_qkv_rope_bf16_coop_uncached",
+            @"h3_sdpa_bf16_reference",
             @"h3_swiglu_bf16",
             @"h3_layer_norm_bf16", @"h3_gelu_bf16",
             @"h3_vision_qkv_rope_bf16",
@@ -1449,6 +1458,30 @@ int h3_gpu_cast_bf16_to_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
+int h3_gpu_dequantize_rows_i8_bf16(
+                            h3_gpu *opaque, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *scales, uint32_t rows,
+                            uint32_t columns) {
+    H3GPU *gpu = GPU(opaque);
+    size_t elements = (size_t)rows * columns;
+    if (!rows || !columns ||
+        !h3_gpu_require_i8(gpu, input, elements, @"dequantized row input") ||
+        !h3_gpu_require_f32(gpu, scales, rows, @"dequantized row scales") ||
+        !h3_gpu_require_bf16(gpu, output, elements,
+                             @"dequantized row output")) return 0;
+    typedef struct { uint32_t rows, columns; } dequantize_rows_args;
+    dequantize_rows_args args = {rows, columns};
+    return h3_gpu_dispatch_2d(gpu, @"h3_dequantize_rows_i8_bf16", columns,
+                               rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
 int h3_gpu_adaln_table_interpolate_f32(
                             h3_gpu *opaque, h3_gpu_tensor *output,
                             const h3_gpu_tensor *times,
@@ -1800,6 +1833,55 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
     }
 }
 
+/* This deliberately small, direct SDPA is a numerical oracle for the
+ * 128-token hybrid block fixture. Production keeps using MPSGraph unless the
+ * explicit diagnostic environment switch is selected. */
+static int h3_gpu_sdpa_reference_bf16(
+                    H3GPU *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                    const h3_gpu_tensor *value, uint32_t sequence,
+                    uint32_t heads, uint32_t head_dim, float scale) {
+    if (sequence > 128 || head_dim != 128) {
+        h3_gpu_set_error(gpu,
+            @"reference BF16 SDPA only supports sequence/head dimension 128");
+        return 0;
+    }
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_sdpa_bf16_reference");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu,
+            @"reference BF16 SDPA needs a 128-thread threadgroup");
+        return 0;
+    }
+    typedef struct {
+        uint32_t sequence, heads, head_dim;
+        float scale;
+        uint32_t online_softmax;
+    }
+        sdpa_reference_args;
+    sdpa_reference_args args = {
+        sequence, heads, head_dim, scale,
+        getenv("H3_REFERENCE_SDPA_ONLINE") != NULL
+    };
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(sequence, heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                        const h3_gpu_tensor *value, uint32_t batch,
@@ -1823,6 +1905,10 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"SDPA tensor dtype mismatch");
         return 0;
     }
+    if (tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal &&
+        getenv("H3_REFERENCE_SDPA"))
+        return h3_gpu_sdpa_reference_bf16(
+            gpu, output, query, key, value, sequence, heads, head_dim, scale);
     H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
                                       scale, mps_dtype, causal, headMajor,
                                       outputHeadMajor);
