@@ -24,6 +24,7 @@ static void usage(const char *program) {
         "      --dit-checkpoint PATH  Exact standalone DiT safetensors file\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
         "  -o, --output PATH      Output media (default: outputs/h3.mp4)\n"
+        "      --audio-only       Write standalone 32 kHz stereo WAV output\n"
         "      --width N          Output width (default: 864)\n"
         "      --height N         Output height (default: 480)\n"
         "      --render-width N   Lower internal model width (optional)\n"
@@ -285,6 +286,7 @@ int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_DIT_CHECKPOINT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_SAMPLER, OPT_REUSE,
+           OPT_AUDIO_ONLY,
            OPT_VIDEO_CODEC, OPT_VIDEO_PRESET, OPT_VIDEO_CRF,
            OPT_LOSSLESS_OUTPUT, OPT_LATENT_OUTPUT,
            OPT_REFINE_VIDEO, OPT_REFINE_LATENT,
@@ -324,6 +326,7 @@ int main(int argc, char **argv) {
         {"seconds", required_argument, NULL, OPT_SECONDS},
         {"steps", required_argument, NULL, OPT_STEPS},
         {"sampler", required_argument, NULL, OPT_SAMPLER},
+        {"audio-only", no_argument, NULL, OPT_AUDIO_ONLY},
         {"video-codec", required_argument, NULL, OPT_VIDEO_CODEC},
         {"video-preset", required_argument, NULL, OPT_VIDEO_PRESET},
         {"video-crf", required_argument, NULL, OPT_VIDEO_CRF},
@@ -394,6 +397,7 @@ int main(int argc, char **argv) {
     int info = 0;
     int frames_given = 0;
     int seconds_given = 0;
+    int output_given = 0;
     int seed_given = 0;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
@@ -401,7 +405,7 @@ int main(int argc, char **argv) {
             case 'd': model_dir = optarg; break;
             case OPT_DIT_CHECKPOINT: params.dit_checkpoint = optarg; break;
             case 'p': prompt = optarg; break;
-            case 'o': output = optarg; break;
+            case 'o': output = optarg; output_given = 1; break;
             case 'h': usage(argv[0]); return 0;
             case OPT_WIDTH: params.width = parse_int(optarg, "width"); break;
             case OPT_HEIGHT: params.height = parse_int(optarg, "height"); break;
@@ -421,6 +425,7 @@ int main(int argc, char **argv) {
                 break;
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
             case OPT_SAMPLER: params.sampler = parse_sampler(optarg); break;
+            case OPT_AUDIO_ONLY: params.audio_only = 1; break;
             case OPT_VIDEO_CODEC:
                 params.video_codec = parse_video_codec(optarg);
                 break;
@@ -569,6 +574,17 @@ int main(int argc, char **argv) {
     }
     if (frames_given && seconds_given) {
         fprintf(stderr, "h3: --seconds and --frames are mutually exclusive\n");
+        return 2;
+    }
+    if (params.audio_only && !output_given)
+        output = "outputs/h3.wav";
+    if (params.audio_only && show) {
+        fprintf(stderr, "h3: --audio-only cannot be combined with --show\n");
+        return 2;
+    }
+    if (params.audio_only && cli.frames_dir) {
+        fprintf(stderr,
+            "h3: --audio-only cannot be combined with --frames-dir\n");
         return 2;
     }
     if (prompt && params.sampler == H3_SAMPLER_EULER &&

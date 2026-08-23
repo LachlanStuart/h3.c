@@ -1,6 +1,7 @@
 #include "h3_ffmpeg.h"
 
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -63,6 +64,11 @@ int h3_ffmpeg_video_plan_build(h3_video_codec codec,
 static int has_mkv_extension(const char *path) {
     size_t length = path ? strlen(path) : 0;
     return length >= 4 && !strcmp(path + length - 4, ".mkv");
+}
+
+static int has_wav_extension(const char *path) {
+    size_t length = path ? strlen(path) : 0;
+    return length >= 4 && !strcmp(path + length - 4, ".wav");
 }
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -925,4 +931,103 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         return 0;
     }
     return 1;
+}
+
+static void wav_u16(uint8_t *destination, uint16_t value) {
+    destination[0] = (uint8_t)value;
+    destination[1] = (uint8_t)(value >> 8);
+}
+
+static void wav_u32(uint8_t *destination, uint32_t value) {
+    destination[0] = (uint8_t)value;
+    destination[1] = (uint8_t)(value >> 8);
+    destination[2] = (uint8_t)(value >> 16);
+    destination[3] = (uint8_t)(value >> 24);
+}
+
+int h3_ffmpeg_write_wav_f32(const char *path, const float *pcm,
+                            int samples, int channels, int sample_rate,
+                            char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!path || !*path || !has_wav_extension(path) || !pcm || samples < 1 ||
+        channels < 1 || channels > UINT16_MAX || sample_rate < 1 ||
+        (uint64_t)sample_rate > UINT32_MAX ||
+        (uint64_t)channels * 2 > UINT16_MAX) {
+        fail(error, error_size, "invalid WAV output arguments");
+        return 0;
+    }
+    uint64_t data_bytes = (uint64_t)samples * (uint64_t)channels * 2;
+    if (data_bytes > UINT32_MAX) {
+        fail(error, error_size, "WAV PCM stream exceeds the RIFF size limit");
+        return 0;
+    }
+    if (!make_parents(path, error, error_size)) return 0;
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        fail(error, error_size, "cannot open WAV output %s: %s",
+             path, strerror(errno));
+        return 0;
+    }
+    uint32_t byte_rate = (uint32_t)sample_rate * (uint32_t)channels * 2;
+    uint16_t block_align = (uint16_t)(channels * 2);
+    uint8_t header[44] = {
+        'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E',
+        'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0,
+        'd', 'a', 't', 'a', 0, 0, 0, 0
+    };
+    wav_u32(header + 4, 36 + (uint32_t)data_bytes);
+    wav_u16(header + 22, (uint16_t)channels);
+    wav_u32(header + 24, (uint32_t)sample_rate);
+    wav_u32(header + 28, byte_rate);
+    wav_u16(header + 32, block_align);
+    wav_u16(header + 34, 16);
+    wav_u32(header + 40, (uint32_t)data_bytes);
+    int ok = fwrite(header, 1, sizeof(header), file) == sizeof(header);
+    if (ok) {
+        enum { WAV_CHUNK_SAMPLES = 4096 };
+        size_t chunk_bytes = (size_t)WAV_CHUNK_SAMPLES *
+                             (size_t)channels * sizeof(int16_t);
+        int16_t *converted = malloc(chunk_bytes);
+        if (!converted) {
+            fail(error, error_size, "out of memory converting WAV PCM");
+            ok = 0;
+        } else {
+            for (int offset = 0; ok && offset < samples;) {
+                int count = samples - offset;
+                if (count > WAV_CHUNK_SAMPLES) count = WAV_CHUNK_SAMPLES;
+                size_t values = (size_t)count * (size_t)channels;
+                for (int sample = 0; sample < count; sample++)
+                    for (int channel = 0; channel < channels; channel++) {
+                        float value = pcm[(size_t)channel * (size_t)samples +
+                                          (size_t)offset + (size_t)sample];
+                        if (!isfinite(value)) value = 0.0f;
+                        if (value > 1.0f) value = 1.0f;
+                        if (value < -1.0f) value = -1.0f;
+                        float scaled = value < 0.0f ? value * 32768.0f :
+                                                       value * 32767.0f;
+                        long rounded = lroundf(scaled);
+                        if (rounded > INT16_MAX) rounded = INT16_MAX;
+                        if (rounded < INT16_MIN) rounded = INT16_MIN;
+                        converted[(size_t)sample * (size_t)channels +
+                                  (size_t)channel] = (int16_t)rounded;
+                    }
+                if (fwrite(converted, sizeof(*converted), values, file) != values) {
+                    fail(error, error_size, "cannot write WAV PCM: %s",
+                         strerror(errno));
+                    ok = 0;
+                }
+                offset += count;
+            }
+            free(converted);
+        }
+    }
+    if (fclose(file) != 0) {
+        if (ok) fail(error, error_size, "cannot close WAV output %s: %s",
+                    path, strerror(errno));
+        ok = 0;
+    }
+    if (!ok && error && error_size && !error[0])
+        fail(error, error_size, "cannot write WAV output %s", path);
+    return ok;
 }

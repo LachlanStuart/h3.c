@@ -183,14 +183,14 @@ static void print_help(void) {
     puts("  !ref-remove N            Remove ordered reference N");
     puts("  !show [on|off]           Toggle denoising previews");
     puts("  !zoom N                  Set terminal image zoom");
-    puts("  !open [on|off]           Toggle opening completed videos");
+    puts("  !open [on|off]           Toggle opening completed media");
     puts("  !output [DIR]            Set or show the output directory");
-    puts("  !save [PATH]             Copy the last generated video");
+    puts("  !save [PATH]             Copy the last generated media");
     puts("  !again                   Repeat the last prompt");
     puts("  !cache                   Show reusable-session cache state");
     puts("  !cache clear             Clear reusable-session caches");
     puts("  !quit                    Exit");
-    puts("\nType a prompt on a line by itself to generate a video.");
+    puts("\nType a prompt on a line by itself to generate media.");
 }
 
 static void print_status(const h3_cli_state *state) {
@@ -440,8 +440,10 @@ static void open_video(const char *path) {
 static int generate(h3_cli_state *state, const char *prompt) {
     char output[H3_CLI_PATH];
     unsigned number = ++state->output_count;
-    int length = snprintf(output, sizeof(output), "%s/video-%04u.mp4",
-                          state->output_dir, number);
+    const char *kind = state->params.audio_only ? "audio" : "video";
+    const char *extension = state->params.audio_only ? "wav" : "mp4";
+    int length = snprintf(output, sizeof(output), "%s/%s-%04u.%s",
+                          state->output_dir, kind, number, extension);
     if (length < 0 || (size_t)length >= sizeof(output)) {
         fprintf(stderr, "h3: output path is too long\n");
         return 0;
@@ -695,11 +697,13 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                     argument, strerror(errno));
         else printf("Output: %s\n", state->output_dir);
     } else if (!strcasecmp(command, "save")) {
-        if (!state->last_output[0]) fprintf(stderr, "h3: no video to save\n");
+        if (!state->last_output[0]) fprintf(stderr, "h3: no media to save\n");
         else {
             char destination[H3_CLI_PATH];
             if (*argument) snprintf(destination, sizeof(destination), "%s", argument);
-            else snprintf(destination, sizeof(destination), "h3-%ld.mp4", (long)time(NULL));
+            else snprintf(destination, sizeof(destination),
+                          "h3-%ld.%s", (long)time(NULL),
+                          state->params.audio_only ? "wav" : "mp4");
             if (!copy_file(state->last_output, destination))
                 fprintf(stderr, "h3: cannot save %s: %s\n", destination,
                         strerror(errno));

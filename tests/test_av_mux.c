@@ -15,6 +15,7 @@ static void die(const char *message) {
 int main(int argc, char **argv) {
     enum { WIDTH = 32, HEIGHT = 32, FRAMES = 8, SAMPLES = 64000 };
     const char *path = argc > 1 ? argv[1] : "/tmp/h3-av-mux-test.mp4";
+    const char *wav_path = "/tmp/h3-audio-only-test.wav";
     const char *lossless_path = "/tmp/h3-av-mux-lossless-test.mkv";
     const char *source_audio_path = "/tmp/h3-av-source-audio-test.mp4";
     const char *short_source_path = "/tmp/h3-av-short-source-test.mp4";
@@ -66,6 +67,20 @@ int main(int argc, char **argv) {
                              (float)(220 + channel * 110) * (float)sample /
                              32000.0f);
     char error[512];
+    if (!h3_ffmpeg_write_wav_f32(
+            wav_path, pcm, SAMPLES, 2, 32000, error, sizeof(error)))
+        die(error);
+    struct stat wav_status;
+    if (stat(wav_path, &wav_status) != 0 || wav_status.st_size <= 44)
+        die("standalone WAV output is empty");
+    float *wav_pcm = NULL;
+    int wav_samples = 0;
+    if (!h3_ffmpeg_read_audio_f32(wav_path, SAMPLES, 0, &wav_pcm,
+                                  &wav_samples, error, sizeof(error)))
+        die(error);
+    if (wav_samples != SAMPLES)
+        die("standalone WAV output returned an unexpected sample count");
+    free(wav_pcm);
     if (h3_ffmpeg_write_av_rgb24_f32(
             "/tmp/h3-lossless-wrong-container.mp4", rgb, FRAMES,
             WIDTH, HEIGHT, 24, pcm, SAMPLES, 2, 32000,

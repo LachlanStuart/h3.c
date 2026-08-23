@@ -100,6 +100,10 @@ typedef struct {
      * encoder, and VAEs continue to come from model_dir. */
     const char *dit_checkpoint;
     const char *output_path;
+    /* Write only the generated 32 kHz stereo waveform as a standalone WAV.
+     * Joint DiT denoising and AudioVAE decoding still run; VideoVAE decode,
+     * RGB delivery, and video muxing are skipped. */
+    int audio_only;
     /* Optionally emit a second FFV1/Matroska diagnostic from these exact
      * generated RGB and PCM buffers. Must differ from output_path. */
     const char *lossless_output_path;

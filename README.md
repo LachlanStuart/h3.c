@@ -318,7 +318,25 @@ experimental frame counts when memory and runtime allow. A request such as
 temporal shape. For example, `--seconds 45` requests 1080 frames and produces
 the next legal shape, 1093 frames (45.542 seconds).
 
-### 6. Improve the prompt
+### 6. Generate audio only
+
+Pass `--audio-only` to keep the joint DiT denoising and AudioVAE decode while
+skipping VideoVAE RGB decode, frame callbacks, and video muxing. The output is
+a standalone 16-bit PCM WAV at H3's native 32 kHz stereo rate:
+
+```sh
+./h3 --profile -d ./MiniMax-H3 \
+  -p "A whispered story about a lighthouse that remembers every storm." \
+  --audio-only --width 32 --height 32 --seconds 10 --steps 10 \
+  -o outputs/lighthouse.wav
+```
+
+The audio-only path still allocates and denoises the video latent because H3's
+DiT is joint audio/video; it only removes the final VideoVAE and visual output
+work. The output path must end in `.wav`. `--show`, `--frames-dir`, restart
+refinement, and `--lossless-output` are incompatible with this mode.
+
+### 7. Improve the prompt
 
 A short prompt works, but the released system expects a Context-IR-like
 description. State the subject, action, setting, camera, lighting/style, and
@@ -336,7 +354,7 @@ Keep identity and object counts explicit when they matter. `--seed N` controls
 the native random stream; the default is 42. Compare options with the same
 prompt, seed, resolution, frame count, and step count.
 
-### 7. Preview frames and diagnose performance
+### 8. Preview frames and diagnose performance
 
 - `--show` displays a representative frame after every denoising transition,
   followed by all frames from the completed video. Like Iris, it advertises 2x

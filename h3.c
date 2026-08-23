@@ -536,6 +536,31 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "latent output path must not be empty");
         return 0;
     }
+    if (params->audio_only) {
+        if (!params->output_path || !*params->output_path) {
+            h3_set_error(ctx, "audio-only output requires a .wav path");
+            return 0;
+        }
+        size_t length = strlen(params->output_path);
+        if (length < 4 || strcmp(params->output_path + length - 4, ".wav")) {
+            h3_set_error(ctx, "audio-only output must use a .wav path");
+            return 0;
+        }
+        if (params->lossless_output_path && *params->lossless_output_path) {
+            h3_set_error(ctx, "audio-only output cannot use --lossless-output");
+            return 0;
+        }
+        if (params->refine_video_path || params->refine_latent_path ||
+            params->restart_steps || params->restart_schedule_steps ||
+            params->freeze_audio) {
+            h3_set_error(ctx, "audio-only output cannot use restart refinement");
+            return 0;
+        }
+        if (params->preview_denoise) {
+            h3_set_error(ctx, "audio-only output cannot use denoising previews");
+            return 0;
+        }
+    }
     if (params->refine_video_path) {
         if (!*params->refine_video_path || params->sampler != H3_SAMPLER_RES ||
             !params->freeze_audio || params->restart_schedule_steps < 2 ||
@@ -584,12 +609,13 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             "restart options and --refine-latent require --refine-video");
         return 0;
     }
-    if (!h3_video_settings_valid(params->video_codec, params->video_preset,
+    if (!params->audio_only &&
+        !h3_video_settings_valid(params->video_codec, params->video_preset,
                                  params->video_crf)) {
         h3_set_error(ctx, "invalid video codec, preset, or CRF");
         return 0;
     }
-    if (params->video_codec == H3_VIDEO_CODEC_FFV1 &&
+    if (!params->audio_only && params->video_codec == H3_VIDEO_CODEC_FFV1 &&
         params->output_path && *params->output_path) {
         size_t length = strlen(params->output_path);
         if (length < 4 || strcmp(params->output_path + length - 4, ".mkv")) {
@@ -1812,6 +1838,29 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->audio_only) {
+        h3_progress_emit(&progress, "WAV output", 0, 1);
+        if (!h3_ffmpeg_write_wav_f32(
+                params->output_path, waveform.pcm, waveform.samples,
+                waveform.channels, waveform.sample_rate,
+                detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        h3_progress_emit(&progress, "WAV output", 1, 1);
+        result = calloc(1, sizeof(*result));
+        if (!result) {
+            h3_set_error(ctx, "out of memory creating generation result");
+            goto cleanup;
+        }
+        result->width = params->width;
+        result->height = params->height;
+        result->frames = temporal.frame_count;
+        result->fps = H3_FPS;
+        result->sample_rate = waveform.sample_rate;
+        result->seed = params->seed;
+        goto cleanup;
+    }
     if (!preview_decoder && ctx->cache_enabled) {
         h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(

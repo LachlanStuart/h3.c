@@ -88,4 +88,9 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
                                  h3_video_preset preset, int crf,
                                  char *error, size_t error_size);
 
+/* Write channel-major clipped F32 PCM as a standalone 16-bit PCM WAV. */
+int h3_ffmpeg_write_wav_f32(const char *path, const float *pcm,
+                            int samples, int channels, int sample_rate,
+                            char *error, size_t error_size);
+
 #endif
