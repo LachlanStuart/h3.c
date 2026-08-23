@@ -67,6 +67,7 @@ typedef struct {
     h3_gpu *gpu;
     h3_weight_store *store;
     int fp16;
+    int scheduled_tiles;
     encoder_conv conv_in;
     encoder_level levels[LEVELS];
     encoder_norm norm_out;
@@ -95,6 +96,34 @@ typedef struct {
     size_t capacity;
 } tensor_arena;
 
+/* A forward owns all transient activation tensors through its arena, while its
+ * quantized moments remain separately owned by the caller for the later
+ * spatial stitch.  The arena cannot be released at encode time: an enqueued
+ * MPSGraph command may still read any of these buffers. */
+typedef struct {
+    h3_gpu_tensor *quant;
+    tensor_arena scratch;
+} tile_forward;
+
+/* Two tile forwards fit comfortably in a root command on M5 without the
+ * MPSGraph command-buffer back-pressure seen with unbounded batches.  Keep at
+ * most three such commands' scratch arenas live.  A normal 608x352 image has
+ * six tiles, so it still has one final synchronization; very large canvases
+ * gain bounded peak memory rather than retaining every tile arena. */
+enum {
+    TILES_PER_COMMAND = 2,
+    MAX_DEFERRED_TILES = 6
+};
+
+typedef struct {
+    encoder_context *encoder;
+    tile_forward *forwards;
+    int count;
+    int released;
+    int command_tiles;
+    int command_active;
+} tile_schedule;
+
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
     va_list arguments;
@@ -121,6 +150,19 @@ static void tensor_arena_free(tensor_arena *arena) {
         h3_gpu_tensor_free(arena->items[index]);
     free(arena->items);
     memset(arena, 0, sizeof(*arena));
+}
+
+static void tile_forward_free_scratch(tile_forward *forward) {
+    if (!forward) return;
+    tensor_arena_free(&forward->scratch);
+}
+
+static void tile_schedule_release_scratch(tile_schedule *schedule,
+                                          int through) {
+    if (!schedule) return;
+    for (int index = schedule->released; index < through; index++)
+        tile_forward_free_scratch(&schedule->forwards[index]);
+    schedule->released = through;
 }
 
 static h3_gpu_tensor *tensor_arena_own(tensor_arena *arena,
@@ -153,6 +195,13 @@ static h3_gpu_tensor *tensor_arena_new_activation(encoder_context *encoder,
 static int configured_fp16(void) {
     const char *value = getenv("H3_VIDEO_ENCODER_FP16");
     return !value || !*value || strcmp(value, "0");
+}
+
+/* Preserve an explicit FP16 serial oracle for scheduling A/B tests.  The F32
+ * path is independently retained by H3_VIDEO_ENCODER_FP16=0. */
+static int configured_tile_schedule(void) {
+    const char *value = getenv("H3_VIDEO_ENCODER_SERIAL_TILES");
+    return !value || !*value || !strcmp(value, "0");
 }
 
 static void free_conv(encoder_conv *conv) {
@@ -644,17 +693,22 @@ done:
     return output;
 }
 
-static h3_gpu_tensor *encode_tile_quant(encoder_context *encoder,
-                                        const float *pixels, int frames,
-                                        int height, int width,
-                                        int *latent_time, char *error,
-                                        size_t error_size) {
+static int encode_tile_quant_enqueue(encoder_context *encoder,
+                                     const float *pixels, int frames,
+                                     int height, int width,
+                                     int *latent_time, tile_forward *forward,
+                                     char *error, size_t error_size) {
+    if (!forward) {
+        fail(error, error_size, "missing visual encoder tile forward");
+        return 0;
+    }
+    memset(forward, 0, sizeof(*forward));
     size_t pixel_count = (size_t)frames * height * width * RGB_CHANNELS;
     float *normalized = encoder->fp16 ? NULL :
         malloc(pixel_count * sizeof(*normalized));
     if (!encoder->fp16 && !normalized) {
         fail(error, error_size, "out of memory normalizing visual anchor");
-        return NULL;
+        return 0;
     }
     static const float mean[] = {0.485f, 0.456f, 0.406f};
     static const float deviation[] = {0.229f, 0.224f, 0.225f};
@@ -671,23 +725,17 @@ static h3_gpu_tensor *encode_tile_quant(encoder_context *encoder,
                             deviation[channel];
                     }
     }
-    tensor_arena arena = {0};
+    tensor_arena *arena = &forward->scratch;
     h3_gpu_tensor *uploaded = tensor_arena_own(
-        &arena, h3_gpu_tensor_from_f32(
+        arena, h3_gpu_tensor_from_f32(
             encoder->gpu, encoder->fp16 ? pixels : normalized, pixel_count));
     h3_gpu_tensor *hidden = encoder->fp16 ? tensor_arena_new_activation(
-        encoder, &arena, pixel_count) : uploaded;
+        encoder, arena, pixel_count) : uploaded;
     free(normalized);
     if (!uploaded || !hidden) {
         fail(error, error_size, "cannot allocate visual encoder pixels");
-        tensor_arena_free(&arena);
-        return NULL;
-    }
-    int began = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                       "begin visual encoder tile");
-    if (!began) {
-        tensor_arena_free(&arena);
-        return NULL;
+        tile_forward_free_scratch(forward);
+        return 0;
     }
     h3_gpu_tensor *quant = NULL;
     int ok = 1;
@@ -699,7 +747,7 @@ static h3_gpu_tensor *encode_tile_quant(encoder_context *encoder,
     uint32_t depth = (uint32_t)frames, h = (uint32_t)height, w = (uint32_t)width;
     uint32_t next_d, next_h, next_w;
     h3_gpu_tensor *next = ok ? run_conv(
-        encoder, &arena, hidden, &encoder->conv_in,
+        encoder, arena, hidden, &encoder->conv_in,
                                    depth, h, w, &next_d, &next_h, &next_w,
                                    error, error_size) : NULL;
     hidden = next;
@@ -710,13 +758,13 @@ static h3_gpu_tensor *encode_tile_quant(encoder_context *encoder,
         uint32_t channels = level_channels[level];
         for (int block = 0; block < BLOCKS && hidden; block++) {
             uint32_t input_channels = block ? channels : previous;
-            next = run_block(encoder, &arena, hidden,
+            next = run_block(encoder, arena, hidden,
                              &encoder->levels[level].blocks[block], depth, h, w,
                              input_channels, channels, error, error_size);
             hidden = next;
         }
         if (hidden && encoder->levels[level].has_downsample) {
-            next = run_conv(encoder, &arena, hidden,
+            next = run_conv(encoder, arena, hidden,
                             &encoder->levels[level].downsample, depth, h, w,
                             &next_d, &next_h, &next_w, error, error_size);
             hidden = next;
@@ -729,11 +777,11 @@ static h3_gpu_tensor *encode_tile_quant(encoder_context *encoder,
     size_t hidden_count = tensor_elements(depth, h, w, 1024);
     size_t padded_count = tensor_elements(depth + 2, h + 2, w + 2, 1024);
     size_t moment_count = tensor_elements(depth, h, w, MOMENT_CHANNELS);
-    h3_gpu_tensor *norm = tensor_arena_new_activation(encoder, &arena,
+    h3_gpu_tensor *norm = tensor_arena_new_activation(encoder, arena,
                                                 hidden_count);
-    h3_gpu_tensor *padded = tensor_arena_new_activation(encoder, &arena,
+    h3_gpu_tensor *padded = tensor_arena_new_activation(encoder, arena,
                                                   padded_count);
-    h3_gpu_tensor *moments = tensor_arena_new_activation(encoder, &arena,
+    h3_gpu_tensor *moments = tensor_arena_new_activation(encoder, arena,
                                                    moment_count);
     quant = encoder->fp16 ? h3_gpu_tensor_new_f16(encoder->gpu, moment_count) :
                             h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
@@ -755,15 +803,115 @@ static h3_gpu_tensor *encode_tile_quant(encoder_context *encoder,
                      NULL, error, error_size);
     }
 done:
-    if (!gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                "submit visual encoder tile")) ok = 0;
-    tensor_arena_free(&arena);
     if (!ok) {
         h3_gpu_tensor_free(quant);
-        return NULL;
+        tile_forward_free_scratch(forward);
+        return 0;
     }
     *latent_time = (int)depth;
-    return quant;
+    forward->quant = quant;
+    return 1;
+}
+
+/* Retained F32 oracle path: keep its exact submit/fence schedule.  The FP16
+ * path below is the experimentally scheduled path; retaining this wrapper
+ * gives A/B diagnosis a stable reference. */
+static h3_gpu_tensor *encode_tile_quant_sync(encoder_context *encoder,
+                                             const float *pixels, int frames,
+                                             int height, int width,
+                                             int *latent_time, char *error,
+                                             size_t error_size) {
+    tile_forward forward = {0};
+    int ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
+                    "begin visual encoder tile") &&
+             encode_tile_quant_enqueue(encoder, pixels, frames, height, width,
+                                       latent_time, &forward, error, error_size);
+    if (ok) ok = gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
+                        "submit visual encoder tile");
+    else h3_gpu_abort(encoder->gpu);
+    tile_forward_free_scratch(&forward);
+    if (!ok) {
+        h3_gpu_tensor_free(forward.quant);
+        return NULL;
+    }
+    return forward.quant;
+}
+
+static int tile_schedule_enqueue(tile_schedule *schedule,
+                                 const float *pixels, int frames,
+                                 int height, int width, int *latent_time,
+                                 char *error, size_t error_size) {
+    if (!schedule || !schedule->encoder || !schedule->forwards) {
+        fail(error, error_size, "invalid visual encoder tile schedule");
+        return 0;
+    }
+    if (!schedule->command_active) {
+        if (!gpu_op(schedule->encoder, h3_gpu_begin(schedule->encoder->gpu),
+                    error, error_size, "begin visual encoder tile batch"))
+            return 0;
+        schedule->command_active = 1;
+        schedule->command_tiles = 0;
+    }
+    if (!encode_tile_quant_enqueue(schedule->encoder, pixels, frames, height,
+                                   width, latent_time,
+                                   &schedule->forwards[schedule->count], error,
+                                   error_size)) return 0;
+    schedule->count++;
+    schedule->command_tiles++;
+    return 1;
+}
+
+/* Commit at a modest cadence without fencing.  Scratch arenas are deferred
+ * until a later submit proves every command that references them complete.
+ * This is deliberately distinct from freeing after h3_gpu_continue(): a
+ * continued command is only committed, not known complete. */
+static int tile_schedule_after_tile(tile_schedule *schedule, int final_tile,
+                                    char *error, size_t error_size) {
+    if (!schedule || !schedule->command_active) {
+        fail(error, error_size, "visual encoder tile schedule has no command");
+        return 0;
+    }
+    int retained = schedule->count - schedule->released;
+    if (!final_tile && retained == MAX_DEFERRED_TILES) {
+        if (!gpu_op(schedule->encoder, h3_gpu_submit(schedule->encoder->gpu),
+                    error, error_size, "submit bounded visual encoder batch"))
+            return 0;
+        schedule->command_active = 0;
+        schedule->command_tiles = 0;
+        tile_schedule_release_scratch(schedule, schedule->count);
+        return 1;
+    }
+    if (!final_tile && schedule->command_tiles == TILES_PER_COMMAND) {
+        if (!gpu_op(schedule->encoder, h3_gpu_continue(schedule->encoder->gpu),
+                    error, error_size, "continue visual encoder tile batch"))
+            return 0;
+        schedule->command_tiles = 0;
+    }
+    return 1;
+}
+
+static int tile_schedule_submit(tile_schedule *schedule, char *error,
+                                size_t error_size) {
+    if (!schedule || !schedule->command_active) {
+        fail(error, error_size, "visual encoder schedule has no final command");
+        return 0;
+    }
+    int ok = gpu_op(schedule->encoder, h3_gpu_submit(schedule->encoder->gpu),
+                    error, error_size, "submit visual encoder tile chain");
+    schedule->command_active = 0;
+    if (ok) tile_schedule_release_scratch(schedule, schedule->count);
+    return ok;
+}
+
+static void tile_schedule_abort(tile_schedule *schedule) {
+    if (!schedule || !schedule->encoder) return;
+    if (schedule->command_active) h3_gpu_abort(schedule->encoder->gpu);
+    /* A failure after h3_gpu_continue() leaves prior batches in flight. Fence
+     * them before the caller frees command-scoped scratch.  This is a failure
+     * path only; successful FP16 scheduling has no intermediate wait. */
+    (void)h3_gpu_drain(schedule->encoder->gpu);
+    schedule->command_active = 0;
+    tile_schedule_release_scratch(schedule, schedule->count);
 }
 
 static void tile_axis_free(tile_axis *axis) {
@@ -959,6 +1107,7 @@ int h3_video_vae_encode(const char *weight_directory,
     }
     encoder_context encoder = {0};
     encoder.fp16 = configured_fp16();
+    encoder.scheduled_tiles = encoder.fp16 && configured_tile_schedule();
     encoder.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (encoder.gpu)
         h3_gpu_profile_set_label(encoder.gpu, "video VAE encoder");
@@ -970,11 +1119,17 @@ int h3_video_vae_encode(const char *weight_directory,
          (!encoder.fp16 || prepare_fp16_weights(&encoder, error, error_size));
     int tile_count = y_axis.count * x_axis.count;
     h3_gpu_tensor **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
+    tile_forward *forwards = ok && encoder.scheduled_tiles ?
+        calloc((size_t)tile_count, sizeof(*forwards)) : NULL;
     h3_gpu_tensor *final = NULL;
-    if (ok && !tiles) {
+    if (ok && (!tiles || (encoder.scheduled_tiles && !forwards))) {
         fail(error, error_size, "out of memory allocating visual encoder tiles");
         ok = 0;
     }
+    tile_schedule schedule = {
+        .encoder = &encoder,
+        .forwards = forwards
+    };
     int latent_time = 0;
     for (int y = 0, completed = 0; ok && y < y_axis.count; y++)
         for (int x = 0; ok && x < x_axis.count; x++, completed++) {
@@ -982,14 +1137,24 @@ int h3_video_vae_encode(const char *weight_directory,
                 pixels, frames, height, width, y_axis.starts[y], x_axis.starts[x],
                 y_axis.length, x_axis.length, error, error_size);
             int current_time = 0;
-            tiles[completed] = tile ? encode_tile_quant(
-                &encoder, tile, frames, y_axis.length, x_axis.length,
-                &current_time, error, error_size) : NULL;
+            if (tile && encoder.scheduled_tiles) {
+                ok = tile_schedule_enqueue(
+                    &schedule, tile, frames, y_axis.length, x_axis.length,
+                    &current_time, error, error_size);
+                if (ok) tiles[completed] = forwards[completed].quant;
+            } else if (tile) {
+                tiles[completed] = encode_tile_quant_sync(
+                    &encoder, tile, frames, y_axis.length, x_axis.length,
+                    &current_time, error, error_size);
+            }
             free(tile);
-            ok = tiles[completed] != NULL &&
+            ok = ok && tiles[completed] != NULL &&
                  (!latent_time || latent_time == current_time);
             if (ok) latent_time = current_time;
             if (ok && progress) progress(completed + 1, tile_count, progress_opaque);
+            if (ok && encoder.scheduled_tiles)
+                ok = tile_schedule_after_tile(
+                    &schedule, completed + 1 == tile_count, error, error_size);
         }
     int latent_h = height / SPATIAL_RATIO;
     int latent_w = width / SPATIAL_RATIO;
@@ -1004,14 +1169,15 @@ int h3_video_vae_encode(const char *weight_directory,
         fail(error, error_size, "cannot allocate visual encoder latent");
         ok = 0;
     }
-    if (ok) ok = gpu_op(&encoder, h3_gpu_begin(encoder.gpu), error,
-                        error_size, "begin visual encoder stitch");
+    if (ok && !encoder.scheduled_tiles) ok = gpu_op(&encoder, h3_gpu_begin(encoder.gpu), error,
+                                         error_size, "begin visual encoder stitch");
     if (ok) ok = stitch_gpu_tiles(
         &encoder, final, tiles, &y_axis, &x_axis, 0, (uint32_t)latent_time,
         (uint32_t)latent_time, (uint32_t)latent_h, (uint32_t)latent_w,
         error, error_size);
-    if (ok) ok = gpu_op(&encoder, h3_gpu_submit(encoder.gpu), error,
-                        error_size, "submit visual encoder stitch");
+    if (ok) ok = encoder.scheduled_tiles ? tile_schedule_submit(&schedule, error, error_size) :
+        gpu_op(&encoder, h3_gpu_submit(encoder.gpu), error,
+               error_size, "submit visual encoder stitch");
     if (ok) {
         output->values = malloc(latent_count * sizeof(*output->values));
         ok = output->values && h3_gpu_tensor_read_f32(
@@ -1029,6 +1195,10 @@ int h3_video_vae_encode(const char *weight_directory,
         output->height = latent_h;
         output->width = latent_w;
     }
+    if (!ok && encoder.scheduled_tiles) tile_schedule_abort(&schedule);
+    if (forwards) for (int index = 0; index < tile_count; index++)
+        tile_forward_free_scratch(&forwards[index]);
+    free(forwards);
     if (tiles) for (int index = 0; index < tile_count; index++)
         h3_gpu_tensor_free(tiles[index]);
     free(tiles);
@@ -1059,8 +1229,11 @@ int h3_video_vae_encode_ref2va_temporal(
     tile_axis y_axis = {0}, x_axis = {0};
     encoder_context encoder = {0};
     encoder.fp16 = configured_fp16();
+    encoder.scheduled_tiles = encoder.fp16 && configured_tile_schedule();
     h3_gpu_tensor *staged = NULL, *final = NULL;
     h3_gpu_tensor **tiles = NULL;
+    tile_forward *forwards = NULL;
+    tile_schedule schedule = {0};
     int ok = h3_ref2va_video_encode_plan_build(frames, &plan) &&
              tile_axis_build(height, &y_axis, error, error_size) &&
              tile_axis_build(width, &x_axis, error, error_size);
@@ -1089,14 +1262,23 @@ int h3_video_vae_encode_ref2va_temporal(
          load_weights(&encoder, error, error_size) &&
          (!encoder.fp16 || prepare_fp16_weights(&encoder, error, error_size));
     int tile_count = y_axis.count * x_axis.count;
+    schedule.encoder = &encoder;
     if (ok) staged = h3_gpu_tensor_new_f32(encoder.gpu, staged_elements);
     if (ok) final = h3_gpu_tensor_new_f32(encoder.gpu, final_elements);
     if (ok) tiles = calloc((size_t)tile_count, sizeof(*tiles));
-    if (ok && (!staged || !final || !tiles)) {
+    if (ok && encoder.scheduled_tiles) forwards = calloc((size_t)tile_count,
+                                               sizeof(*forwards));
+    schedule.forwards = forwards;
+    if (ok && (!staged || !final || !tiles ||
+               (encoder.scheduled_tiles && !forwards))) {
         fail(error, error_size, "out of memory allocating Ref2VA temporal latents");
         ok = 0;
     }
     for (int chunk = 0, completed = 0; ok && chunk < plan.chunks; chunk++) {
+        schedule.count = 0;
+        schedule.released = 0;
+        schedule.command_tiles = 0;
+        schedule.command_active = 0;
         for (int tile_y = 0; ok && tile_y < y_axis.count; tile_y++)
             for (int tile_x = 0; ok && tile_x < x_axis.count; tile_x++, completed++) {
                 int index = tile_y * x_axis.count + tile_x;
@@ -1105,26 +1287,40 @@ int h3_video_vae_encode_ref2va_temporal(
                     pixels, frames, height, width, chunk * 17,
                     y_axis.starts[tile_y], x_axis.starts[tile_x],
                     y_axis.length, x_axis.length, error, error_size);
-                if (tile) tiles[index] = encode_tile_quant(
-                    &encoder, tile, 17, y_axis.length, x_axis.length,
-                    &current_time, error, error_size);
+                if (tile && encoder.scheduled_tiles) {
+                    ok = tile_schedule_enqueue(
+                        &schedule, tile, 17, y_axis.length, x_axis.length,
+                        &current_time, error, error_size);
+                    if (ok) tiles[index] = forwards[index].quant;
+                } else if (tile) {
+                    tiles[index] = encode_tile_quant_sync(
+                        &encoder, tile, 17, y_axis.length, x_axis.length,
+                        &current_time, error, error_size);
+                }
                 free(tile);
-                ok = tiles[index] != NULL && current_time == 5;
+                ok = ok && tiles[index] != NULL && current_time == 5;
                 if (!ok && !error[0])
                     fail(error, error_size,
                          "Ref2VA temporal clip did not encode to five tokens");
                 if (ok && progress)
                     progress(completed + 1, plan.chunks * tile_count,
                              progress_opaque);
+                if (ok && encoder.scheduled_tiles)
+                    ok = tile_schedule_after_tile(
+                        &schedule, index + 1 == tile_count, error, error_size);
             }
-        if (ok) ok = gpu_op(&encoder, h3_gpu_begin(encoder.gpu), error,
-                            error_size, "begin Ref2VA temporal stitch");
+        if (ok && !encoder.scheduled_tiles) ok = gpu_op(&encoder, h3_gpu_begin(encoder.gpu), error,
+                                             error_size, "begin Ref2VA temporal stitch");
         if (ok) ok = stitch_gpu_tiles(
             &encoder, staged, tiles, &y_axis, &x_axis,
             (uint32_t)(chunk * 5), 5, (uint32_t)plan.encoded_tokens,
             (uint32_t)latent_h, (uint32_t)latent_w, error, error_size);
-        if (ok) ok = gpu_op(&encoder, h3_gpu_submit(encoder.gpu), error,
-                            error_size, "submit Ref2VA temporal stitch");
+        if (ok) ok = encoder.scheduled_tiles ? tile_schedule_submit(&schedule, error, error_size) :
+            gpu_op(&encoder, h3_gpu_submit(encoder.gpu), error,
+                   error_size, "submit Ref2VA temporal stitch");
+        if (!ok && encoder.scheduled_tiles) tile_schedule_abort(&schedule);
+        if (forwards) for (int index = 0; index < tile_count; index++)
+            tile_forward_free_scratch(&forwards[index]);
         for (int index = 0; index < tile_count; index++) {
             h3_gpu_tensor_free(tiles[index]);
             tiles[index] = NULL;
@@ -1157,6 +1353,11 @@ int h3_video_vae_encode_ref2va_temporal(
     }
 
 done:
+    if (encoder.scheduled_tiles && schedule.command_active)
+        tile_schedule_abort(&schedule);
+    if (forwards) for (int index = 0; index < y_axis.count * x_axis.count; index++)
+        tile_forward_free_scratch(&forwards[index]);
+    free(forwards);
     if (tiles) for (int index = 0; index < y_axis.count * x_axis.count; index++)
         h3_gpu_tensor_free(tiles[index]);
     free(tiles);

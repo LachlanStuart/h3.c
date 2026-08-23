@@ -125,6 +125,42 @@ static void test_ref2va_temporal_stitch(void) {
     free(current); free(above); free(left); free(mean); free(std); free(got);
 }
 
+/* A tile scheduler may commit a command then abandon its current batch after
+ * an allocation/encode error.  Draining that continued command before arena
+ * release is the lifetime fence that makes deferred activation ownership safe. */
+static void test_gpu_continue_drain(void) {
+    const float input_values[] = {1.0f, -2.0f, 3.0f, -4.0f};
+    char error[256];
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
+    CHECK(gpu != NULL);
+    h3_gpu_tensor *input = h3_gpu_tensor_from_f32(
+        gpu, input_values, sizeof(input_values) / sizeof(*input_values));
+    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(
+        gpu, sizeof(input_values) / sizeof(*input_values));
+    CHECK(input && output);
+    h3_gpu_stats before, after;
+    CHECK(h3_gpu_get_stats(gpu, &before));
+    CHECK(h3_gpu_begin(gpu));
+    CHECK(h3_gpu_add_scaled_f32(
+        gpu, output, input, input, 1.0f, 1.0f,
+        (uint32_t)(sizeof(input_values) / sizeof(*input_values))));
+    CHECK(h3_gpu_continue(gpu));
+    h3_gpu_abort(gpu);
+    CHECK(h3_gpu_drain(gpu));
+    CHECK(h3_gpu_get_stats(gpu, &after));
+    CHECK(after.submissions == before.submissions + 1);
+    CHECK(after.host_tensor_reads == before.host_tensor_reads);
+    CHECK(after.host_tensor_writes == before.host_tensor_writes);
+    CHECK(after.blit_copies == before.blit_copies);
+    float got[4];
+    CHECK(h3_gpu_tensor_read_f32(output, got, 4));
+    for (size_t index = 0; index < 4; index++)
+        CHECK(close_enough(got[index], 2.0 * input_values[index], 1e-6));
+    h3_gpu_tensor_free(input);
+    h3_gpu_tensor_free(output);
+    h3_gpu_free(gpu);
+}
+
 static void test_gpu_res_solver(void) {
     enum { COUNT = 257 };
     char error[256];
@@ -781,6 +817,7 @@ static void test_terminal_zoom(void) {
 
 int main(void) {
     test_ref2va_temporal_stitch();
+    test_gpu_continue_drain();
     test_temporal_and_canvas();
     test_schedule();
     test_dit_reuse_schedule();
