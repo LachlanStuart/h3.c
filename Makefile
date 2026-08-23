@@ -15,7 +15,7 @@ LIB_C += h3_video_vae.c h3_video_encoder.c h3_latent_io.c h3_audio_vae.c h3_ffmp
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
-CLI_OBJ := main.o h3_cli.o linenoise.o
+CLI_OBJ := main.o h3_cli.o h3_mutex.o linenoise.o
 
 .PHONY: all test parity real-parity clean
 
@@ -23,6 +23,9 @@ all: h3 libh3.a
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_mutex_tests: tests/test_h3_mutex.o h3_mutex.o
+	$(CC) -o $@ $^
 
 libh3.a: $(LIB_OBJ)
 	$(AR) rcs $@ $^
@@ -115,7 +118,7 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_tests h3_latent_io_tests h3_metal_tests h3_bf16_tests \
+test: h3_mutex_tests h3_tests h3_latent_io_tests h3_metal_tests h3_bf16_tests \
 	h3_convrot_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 	h3_real_audio_encoder_test \
@@ -125,6 +128,7 @@ test: h3_tests h3_latent_io_tests h3_metal_tests h3_bf16_tests \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test \
 	h3_semantic_vae_test
 
+	./h3_mutex_tests
 	./h3_tests
 	./h3_latent_io_tests
 	./h3_convrot_tests
