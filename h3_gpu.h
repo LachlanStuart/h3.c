@@ -275,6 +275,28 @@ int h3_gpu_video_vae_unpack_rgb_f16(h3_gpu *gpu, h3_gpu_tensor *rgb,
                                     const h3_gpu_tensor *projected,
                                     uint32_t latent_h, uint32_t latent_w,
                                     uint32_t output_frames);
+/* Composite a decoded tile directly into a full F32 RGB canvas. Earlier
+ * tiles occupy the overlap source positions, matching the CPU blend order. */
+int h3_gpu_video_vae_stitch_tile_f32(h3_gpu *gpu, h3_gpu_tensor *canvas,
+                                     const h3_gpu_tensor *tile,
+                                     uint32_t frames, uint32_t full_h,
+                                     uint32_t full_w, uint32_t tile_h,
+                                     uint32_t tile_w, uint32_t start_y,
+                                     uint32_t start_x, uint32_t overlap_y,
+                                     uint32_t overlap_x, uint32_t keep_h,
+                                     uint32_t keep_w, uint32_t tile_index,
+                                     uint32_t tile_columns);
+int h3_gpu_video_vae_capture_tile_f32(h3_gpu *gpu, h3_gpu_tensor *tiles,
+                                      const h3_gpu_tensor *tile,
+                                      uint32_t tile_index, uint32_t elements);
+/* Place a 22-frame spatially stitched chunk in the final timeline. The first
+ * five frames of later chunks blend with the existing tail in place. */
+int h3_gpu_video_vae_temporal_stitch_f32(h3_gpu *gpu,
+                                         h3_gpu_tensor *video,
+                                         const h3_gpu_tensor *chunk,
+                                         uint32_t chunk_index,
+                                         uint32_t chunks, uint32_t full_h,
+                                         uint32_t full_w);
 
 /* H3 AudioVAE uses time-major [batch,length,channels] activations and stores
  * Conv1d/ConvTranspose1d weights in PyTorch OIK/IOK order respectively. */

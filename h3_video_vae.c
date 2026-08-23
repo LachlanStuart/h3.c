@@ -1259,6 +1259,86 @@ static int decode_chunked(const char *weight_directory,
     int pixel_w = latent_width * SPATIAL_RATIO;
     size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
     size_t output_elements = (size_t)output_frames * frame_elements;
+    if (ok && vae.fp16) {
+        h3_gpu_tensor *chunk_canvas = h3_gpu_tensor_new_f32(
+            vae.gpu, (size_t)FIRST_CHUNK_FRAMES * frame_elements);
+        h3_gpu_tensor *final_canvas = h3_gpu_tensor_new_f32(
+            vae.gpu, output_elements);
+        size_t tile_elements = (size_t)FIRST_CHUNK_FRAMES * vae.latent_h * 16 *
+                               vae.latent_w * 16 * 3;
+        h3_gpu_tensor *tile_store = h3_gpu_tensor_new_f32(
+            vae.gpu, (size_t)tile_count * tile_elements);
+        float *final_rgb = NULL;
+        if (!chunk_canvas || !final_canvas || !tile_store) {
+            fail(error, error_size, "cannot allocate GPU video VAE stitch canvases: %s",
+                 h3_gpu_error(vae.gpu));
+            ok = 0;
+        }
+        for (int chunk = 0; chunk < chunks && ok; chunk++) {
+            for (int tile_y = 0; tile_y < y_axis.count && ok; tile_y++)
+                for (int tile_x = 0; tile_x < x_axis.count && ok; tile_x++) {
+                    float *input = extract_latent_tile(normalized_latent,
+                        latent_time, latent_height, latent_width, chunk * 5,
+                        y_axis.starts[tile_y] / SPATIAL_RATIO,
+                        x_axis.starts[tile_x] / SPATIAL_RATIO,
+                        CHUNK_LATENT_TIME, vae.latent_h, vae.latent_w,
+                        error, error_size);
+                    if (!input) { ok = 0; break; }
+                    free_tensor(&vae.latent);
+                    ok = prepare_input(&vae, input, latent_mean, latent_std,
+                                       error, error_size) &&
+                         run_resident_tile(&vae, NULL, NULL, error, error_size);
+                    free(input);
+                    if (ok) ok = h3_gpu_begin(vae.gpu) &&
+                        h3_gpu_video_vae_capture_tile_f32(vae.gpu, tile_store,
+                            vae.rgb, (uint32_t)(tile_y * x_axis.count + tile_x),
+                            (uint32_t)tile_elements) &&
+                        h3_gpu_submit(vae.gpu);
+                    if (!ok) fail(error, error_size, "cannot retain FP16 VAE tile: %s",
+                                  h3_gpu_error(vae.gpu));
+                }
+            for (int tile_y = 0; tile_y < y_axis.count && ok; tile_y++)
+                for (int tile_x = 0; tile_x < x_axis.count && ok; tile_x++) {
+                    int overlap_y = tile_y ? y_axis.overlaps[tile_y - 1] : 0;
+                    int overlap_x = tile_x ? x_axis.overlaps[tile_x - 1] : 0;
+                    int keep_h = y_axis.length - (tile_y + 1 < y_axis.count ? y_axis.overlaps[tile_y] : 0);
+                    int keep_w = x_axis.length - (tile_x + 1 < x_axis.count ? x_axis.overlaps[tile_x] : 0);
+                    ok = h3_gpu_begin(vae.gpu) && h3_gpu_video_vae_stitch_tile_f32(
+                        vae.gpu, chunk_canvas, tile_store, FIRST_CHUNK_FRAMES,
+                        (uint32_t)pixel_h, (uint32_t)pixel_w,
+                        (uint32_t)(vae.latent_h * 16), (uint32_t)(vae.latent_w * 16),
+                        (uint32_t)y_axis.starts[tile_y], (uint32_t)x_axis.starts[tile_x],
+                        (uint32_t)overlap_y, (uint32_t)overlap_x, (uint32_t)keep_h,
+                        (uint32_t)keep_w, (uint32_t)(tile_y * x_axis.count + tile_x),
+                        (uint32_t)x_axis.count) && h3_gpu_submit(vae.gpu);
+                    if (!ok) fail(error, error_size, "cannot stitch retained FP16 VAE tile: %s", h3_gpu_error(vae.gpu));
+                }
+            if (ok) ok = h3_gpu_begin(vae.gpu) && h3_gpu_video_vae_temporal_stitch_f32(
+                vae.gpu, final_canvas, chunk_canvas, (uint32_t)chunk,
+                (uint32_t)chunks, (uint32_t)pixel_h, (uint32_t)pixel_w) &&
+                h3_gpu_submit(vae.gpu);
+            if (!ok) fail(error, error_size, "cannot place FP16 VAE chunk: %s",
+                          h3_gpu_error(vae.gpu));
+        }
+        if (ok) {
+            final_rgb = malloc(output_elements * sizeof(*final_rgb));
+            if (!final_rgb || !h3_gpu_tensor_read_f32(final_canvas, final_rgb,
+                                                       output_elements)) {
+                free(final_rgb); final_rgb = NULL; ok = 0;
+                fail(error, error_size, "cannot read final GPU-stitched VAE video");
+            }
+        }
+        h3_gpu_tensor_free(chunk_canvas); h3_gpu_tensor_free(final_canvas);
+        h3_gpu_tensor_free(tile_store);
+        if (ok) {
+            output->frames = output_frames; output->height = pixel_h;
+            output->width = pixel_w; output->rgb = final_rgb; final_rgb = NULL;
+            ok = h3_gpu_get_stats(vae.gpu, &output->gpu_stats);
+        }
+        free(final_rgb);
+        cleanup(&vae); tile_axis_free(&y_axis); tile_axis_free(&x_axis);
+        return ok;
+    }
     float *final_rgb = ok ? malloc(output_elements * sizeof(*final_rgb)) : NULL;
     float *temporal_overlap = ok ? malloc(5 * frame_elements *
                                           sizeof(*temporal_overlap)) : NULL;

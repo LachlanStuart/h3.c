@@ -456,6 +456,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_video_qkv_rope_f32",
             @"h3_video_qkv_rope_f16",
             @"h3_video_vae_pack_f16", @"h3_video_vae_unpack_rgb_f16",
+            @"h3_video_vae_stitch_tile_f32", @"h3_video_vae_temporal_stitch_f32",
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_swiglu_f16", @"h3_linear_bf16", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
@@ -1155,6 +1156,12 @@ typedef struct { uint32_t patch_rows, register_rows, suffix_rows, width; }
     vae_decoder_pack_args;
 typedef struct { uint32_t latent_h, latent_w, output_frames; }
     vae_decoder_unpack_args;
+typedef struct {
+    uint32_t frames, full_h, full_w, tile_h, tile_w, start_y, start_x;
+    uint32_t overlap_y, overlap_x, keep_h, keep_w, tile_index, tile_columns;
+} vae_stitch_tile_args;
+typedef struct { uint32_t chunk_index, chunks, full_h, full_w; }
+    vae_temporal_stitch_args;
 typedef struct { uint32_t elements, approximate; } gelu_bf16_args;
 typedef struct { uint32_t tokens, vocab_size, width; } embedding_args;
 typedef struct {
@@ -2247,6 +2254,81 @@ int h3_gpu_video_vae_unpack_rgb_f16(h3_gpu *opaque, h3_gpu_tensor *rgb,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(projected).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(rgb).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_video_vae_stitch_tile_f32(h3_gpu *opaque, h3_gpu_tensor *canvas,
+                                     const h3_gpu_tensor *tile,
+                                     uint32_t frames, uint32_t full_h,
+                                     uint32_t full_w, uint32_t tile_h,
+                                     uint32_t tile_w, uint32_t start_y,
+                                     uint32_t start_x, uint32_t overlap_y,
+                                     uint32_t overlap_x, uint32_t keep_h,
+                                     uint32_t keep_w, uint32_t tile_index,
+                                     uint32_t tile_columns) {
+    H3GPU *gpu = GPU(opaque);
+    size_t canvas_count = (size_t)frames * full_h * full_w * 3;
+    size_t tile_count = (size_t)frames * tile_h * tile_w * 3;
+    if (!frames || !full_h || !full_w || !tile_h || !tile_w ||
+        start_y > full_h || start_x > full_w || keep_h > tile_h || keep_w > tile_w ||
+        start_y + keep_h > full_h || start_x + keep_w > full_w ||
+        !h3_gpu_require_elements(gpu, canvas, canvas_count, @"VAE stitch canvas") ||
+        TENSOR(canvas).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, tile, tile_count, @"VAE stitch tile") ||
+        TENSOR(tile).dtype != H3_GPU_F32) return 0;
+    vae_stitch_tile_args args = {frames, full_h, full_w, tile_h, tile_w,
+        start_y, start_x, overlap_y, overlap_x, keep_h, keep_w, tile_index,
+        tile_columns};
+    return h3_gpu_dispatch_3d(gpu, @"h3_video_vae_stitch_tile_f32",
+        MTLSizeMake(keep_w, keep_h, frames),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(canvas).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(tile).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_video_vae_capture_tile_f32(h3_gpu *opaque, h3_gpu_tensor *tiles,
+                                      const h3_gpu_tensor *tile,
+                                      uint32_t tile_index, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    size_t offset = (size_t)tile_index * elements;
+    if (!elements || offset > SIZE_MAX - elements ||
+        !h3_gpu_require_elements(gpu, tile, elements, @"VAE captured tile") ||
+        TENSOR(tile).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, tiles, offset + elements, @"VAE tile store") ||
+        TENSOR(tiles).dtype != H3_GPU_F32) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_video_vae_capture_tile_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(tile).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(tiles).buffer offset:0 atIndex:1];
+            [encoder setBytes:&tile_index length:sizeof(tile_index) atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_video_vae_temporal_stitch_f32(h3_gpu *opaque,
+                                         h3_gpu_tensor *video,
+                                         const h3_gpu_tensor *chunk,
+                                         uint32_t chunk_index,
+                                         uint32_t chunks, uint32_t full_h,
+                                         uint32_t full_w) {
+    H3GPU *gpu = GPU(opaque);
+    size_t pixels = (size_t)full_h * full_w * 3;
+    size_t video_count = ((size_t)chunks * 17 + 5) * pixels;
+    size_t chunk_count = 22 * pixels;
+    if (!chunks || chunk_index >= chunks || !full_h || !full_w ||
+        !h3_gpu_require_elements(gpu, video, video_count, @"VAE final video") ||
+        TENSOR(video).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, chunk, chunk_count, @"VAE chunk canvas") ||
+        TENSOR(chunk).dtype != H3_GPU_F32) return 0;
+    vae_temporal_stitch_args args = {chunk_index, chunks, full_h, full_w};
+    return h3_gpu_dispatch_3d(gpu, @"h3_video_vae_temporal_stitch_f32",
+        MTLSizeMake(full_w, full_h, 22),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(video).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(chunk).buffer offset:0 atIndex:1];
             [encoder setBytes:&args length:sizeof(args) atIndex:2];
         });
 }

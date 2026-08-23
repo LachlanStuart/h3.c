@@ -619,6 +619,74 @@ kernel void h3_video_vae_unpack_rgb_f16(
     }
 }
 
+struct vae_stitch_tile_args {
+    uint frames, full_h, full_w, tile_h, tile_w, start_y, start_x;
+    uint overlap_y, overlap_x, keep_h, keep_w, tile_index, tile_columns;
+};
+
+kernel void h3_video_vae_stitch_tile_f32(
+                                 device float *canvas [[buffer(0)]],
+                                 device const float *tile [[buffer(1)]],
+                                 constant vae_stitch_tile_args &args [[buffer(2)]],
+                                 uint3 gid [[thread_position_in_grid]]) {
+    uint x = gid.x, y = gid.y, frame = gid.z;
+    if (x >= args.keep_w || y >= args.keep_h || frame >= args.frames) return;
+    uint elements = args.frames * args.tile_h * args.tile_w * 3;
+    uint tile_index = args.tile_index * elements +
+        (frame * args.tile_h * args.tile_w + y * args.tile_w + x) * 3;
+    uint canvas_index = (frame * args.full_h * args.full_w +
+                         (args.start_y + y) * args.full_w + args.start_x + x) * 3;
+    for (uint c = 0; c < 3; c++) {
+        float value = tile[tile_index + c];
+        if (args.overlap_y && y < args.overlap_y) {
+            float alpha = float(y) / float(args.overlap_y);
+            uint above = (args.tile_index - args.tile_columns) * elements +
+                (frame * args.tile_h * args.tile_w +
+                 (args.tile_h - args.overlap_y + y) * args.tile_w + x) * 3 + c;
+            value = tile[above] * (1.0f - alpha) + value * alpha;
+        }
+        if (args.overlap_x && x < args.overlap_x) {
+            float alpha = float(x) / float(args.overlap_x);
+            uint left = (args.tile_index - 1) * elements +
+                (frame * args.tile_h * args.tile_w + y * args.tile_w +
+                 args.tile_w - args.overlap_x + x) * 3 + c;
+            value = tile[left] * (1.0f - alpha) + value * alpha;
+        }
+        canvas[canvas_index + c] = value;
+    }
+}
+
+kernel void h3_video_vae_capture_tile_f32(device const float *tile [[buffer(0)]],
+                                          device float *tiles [[buffer(1)]],
+                                          constant uint &tile_index [[buffer(2)]],
+                                          constant uint &elements [[buffer(3)]],
+                                          uint gid [[thread_position_in_grid]]) {
+    if (gid < elements) tiles[tile_index * elements + gid] = tile[gid];
+}
+
+struct vae_temporal_stitch_args { uint chunk_index, chunks, full_h, full_w; };
+
+kernel void h3_video_vae_temporal_stitch_f32(
+                                 device float *video [[buffer(0)]],
+                                 device const float *chunk [[buffer(1)]],
+                                 constant vae_temporal_stitch_args &args [[buffer(2)]],
+                                 uint3 gid [[thread_position_in_grid]]) {
+    uint x = gid.x, y = gid.y, frame = gid.z;
+    if (x >= args.full_w || y >= args.full_h || frame >= 22) return;
+    uint pixel = args.full_h * args.full_w;
+    uint source = (frame * pixel + y * args.full_w + x) * 3;
+    uint global = args.chunk_index * 17 + frame;
+    uint destination = (global * pixel + y * args.full_w + x) * 3;
+    for (uint c = 0; c < 3; c++) {
+        float value = chunk[source + c];
+        if (args.chunk_index && frame < 5) {
+            float alpha = float(frame) / 5.0f;
+            value = video[destination + c] * (1.0f - alpha) + value * alpha;
+        }
+        video[destination + c] = value;
+    }
+}
+
 struct adaln_args {
     uint rows;
     uint width;
