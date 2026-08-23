@@ -165,6 +165,7 @@ int main(void) {
     NEW_F32(pack_output_f32, PACK_COUNT);
     NEW_F16(unpack_projected_f16, UNPACK_PROJECTED);
     NEW_F32(unpack_rgb_f32, UNPACK_RGB);
+    NEW_F32(captured_tiles_f32, UNPACK_RGB * 2);
 
     gpu_check(gpu, h3_gpu_begin(gpu), "begin");
     gpu_check(gpu, h3_gpu_cast_f32_to_f16(
@@ -267,6 +268,11 @@ int main(void) {
     gpu_check(gpu, h3_gpu_video_vae_unpack_rgb_f16(
         gpu, unpack_rgb_f32, unpack_projected_f16, 1, 1, 22),
         "unpack FP16 decoder RGB");
+    /* This is deliberately dispatched, not merely declared: omitting its
+     * pipeline from h3_gpu_create must fail this GPU construction test. */
+    gpu_check(gpu, h3_gpu_video_vae_capture_tile_f32(
+        gpu, captured_tiles_f32, unpack_rgb_f32, 1, UNPACK_RGB),
+        "capture GPU-resident decoder tile");
     gpu_check(gpu, h3_gpu_submit(gpu), "submit");
 
     float got_norm[NORM_COUNT], want_norm[NORM_COUNT];
