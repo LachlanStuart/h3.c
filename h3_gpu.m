@@ -117,6 +117,7 @@
 @property(nonatomic, copy) NSString *profileLabel;
 @property(nonatomic) BOOL tensorOpsEnabled;
 @property(nonatomic) NSUInteger tensorOpsMode;
+@property(nonatomic) BOOL useFP32Bf16Accumulator;
 @property(nonatomic) BOOL headMajorSDPAInputs;
 @property(nonatomic) h3_gpu_stats profileStartStats;
 @property(nonatomic) h3_gpu_stats profileMarkStats;
@@ -601,6 +602,12 @@ int h3_gpu_has_int8_mlp(const h3_gpu *opaque) {
     if (!opaque) return 0;
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
     return gpu.tensorOpsEnabled;
+}
+
+void h3_gpu_set_fp32_bf16_accumulator(h3_gpu *opaque, int enabled) {
+    if (!opaque) return;
+    H3GPU *gpu = GPU(opaque);
+    gpu.useFP32Bf16Accumulator = enabled != 0;
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
@@ -1136,7 +1143,9 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
     gpu.profileMarkWall = h3_gpu_now();
 }
 
-typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
+typedef struct {
+    uint32_t rows, input_dim, output_dim, has_bias, fp32_accum;
+} linear_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct { uint32_t rows, table_rows; } curve_args;
 typedef struct {
@@ -1237,7 +1246,9 @@ int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                   TENSOR(bias).dtype != H3_GPU_F32))) return 0;
     if (!getenv("H3_SCALAR_PATCH") && rows >= 16 && output_dim == 5376 &&
         (input_dim == 32 || input_dim == 96)) {
-        linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+        linear_args args = {
+            rows, input_dim, output_dim, bias ? 1u : 0u, 0
+        };
         const h3_gpu_tensor *bias_buffer = bias ? bias : input;
         if (!h3_gpu_require_command(gpu)) return 0;
         id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
@@ -1269,7 +1280,9 @@ int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim, MPSDataTypeFloat32)) return 1;
-    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    linear_args args = {
+        rows, input_dim, output_dim, bias ? 1u : 0u, 0
+    };
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     return h3_gpu_dispatch_2d(gpu, @"h3_linear_f32", output_dim, rows,
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -1300,7 +1313,9 @@ int h3_gpu_linear_f16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim, MPSDataTypeFloat16)) return 1;
-    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    linear_args args = {
+        rows, input_dim, output_dim, bias ? 1u : 0u, 0
+    };
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     return h3_gpu_dispatch_2d(gpu, @"h3_linear_f16", output_dim, rows,
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -1347,7 +1362,9 @@ int h3_gpu_patch_linear_bf16_offset(
                                            @"patch projection bias") ||
                   TENSOR(bias).dtype != H3_GPU_F32)) ||
         !h3_gpu_require_command(gpu)) return 0;
-    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    linear_args args = {
+        rows, input_dim, output_dim, bias ? 1u : 0u, 0
+    };
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
         gpu, @"h3_linear_f32_tiled_bf16");
@@ -1420,7 +1437,9 @@ int h3_gpu_patch_linear_bf16_map(
                                            @"mapped patch bias") ||
                   TENSOR(bias).dtype != H3_GPU_F32)) ||
         !h3_gpu_require_command(gpu)) return 0;
-    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    linear_args args = {
+        rows, input_dim, output_dim, bias ? 1u : 0u, 0
+    };
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
         gpu, @"h3_linear_f32_tiled_bf16_map");
@@ -1563,7 +1582,7 @@ int h3_gpu_linear_rank8_f16_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_elements(gpu, output, (size_t)rows * output_dim,
                                  @"rank-8 BF16 output") ||
         TENSOR(output).dtype != H3_GPU_BF16) return 0;
-    linear_args args = {rows, 8, output_dim, 1};
+    linear_args args = {rows, 8, output_dim, 1, 0};
     return h3_gpu_dispatch_2d(gpu, @"h3_linear_rank8_f16_bf16",
         output_dim, rows, ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
@@ -3484,7 +3503,10 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         for (uint32_t rowOffset = 0; rowOffset < rows;
              rowOffset += splitAt) @autoreleasepool {
             uint32_t chunkRows = MIN(splitAt, rows - rowOffset);
-            linear_args args = {chunkRows, input_dim, output_dim, 0};
+            linear_args args = {
+                chunkRows, input_dim, output_dim, 0,
+                gpu.useFP32Bf16Accumulator ? 1u : 0u
+            };
             uint32_t row_tiles = (chunkRows + 127) / 128;
             id<MTLComputeCommandEncoder> encoder =
                 [gpu.command computeCommandEncoder];
@@ -3518,7 +3540,10 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim,
                           MPSDataTypeBFloat16)) return 1;
-    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    linear_args args = {
+        rows, input_dim, output_dim, bias ? 1u : 0u,
+        gpu.useFP32Bf16Accumulator ? 1u : 0u
+    };
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     if (!h3_gpu_require_command(gpu)) return 0;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
@@ -3679,7 +3704,10 @@ static int h3_gpu_fc1_swiglu_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"device cannot dispatch fused M5 FC1/SwiGLU");
         return 0;
     }
-    linear_args args = {rows, input_dim, hidden_dim, 0};
+    linear_args args = {
+        rows, input_dim, hidden_dim, 0,
+        gpu.useFP32Bf16Accumulator ? 1u : 0u
+    };
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -3746,7 +3774,10 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"device cannot dispatch M5 BF16 TensorOps FC2");
         return 0;
     }
-    linear_args args = {rows, hidden_dim, output_dim, 0};
+    linear_args args = {
+        rows, hidden_dim, output_dim, 0,
+        gpu.useFP32Bf16Accumulator ? 1u : 0u
+    };
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -4018,7 +4049,7 @@ static int h3_gpu_linear_int8_quantized_bf16(
         h3_gpu_set_error(gpu, @"int8 M5 linear projection is unavailable");
         return 0;
     }
-    linear_args args = {rows, input_dim, output_dim, 0};
+    linear_args args = {rows, input_dim, output_dim, 0, 0};
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -4104,7 +4135,7 @@ static int h3_gpu_linear_int8_bf16_layout(
         h3_gpu_set_error(gpu, @"int8 M5 linear projection is unavailable");
         return 0;
     }
-    linear_args args = {rows, input_dim, output_dim, 0};
+    linear_args args = {rows, input_dim, output_dim, 0, 0};
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -4289,7 +4320,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             padded_rows, input_dim, activation_clip,
             @"int8 MLP input")) return 0;
     if (int8_fc1) @autoreleasepool {
-        linear_args fc1_args = {rows, input_dim, hidden_dim, 0};
+        linear_args fc1_args = {rows, input_dim, hidden_dim, 0, 0};
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
         [encoder setComputePipelineState:int8_fc1_local ? fc1_local :
@@ -4329,7 +4360,7 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             padded_rows, hidden_dim, activation_clip,
             @"int8 MLP FC2 input")) return 0;
     if (int8_fc2) @autoreleasepool {
-        linear_args fc2_args = {rows, hidden_dim, output_dim, 0};
+        linear_args fc2_args = {rows, hidden_dim, output_dim, 0, 0};
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
         [encoder setComputePipelineState:grouped_fc2_local128 ?
@@ -4953,9 +4984,11 @@ int h3_gpu_grouped_qkv_linear_rope_bf16(
     typedef struct {
         uint32_t rows, input_dim, heads, head_dim, rope_half, head_major;
         float epsilon;
+        uint32_t fp32_accum;
     } qkv_project_rope_args;
     qkv_project_rope_args args = {
-        rows, input_dim, heads, head_dim, rope_half, headMajor, epsilon
+        rows, input_dim, heads, head_dim, rope_half, headMajor, epsilon,
+        gpu.useFP32Bf16Accumulator ? 1u : 0u
     };
     id<MTLComputePipelineState> projection = h3_gpu_pipeline(
         gpu, @"h3_qkv_project_split_bf16_nax_r128_morton4");
@@ -5086,6 +5119,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     typedef struct {
         uint32_t rows, input_dim, heads, head_dim, rope_half, head_major;
         float epsilon;
+        uint32_t fp32_accum;
     } qkv_project_rope_args;
     /* The historical layout field now carries fused-epilogue mode bits:
      * bit 1 selects ordered BF16x4 RMS loads, bit 2 packs norm/RoPE by four. */
@@ -5096,7 +5130,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
     if (fused_rope && getenv("H3_DISABLE_VECTOR_QKV_ROPE") == NULL)
         rms_mode |= 4u;
     qkv_project_rope_args args = {
-        rows, input_dim, heads, head_dim, rope_half, rms_mode, epsilon
+        rows, input_dim, heads, head_dim, rope_half, rms_mode, epsilon, 0
     };
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =

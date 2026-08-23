@@ -1636,6 +1636,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
                         int use_slower_bf16_attention_output,
+                        int use_fp32_bf16_accumulator,
                         int use_slower_row_major_attention_output,
                         int use_slower_unfused_int8_inputs,
                         int use_slower_unfused_qkv_rope,
@@ -1705,6 +1706,8 @@ static h3_dit *load_dit(const char *weight_directory,
     }
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    h3_gpu_set_fp32_bf16_accumulator(
+        dit->gpu, use_fp32_bf16_accumulator);
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     if (dit->convrot && !h3_gpu_has_int8_mlp(dit->gpu)) {
         fail(error, error_size,
@@ -1792,6 +1795,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
+                         int use_fp32_bf16_accumulator,
                          int use_slower_row_major_attention_output,
                          int use_slower_unfused_int8_inputs,
                          int use_slower_unfused_qkv_rope,
@@ -1808,6 +1812,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
+                    use_fp32_bf16_accumulator,
                     use_slower_row_major_attention_output,
                     use_slower_unfused_int8_inputs,
                     use_slower_unfused_qkv_rope,
@@ -1834,6 +1839,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
                          int use_slower_bf16_attention_output,
+                         int use_fp32_bf16_accumulator,
                          int use_slower_row_major_attention_output,
                          int use_slower_unfused_int8_inputs,
                          int use_slower_unfused_qkv_rope,
@@ -1854,6 +1860,7 @@ h3_dit *h3_dit_load_conditioned(
                     spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
+                    use_fp32_bf16_accumulator,
                     use_slower_row_major_attention_output,
                     use_slower_unfused_int8_inputs,
                     use_slower_unfused_qkv_rope,

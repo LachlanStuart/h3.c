@@ -1620,6 +1620,8 @@ int main(int argc, char **argv) {
         getenv("H3_BENCH_USE_SLOWER_GROUPED_QUANTIZER") != NULL;
     int ssd_streaming = getenv("H3_BENCH_SSD_STREAMING") != NULL;
     int all_bf16 = getenv("H3_BENCH_ALL_BF16") != NULL;
+    int use_fp32_bf16_accumulator =
+        getenv("H3_BENCH_FP32_BF16_ACCUMULATOR") != NULL;
     h3_dit *dit;
     if (ref_layout) {
         size_t video_condition_elements =
@@ -1637,7 +1639,8 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_conditioned(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
-            all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
+            all_bf16, all_bf16, all_bf16, use_fp32_bf16_accumulator,
+            0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
             video_condition,
             video_condition_elements, audio_condition,
@@ -1648,7 +1651,8 @@ int main(int argc, char **argv) {
         dit = h3_dit_load_t2va(
             weights, "h3_shaders.metal", &text, &layout, &sigmas,
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
-            all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
+            all_bf16, all_bf16, all_bf16, use_fp32_bf16_accumulator,
+            0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
             NULL, NULL, error,
             sizeof(error));

@@ -76,6 +76,7 @@ struct linear_args {
     uint input_dim;
     uint output_dim;
     uint has_bias;
+    uint fp32_accum;
 };
 
 struct int8_quant_args {
@@ -1523,7 +1524,8 @@ kernel void h3_linear_bf16_nax_r128(
                            device bfloat *weight [[buffer(1)]],
                            device bfloat *output [[buffer(3)]],
                            constant linear_args &args [[buffer(4)]],
-                           uint2 group [[threadgroup_position_in_grid]]) {
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
     auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
         input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
     auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
@@ -1538,7 +1540,21 @@ kernel void h3_linear_bf16_nax_r128(
     matmul2d<matmul2d_descriptor(128, 64, dynamic_extent,
                                 false, true, false),
               execution_simdgroups<4>> mm;
-    mm.run(mx, mw, my);
+    if (!args.fp32_accum) {
+        mm.run(mx, mw, my);
+        return;
+    }
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(mx), decltype(mw), float>();
+    mm.run(mx, mw, accum);
+    for (ushort element = tid; element < accum.get_capacity(); element += 128) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = group.x * 128u + (uint)index[1];
+        uint column = group.y * 64u + (uint)index[0];
+        if (row < args.rows && column < args.output_dim)
+            output[row * args.output_dim + column] = (bfloat)accum[element];
+    }
 }
 
 kernel void h3_linear_bf16_nax_r128_morton(
@@ -1546,7 +1562,8 @@ kernel void h3_linear_bf16_nax_r128_morton(
                            device bfloat *weight [[buffer(1)]],
                            device bfloat *output [[buffer(3)]],
                            constant linear_args &args [[buffer(4)]],
-                           uint code [[threadgroup_position_in_grid]]) {
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
     uint row_tiles = (args.rows + 127) / 128;
     uint column_tiles = (args.output_dim + 63) / 64;
     uint row_bits = row_tiles <= 1 ? 0 : 32 - clz(row_tiles - 1);
@@ -1568,7 +1585,21 @@ kernel void h3_linear_bf16_nax_r128_morton(
     matmul2d<matmul2d_descriptor(128, 64, dynamic_extent,
                                 false, true, false),
               execution_simdgroups<4>> mm;
-    mm.run(mx, mw, my);
+    if (!args.fp32_accum) {
+        mm.run(mx, mw, my);
+        return;
+    }
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(mx), decltype(mw), float>();
+    mm.run(mx, mw, accum);
+    for (ushort element = tid; element < accum.get_capacity(); element += 128) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = group.x * 128u + (uint)index[1];
+        uint column = group.y * 64u + (uint)index[0];
+        if (row < args.rows && column < args.output_dim)
+            output[row * args.output_dim + column] = (bfloat)accum[element];
+    }
 }
 
 kernel void h3_linear_bf16_nax_r128_morton4(
@@ -1576,7 +1607,8 @@ kernel void h3_linear_bf16_nax_r128_morton4(
                            device bfloat *weight [[buffer(1)]],
                            device bfloat *output [[buffer(3)]],
                            constant linear_args &args [[buffer(4)]],
-                           uint code [[threadgroup_position_in_grid]]) {
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
     uint row_tiles = (args.rows + 127) / 128;
     uint2 group = h3_morton_decode_compact4(code, row_tiles);
     auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
@@ -1593,7 +1625,21 @@ kernel void h3_linear_bf16_nax_r128_morton4(
     matmul2d<matmul2d_descriptor(128, 64, dynamic_extent,
                                 false, true, false),
               execution_simdgroups<4>> mm;
-    mm.run(mx, mw, my);
+    if (!args.fp32_accum) {
+        mm.run(mx, mw, my);
+        return;
+    }
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(mx), decltype(mw), float>();
+    mm.run(mx, mw, accum);
+    for (ushort element = tid; element < accum.get_capacity(); element += 128) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = group.x * 128u + (uint)index[1];
+        uint column = group.y * 64u + (uint)index[0];
+        if (row < args.rows && column < args.output_dim)
+            output[row * args.output_dim + column] = (bfloat)accum[element];
+    }
 }
 
 struct h3_qkv_project_rope_args {
@@ -1604,6 +1650,7 @@ struct h3_qkv_project_rope_args {
     uint rope_half;
     uint head_major;
     float epsilon;
+    uint fp32_accum;
 };
 
 /* Preserve the successful direct 128x64 TensorOps matmul, but route each
@@ -1617,7 +1664,8 @@ kernel void h3_qkv_project_split_bf16_nax_r128_morton4(
                            device bfloat *value [[buffer(4)]],
                            constant h3_qkv_project_rope_args &args
                                [[buffer(5)]],
-                           uint code [[threadgroup_position_in_grid]]) {
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int ROW_TILE = 128;
     constexpr int COLUMN_TILE = 64;
     constexpr int HEAD_DIM = 128;
@@ -1648,7 +1696,21 @@ kernel void h3_qkv_project_split_bf16_nax_r128_morton4(
     matmul2d<matmul2d_descriptor(ROW_TILE, COLUMN_TILE, dynamic_extent,
                                 false, true, false),
               execution_simdgroups<4>> mm;
-    mm.run(mx, mw, my);
+    if (!args.fp32_accum) {
+        mm.run(mx, mw, my);
+        return;
+    }
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(mx), decltype(mw), float>();
+    mm.run(mx, mw, accum);
+    for (ushort element = tid; element < accum.get_capacity(); element += 128) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = group.x * ROW_TILE + (uint)index[1];
+        uint column = (uint)output_column + (uint)index[0];
+        if (row < args.rows && column < (uint)output_width)
+            destination[row * output_width + column] = (bfloat)accum[element];
+    }
 }
 
 /* Q and K already have the requested attention layout. Cache both 128-wide
@@ -1762,17 +1824,45 @@ kernel void h3_fc1_swiglu_bf16_nax_r128(
                                 false, true, false),
               execution_simdgroups<4>> mm;
     {
-        auto accum = mm.template get_destination_cooperative_tensor<
-            decltype(x), decltype(w), bfloat>();
-        mm.run(mx, mw_gate, accum);
-        accum.store(tg_gate);
+        if (args.fp32_accum) {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), float>();
+            mm.run(mx, mw_gate, accum);
+            for (ushort element = tid; element < accum.get_capacity();
+                 element += 128) {
+                if (!accum.is_valid_element(element)) continue;
+                auto index = accum.get_multidimensional_index(element);
+                uint offset = (uint)index[1] * COLUMN_TILE +
+                              (uint)index[0];
+                gate_tile[offset] = (bfloat)accum[element];
+            }
+        } else {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), bfloat>();
+            mm.run(mx, mw_gate, accum);
+            accum.store(tg_gate);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-        auto accum = mm.template get_destination_cooperative_tensor<
-            decltype(x), decltype(w), bfloat>();
-        mm.run(mx, mw_up, accum);
-        accum.store(tg_up);
+        if (args.fp32_accum) {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), float>();
+            mm.run(mx, mw_up, accum);
+            for (ushort element = tid; element < accum.get_capacity();
+                 element += 128) {
+                if (!accum.is_valid_element(element)) continue;
+                auto index = accum.get_multidimensional_index(element);
+                uint offset = (uint)index[1] * COLUMN_TILE +
+                              (uint)index[0];
+                up_tile[offset] = (bfloat)accum[element];
+            }
+        } else {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), bfloat>();
+            mm.run(mx, mw_up, accum);
+            accum.store(tg_up);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint row_base = group.x * ROW_TILE;
@@ -1826,17 +1916,45 @@ kernel void h3_fc1_swiglu_bf16_nax_r128_morton(
                                 false, true, false),
               execution_simdgroups<4>> mm;
     {
-        auto accum = mm.template get_destination_cooperative_tensor<
-            decltype(x), decltype(w), bfloat>();
-        mm.run(mx, mw_gate, accum);
-        accum.store(tg_gate);
+        if (args.fp32_accum) {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), float>();
+            mm.run(mx, mw_gate, accum);
+            for (ushort element = tid; element < accum.get_capacity();
+                 element += 128) {
+                if (!accum.is_valid_element(element)) continue;
+                auto index = accum.get_multidimensional_index(element);
+                uint offset = (uint)index[1] * COLUMN_TILE +
+                              (uint)index[0];
+                gate_tile[offset] = (bfloat)accum[element];
+            }
+        } else {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), bfloat>();
+            mm.run(mx, mw_gate, accum);
+            accum.store(tg_gate);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-        auto accum = mm.template get_destination_cooperative_tensor<
-            decltype(x), decltype(w), bfloat>();
-        mm.run(mx, mw_up, accum);
-        accum.store(tg_up);
+        if (args.fp32_accum) {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), float>();
+            mm.run(mx, mw_up, accum);
+            for (ushort element = tid; element < accum.get_capacity();
+                 element += 128) {
+                if (!accum.is_valid_element(element)) continue;
+                auto index = accum.get_multidimensional_index(element);
+                uint offset = (uint)index[1] * COLUMN_TILE +
+                              (uint)index[0];
+                up_tile[offset] = (bfloat)accum[element];
+            }
+        } else {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), bfloat>();
+            mm.run(mx, mw_up, accum);
+            accum.store(tg_up);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint row_base = group.x * ROW_TILE;
@@ -1885,17 +2003,45 @@ kernel void h3_fc1_swiglu_bf16_nax_r128_morton4(
                                 false, true, false),
               execution_simdgroups<4>> mm;
     {
-        auto accum = mm.template get_destination_cooperative_tensor<
-            decltype(x), decltype(w), bfloat>();
-        mm.run(mx, mw_gate, accum);
-        accum.store(tg_gate);
+        if (args.fp32_accum) {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), float>();
+            mm.run(mx, mw_gate, accum);
+            for (ushort element = tid; element < accum.get_capacity();
+                 element += 128) {
+                if (!accum.is_valid_element(element)) continue;
+                auto index = accum.get_multidimensional_index(element);
+                uint offset = (uint)index[1] * COLUMN_TILE +
+                              (uint)index[0];
+                gate_tile[offset] = (bfloat)accum[element];
+            }
+        } else {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), bfloat>();
+            mm.run(mx, mw_gate, accum);
+            accum.store(tg_gate);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-        auto accum = mm.template get_destination_cooperative_tensor<
-            decltype(x), decltype(w), bfloat>();
-        mm.run(mx, mw_up, accum);
-        accum.store(tg_up);
+        if (args.fp32_accum) {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), float>();
+            mm.run(mx, mw_up, accum);
+            for (ushort element = tid; element < accum.get_capacity();
+                 element += 128) {
+                if (!accum.is_valid_element(element)) continue;
+                auto index = accum.get_multidimensional_index(element);
+                uint offset = (uint)index[1] * COLUMN_TILE +
+                              (uint)index[0];
+                up_tile[offset] = (bfloat)accum[element];
+            }
+        } else {
+            auto accum = mm.template get_destination_cooperative_tensor<
+                decltype(x), decltype(w), bfloat>();
+            mm.run(mx, mw_up, accum);
+            accum.store(tg_up);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint row_base = group.x * ROW_TILE;

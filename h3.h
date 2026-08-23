@@ -168,6 +168,9 @@ typedef struct {
     int use_slower_bf16_qkv;
     /* Force the portable BF16 attention-output projection. */
     int use_slower_bf16_attention_output;
+    /* Use FP32 cooperative accumulators in M5 BF16 TensorOps, then round the
+     * projection result back to BF16 at the normal output boundary. */
+    int use_fp32_bf16_accumulator;
     /* Materialize row-major BF16 after SDPA before int8 quantization. */
     int use_slower_row_major_attention_output;
     /* Keep int8 projection-input quantization as standalone kernels. */

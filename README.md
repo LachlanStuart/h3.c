@@ -855,6 +855,16 @@ at 512 and 864. A decoded fox render remained clean and closely matched the
 int8-QKV-only composition; its thermally hot denoise measured 19.18 seconds.
 Use `--use-slower-bf16-attention-output` to retain that projection in BF16.
 
+For an M5 BF16 TensorOps precision diagnostic, use
+`--use-fp32-bf16-accumulator`. This changes the cooperative matmul destination
+to FP32 for BF16 TensorOps projections, including split QKV and the BF16 fused
+MLP when that NAX MLP path is selected, then rounds the result back to BF16 at
+the existing output boundary. It does not force a BF16 projection: at the
+default long-sequence Ref2VA setting, use the `--use-slower-bf16-*` switches to
+leave the corresponding projection out of the native int8 path. The flag does
+not change native int8 TensorOps, MPSGraph BF16/SDPA fallbacks, or the rest of
+the pipeline's BF16 storage boundaries.
+
 On that int8 path, SDPA now leaves its result in native
 `[head,row,dimension]` order. A specialized 256-thread kernel gathers and
 quantizes each H3 row directly into the projection's row-major int8 buffer,

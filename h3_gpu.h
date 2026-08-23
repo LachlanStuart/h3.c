@@ -41,6 +41,9 @@ typedef struct {
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
+/* Select the diagnostic M5 BF16 TensorOps path that accumulates into FP32
+ * cooperative fragments before storing BF16 outputs. */
+void h3_gpu_set_fp32_bf16_accumulator(h3_gpu *gpu, int enabled);
 void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
