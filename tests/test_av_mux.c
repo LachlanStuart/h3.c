@@ -81,6 +81,19 @@ int main(int argc, char **argv) {
     if (wav_samples != SAMPLES)
         die("standalone WAV output returned an unexpected sample count");
     free(wav_pcm);
+    wav_pcm = NULL;
+    if (!h3_ffmpeg_read_audio_f32(
+            wav_path, H3_REFERENCE_AUDIO_MAX_SAMPLES, 0, &wav_pcm,
+            &wav_samples, error, sizeof(error)))
+        die("45-second reference-audio bound rejected a valid short clip");
+    if (wav_samples != SAMPLES)
+        die("extended reference-audio bound changed the decoded sample count");
+    free(wav_pcm);
+    wav_pcm = NULL;
+    if (h3_ffmpeg_read_audio_f32(
+            wav_path, H3_REFERENCE_AUDIO_MAX_SAMPLES + 1, 0, &wav_pcm,
+            &wav_samples, error, sizeof(error)))
+        die("reference audio accepted a request above the 45-second bound");
     if (h3_ffmpeg_write_av_rgb24_f32(
             "/tmp/h3-lossless-wrong-container.mp4", rgb, FRAMES,
             WIDTH, HEIGHT, 24, pcm, SAMPLES, 2, 32000,
