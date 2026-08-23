@@ -320,7 +320,8 @@ static void test_temporal_and_canvas(void) {
     const struct { int requested, frames, video_t, audio_t; } cases[] = {
         {5, 5, 2, 8}, {6, 22, 7, 37}, {22, 22, 7, 37},
         {23, 39, 12, 65}, {56, 56, 17, 93}, {124, 124, 37, 207},
-        {361, 362, 107, 603}, {362, 362, 107, 603}
+        {361, 362, 107, 603}, {362, 362, 107, 603},
+        {1080, 1093, 322, 1822}
     };
     for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
         h3_temporal_shape got = h3_temporal(cases[index].requested);

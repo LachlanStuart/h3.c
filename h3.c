@@ -519,8 +519,8 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             return 0;
         }
     }
-    if (params->frames < 5 || h3_align_frame_count(params->frames) > 362) {
-        h3_set_error(ctx, "frames must align within the released 5..362 range");
+    if (params->frames < 5) {
+        h3_set_error(ctx, "frames must align to H3's 5+17*n temporal grid");
         return 0;
     }
     if (params->steps < 2 || params->steps > H3_MAX_STEPS) {

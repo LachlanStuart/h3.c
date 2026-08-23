@@ -309,10 +309,14 @@ legal H3 temporal shape, so `--seconds 10` produces 243 frames (10.125 seconds).
 | 107 | 4.458 seconds |
 | 243 | 10.125 seconds |
 | 362 | 15.083 seconds |
+| 1093 | 45.542 seconds |
 
 Short clips are useful for development. The released workflow is intended for
-roughly 4–15 second videos. A request such as `--frames 23` is rounded up to 39
-frames rather than producing an arbitrary temporal shape.
+roughly 4–15 second videos, while the local runner also permits longer
+experimental frame counts when memory and runtime allow. A request such as
+`--frames 23` is rounded up to 39 frames rather than producing an arbitrary
+temporal shape. For example, `--seconds 45` requests 1080 frames and produces
+the next legal shape, 1093 frames (45.542 seconds).
 
 ### 6. Improve the prompt
 
