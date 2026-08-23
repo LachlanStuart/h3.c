@@ -625,6 +625,45 @@ static void compare_bf16_stage(const char *directory, const char *name,
     free(path); free(actual); free(expected);
 }
 
+static void compare_f32_stage(const char *directory, const char *name,
+                              const h3_gpu_tensor *tensor, size_t elements) {
+    if (!directory || !*directory) return;
+    size_t path_size = strlen(directory) + strlen(name) + 6;
+    char *path = malloc(path_size);
+    float *actual = malloc(elements * sizeof(*actual));
+    float *expected = malloc(elements * sizeof(*expected));
+    require(path && actual && expected, "cannot allocate F32 stage comparison");
+    snprintf(path, path_size, "%s/%s.f32", directory, name);
+    FILE *stream = fopen(path, "rb");
+    require(stream && fread(expected, sizeof(*expected), elements, stream) == elements &&
+            h3_gpu_tensor_read_f32(tensor, actual, elements),
+            "cannot read F32 block stage oracle");
+    fclose(stream);
+    double absolute_sum = 0.0, reference_sum = 0.0;
+    float maximum_error = 0.0f;
+    size_t exact = 0;
+    for (size_t index = 0; index < elements; index++) {
+        float error = fabsf(actual[index] - expected[index]);
+        maximum_error = fmaxf(maximum_error, error);
+        absolute_sum += error;
+        reference_sum += fabs((double)expected[index]);
+        exact += actual[index] == expected[index];
+    }
+    printf("block stage %-14s exact=%zu/%zu max_abs=%.7g mean_abs=%.7g relative_l1=%.7g\n",
+           name, exact, elements, maximum_error, absolute_sum / (double)elements,
+           absolute_sum / reference_sum);
+    if (getenv("H3_CONVROT_BLOCK_DIAG")) {
+        size_t shown = 0;
+        for (size_t index = 0; index < elements && shown < 8; index++) {
+            if (actual[index] == expected[index]) continue;
+            printf("block stage %s first_diff[%zu]=%.7g expected=%.7g\n",
+                   name, index, actual[index], expected[index]);
+            shown++;
+        }
+    }
+    free(path); free(actual); free(expected);
+}
+
 static h3_gpu_tensor *load_bf16_stage_oracle(h3_gpu *gpu,
                                               const char *directory,
                                               const char *name,
@@ -775,6 +814,9 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
         h3_gpu_tensor_new_f32(gpu, head_elements) : NULL;
     h3_gpu_tensor *heads_f32 = use_f32_sdpa ?
         h3_gpu_tensor_new_f32(gpu, head_elements) : NULL;
+    int use_reference_lse = getenv("H3_CONVROT_REFERENCE_LSE") != NULL;
+    h3_gpu_tensor *attention_lse = use_reference_lse ?
+        h3_gpu_tensor_new_f32(gpu, B_ROWS * HEADS) : NULL;
     h3_gpu_tensor *attention_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
     h3_gpu_tensor *after_attention = h3_gpu_tensor_new_bf16(gpu, hidden_count);
     h3_gpu_tensor *mod_mlp = h3_gpu_tensor_new_bf16(gpu, hidden_count);
@@ -798,7 +840,8 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
             after_attention && mod_mlp && fc1 && activated && mlp_output &&
             output && rotated && quantized && activation_scales &&
             (!use_dequantized_out || out_bf16) &&
-            (!use_f32_sdpa || (query_f32 && key_f32 && value_f32 && heads_f32)),
+            (!use_f32_sdpa || (query_f32 && key_f32 && value_f32 && heads_f32)) &&
+            (!use_reference_lse || attention_lse),
             "cannot allocate deterministic block tensors");
 
     require(h3_gpu_begin(gpu) && h3_gpu_adaln_table_interpolate_f32(
@@ -816,7 +859,14 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
             h3_gpu_qkv_rope_bf16(
                 gpu, query, key, value, qkv, q_norm, k_norm, rope_cos,
                 rope_sin, B_ROWS, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f) &&
-            (use_f32_sdpa ?
+            (use_reference_lse ?
+                h3_gpu_sdpa_reference_bf16_lse(
+                    gpu, attention_heads, attention_lse,
+                    oracle_query ? oracle_query : query,
+                    oracle_key ? oracle_key : key,
+                    oracle_value ? oracle_value : value, B_ROWS, HEADS,
+                    HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)) :
+             use_f32_sdpa ?
                 (h3_gpu_cast_bf16_to_f32(
                     gpu, query_f32, oracle_query ? oracle_query : query,
                     head_elements) &&
@@ -886,6 +936,9 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
                            (size_t)B_ROWS * INNER);
         compare_bf16_stage(stage_directory, "value", value,
                            (size_t)B_ROWS * INNER);
+        if (use_reference_lse)
+            compare_f32_stage(stage_directory, "attention_lse_flash",
+                              attention_lse, B_ROWS * HEADS);
         compare_bf16_stage(stage_directory, "attention_heads", attention_heads,
                            (size_t)B_ROWS * INNER);
         compare_bf16_stage(stage_directory, "attention_output", attention_output,
@@ -947,6 +1000,7 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
     FREE_BLOCK_TENSOR(oracle_value);
     FREE_BLOCK_TENSOR(query_f32); FREE_BLOCK_TENSOR(key_f32);
     FREE_BLOCK_TENSOR(value_f32); FREE_BLOCK_TENSOR(heads_f32);
+    FREE_BLOCK_TENSOR(attention_lse);
     FREE_BLOCK_TENSOR(attention_output); FREE_BLOCK_TENSOR(after_attention);
     FREE_BLOCK_TENSOR(mod_mlp); FREE_BLOCK_TENSOR(fc1);
     FREE_BLOCK_TENSOR(activated); FREE_BLOCK_TENSOR(mlp_output);

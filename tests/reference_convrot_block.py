@@ -105,6 +105,12 @@ def main():
             value.to(torch.bfloat16).cpu().contiguous().view(torch.uint16)
             .numpy().tobytes())
 
+    def dump_f32(name, value):
+        if not args.dump_intermediates:
+            return
+        (output_dir / f"{name}.f32").write_bytes(
+            value.float().cpu().contiguous().numpy().tobytes())
+
     report = {"input": stats(x), "modulation": stats(modulation)}
 
     h = adaln(x, norm1, modulation[0, 0], modulation[0, 1])
@@ -120,16 +126,22 @@ def main():
     dump_bf16("query", q)
     dump_bf16("key", k)
     dump_bf16("value", v)
-    attention = F.scaled_dot_product_attention(
-        q.transpose(0, 1).unsqueeze(0),
-        k.transpose(0, 1).unsqueeze(0),
-        v.transpose(0, 1).unsqueeze(0),
+    q_sdpa = q.transpose(0, 1).unsqueeze(0)
+    k_sdpa = k.transpose(0, 1).unsqueeze(0)
+    v_sdpa = v.transpose(0, 1).unsqueeze(0)
+    # The direct operator additionally returns FlashAttention's F32 LSE,
+    # allowing native diagnostics to distinguish score/softmax drift from PV.
+    flash = torch.ops.aten._scaled_dot_product_flash_attention(
+        q_sdpa, k_sdpa, v_sdpa, 0.0, False, False,
         scale=HEAD_DIM ** -0.5)
+    attention = flash[0]
+    dump_f32("attention_lse_flash", flash[1])
     attention = attention.squeeze(0).transpose(0, 1).reshape(ROWS, INNER)
     dump_bf16("attention_heads", attention)
     qh, kh, vh = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
     scores_f32 = torch.matmul(qh.float(), kh.float().transpose(-1, -2))
     scores_f32 *= HEAD_DIM ** -0.5
+    dump_f32("attention_lse_manual_f32", torch.logsumexp(scores_f32, dim=-1))
     manual_f32 = torch.matmul(torch.softmax(scores_f32, dim=-1), vh.float())
     dump_bf16("attention_heads_manual_f32", manual_f32.transpose(0, 1)
               .reshape(ROWS, INNER))
@@ -219,6 +231,77 @@ def main():
         for pairwise in (False, True):
             manual = chunked_values(chunk_size, pairwise)
             name = f"attention_heads_pv{chunk_size}_{'pair' if pairwise else 'seq'}"
+            dump_bf16(name, manual.transpose(0, 1).reshape(ROWS, INNER))
+
+    # FA2 uses a low-precision probability tile for the PV Tensor Core MMA.
+    # Isolate that conversion from the score/LSE path and vary only its
+    # reduction order.  Keeping the matmul operands F32 after conversion gives
+    # the same BF16/FP16 products while retaining an F32 output accumulator.
+    def chunked_low_precision_values(probabilities, chunk_size, pairwise):
+        partials = [torch.matmul(probabilities[..., start:start + chunk_size]
+                                 .float(),
+                                 vh.float()[..., start:start + chunk_size, :])
+                    for start in range(0, ROWS, chunk_size)]
+        if pairwise:
+            while len(partials) > 1:
+                partials = [partials[index] + partials[index + 1]
+                            for index in range(0, len(partials), 2)]
+            return partials[0]
+        total = partials[0]
+        for partial in partials[1:]:
+            total += partial
+        return total
+
+    for precision, probabilities in (
+            ("bf16", probabilities_f32.to(torch.bfloat16)),
+            ("f16", probabilities_f32.to(torch.float16))):
+        for chunk_size in (16, 32, 64):
+            for pairwise in (False, True):
+                manual = chunked_low_precision_values(
+                    probabilities, chunk_size, pairwise)
+                name = (f"attention_heads_pv{precision}{chunk_size}_"
+                        f"{'pair' if pairwise else 'seq'}")
+                dump_bf16(name, manual.transpose(0, 1).reshape(ROWS, INNER))
+
+    # Avoid cuBLAS entirely for this small fixture.  Each addcmul is an F32
+    # FMA over one K element; we can then independently choose the 16-wide
+    # product tree and the eight partial-tile tree used by Tensor Core PV.
+    values_f32 = vh.float()
+
+    def pair_reduce(values):
+        while len(values) > 1:
+            values = [values[index] + values[index + 1]
+                      for index in range(0, len(values), 2)]
+        return values[0]
+
+    def scalar_pv(term_pairwise, tile_pairwise):
+        tile_results = []
+        for start in range(0, ROWS, 16):
+            terms = [torch.addcmul(
+                torch.zeros_like(values_f32[:, :1, :]).expand(-1, ROWS, -1),
+                probabilities_f32[..., start + key].unsqueeze(-1),
+                values_f32[:, start + key, :].unsqueeze(1))
+                for key in range(16)]
+            if term_pairwise:
+                tile_results.append(pair_reduce(terms))
+            else:
+                total = terms[0]
+                for term in terms[1:]:
+                    total += term
+                tile_results.append(total)
+        if tile_pairwise:
+            return pair_reduce(tile_results)
+        total = tile_results[0]
+        for tile in tile_results[1:]:
+            total += tile
+        return total
+
+    for term_pairwise in (False, True):
+        for tile_pairwise in (False, True):
+            manual = scalar_pv(term_pairwise, tile_pairwise)
+            name = ("attention_heads_pvfma16_" +
+                    ("pair" if term_pairwise else "seq") + "_" +
+                    ("pair" if tile_pairwise else "seq"))
             dump_bf16(name, manual.transpose(0, 1).reshape(ROWS, INNER))
     scores_prescale_f32 = torch.matmul(
         qh.float() * (HEAD_DIM ** -0.5), kh.float().transpose(-1, -2))

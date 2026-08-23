@@ -163,6 +163,15 @@ int h3_gpu_dequantize_rows_i8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                                    const h3_gpu_tensor *input,
                                    const h3_gpu_tensor *scales,
                                    uint32_t rows, uint32_t columns);
+/* Test-only FlashAttention parity hook.  Produces BF16 heads and the F32 LSE
+ * layout used by PyTorch's flash operator: [head][query_row]. */
+int h3_gpu_sdpa_reference_bf16_lse(h3_gpu *gpu, h3_gpu_tensor *output,
+                                   h3_gpu_tensor *logsumexp,
+                                   const h3_gpu_tensor *query,
+                                   const h3_gpu_tensor *key,
+                                   const h3_gpu_tensor *value,
+                                   uint32_t sequence, uint32_t heads,
+                                   uint32_t head_dim, float scale);
 int h3_gpu_adaln_table_interpolate_f32(
                             h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *times,

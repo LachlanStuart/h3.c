@@ -4248,6 +4248,7 @@ struct h3_sdpa_reference_args {
     uint head_dim;
     float scale;
     uint online_softmax;
+    uint write_logsumexp;
 };
 
 kernel void h3_sdpa_bf16_reference(
@@ -4255,7 +4256,8 @@ kernel void h3_sdpa_bf16_reference(
                          device const ushort *key [[buffer(1)]],
                          device const ushort *value [[buffer(2)]],
                          device ushort *output [[buffer(3)]],
-                         constant h3_sdpa_reference_args &args [[buffer(4)]],
+                         device float *logsumexp [[buffer(4)]],
+                         constant h3_sdpa_reference_args &args [[buffer(5)]],
                          uint lane [[thread_index_in_threadgroup]],
                          uint2 group [[threadgroup_position_in_grid]]) {
     constexpr uint MAX_SEQUENCE = 128;
@@ -4264,6 +4266,7 @@ kernel void h3_sdpa_bf16_reference(
     if (query_row >= args.sequence || head >= args.heads) return;
     threadgroup float scores[MAX_SEQUENCE];
     threadgroup float reductions[MAX_SEQUENCE];
+    threadgroup float maximum_value;
     uint row_base = (query_row * args.heads + head) * args.head_dim;
     for (uint key_row = 0; key_row < args.sequence; key_row++) {
         uint key_base = (key_row * args.heads + head) * args.head_dim;
@@ -4307,6 +4310,9 @@ kernel void h3_sdpa_bf16_reference(
         if (lane < args.head_dim)
             output[row_base + lane] = h3_f32_to_bf16(
                 accumulator / reductions[1]);
+        if (lane == 0 && args.write_logsumexp)
+            logsumexp[head * args.sequence + query_row] =
+                reductions[0] + log(reductions[1]);
         return;
     }
     if (lane == 0) {
@@ -4315,12 +4321,14 @@ kernel void h3_sdpa_bf16_reference(
             maximum = max(maximum, scores[key_row]);
         for (uint key_row = 0; key_row < args.sequence; key_row++)
             scores[key_row] = exp(scores[key_row] - maximum);
+        maximum_value = maximum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float partial_sum = 0.0f;
     for (uint key_row = lane; key_row < args.sequence; key_row += 128)
         partial_sum += scores[key_row];
     reductions[lane] = partial_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = 64; stride; stride >>= 1) {
         if (lane < stride) reductions[lane] += reductions[lane + stride];
@@ -4335,6 +4343,9 @@ kernel void h3_sdpa_bf16_reference(
         }
         output[row_base + lane] = h3_f32_to_bf16(result);
     }
+    if (lane == 0 && args.write_logsumexp)
+        logsumexp[head * args.sequence + query_row] =
+            maximum_value + log(reductions[0]);
 }
 
 /* One SIMD group owns one (row, head), so a 128-thread threadgroup processes

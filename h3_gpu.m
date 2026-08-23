@@ -1877,7 +1877,8 @@ static int h3_gpu_sdpa_reference_bf16(
                     H3GPU *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
-                    uint32_t heads, uint32_t head_dim, float scale) {
+                    uint32_t heads, uint32_t head_dim, float scale,
+                    h3_gpu_tensor *logsumexp) {
     if (sequence > 128 || head_dim != 128) {
         h3_gpu_set_error(gpu,
             @"reference BF16 SDPA only supports sequence/head dimension 128");
@@ -1894,11 +1895,13 @@ static int h3_gpu_sdpa_reference_bf16(
         uint32_t sequence, heads, head_dim;
         float scale;
         uint32_t online_softmax;
+        uint32_t write_logsumexp;
     }
         sdpa_reference_args;
     sdpa_reference_args args = {
         sequence, heads, head_dim, scale,
-        getenv("H3_REFERENCE_SDPA_ONLINE") != NULL
+        getenv("H3_REFERENCE_SDPA_ONLINE") != NULL,
+        logsumexp != NULL
     };
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
@@ -1908,7 +1911,10 @@ static int h3_gpu_sdpa_reference_bf16(
         [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
         [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
-        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        /* The shader never dereferences this placeholder when write_lse=0. */
+        [encoder setBuffer:logsumexp ? TENSOR(logsumexp).buffer :
+            TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
         [encoder dispatchThreadgroups:MTLSizeMake(sequence, heads, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [encoder endEncoding];
@@ -1917,6 +1923,27 @@ static int h3_gpu_sdpa_reference_bf16(
     stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+int h3_gpu_sdpa_reference_bf16_lse(
+                    h3_gpu *opaque, h3_gpu_tensor *output,
+                    h3_gpu_tensor *logsumexp, const h3_gpu_tensor *query,
+                    const h3_gpu_tensor *key, const h3_gpu_tensor *value,
+                    uint32_t sequence, uint32_t heads, uint32_t head_dim,
+                    float scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t head_elements = (size_t)sequence * heads * head_dim;
+    size_t lse_elements = (size_t)sequence * heads;
+    if (!h3_gpu_require_bf16(gpu, output, head_elements, @"reference SDPA output") ||
+        !h3_gpu_require_f32(gpu, logsumexp, lse_elements,
+                            @"reference SDPA LSE") ||
+        !h3_gpu_require_bf16(gpu, query, head_elements, @"reference SDPA Q") ||
+        !h3_gpu_require_bf16(gpu, key, head_elements, @"reference SDPA K") ||
+        !h3_gpu_require_bf16(gpu, value, head_elements, @"reference SDPA V"))
+        return 0;
+    return h3_gpu_sdpa_reference_bf16(gpu, output, query, key, value,
+                                      sequence, heads, head_dim, scale,
+                                      logsumexp);
 }
 
 static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -1945,7 +1972,8 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
     if (tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal &&
         getenv("H3_REFERENCE_SDPA"))
         return h3_gpu_sdpa_reference_bf16(
-            gpu, output, query, key, value, sequence, heads, head_dim, scale);
+            gpu, output, query, key, value, sequence, heads, head_dim, scale,
+            NULL);
     H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
                                       scale, mps_dtype, causal, headMajor,
                                       outputHeadMajor);
