@@ -41,10 +41,23 @@ int main(int argc, char **argv) {
         die(error);
     double started = seconds_now();
     h3_video_frames frames;
-    if (!h3_video_vae_decode(weights, argv[2], latent.values,
-            latent.time, latent.height, latent.width,
-            progress, NULL, &frames, error, sizeof(error)))
-        die(error);
+    const char *resident_env = getenv("H3_LATENT_DECODE_RESIDENT");
+    int resident = resident_env && *resident_env && strcmp(resident_env, "0");
+    double loaded = started;
+    h3_video_vae_decoder *decoder = NULL;
+    if (resident) {
+        decoder = h3_video_vae_decoder_load(weights, argv[2], latent.height,
+                                            latent.width, progress, NULL,
+                                            error, sizeof(error));
+        if (!decoder) die(error);
+        loaded = seconds_now();
+        if (!h3_video_vae_decoder_decode(decoder, latent.values, latent.time,
+                                         &frames, error, sizeof(error)))
+            die(error);
+    } else if (!h3_video_vae_decode(weights, argv[2], latent.values,
+                                    latent.time, latent.height, latent.width,
+                                    progress, NULL, &frames, error,
+                                    sizeof(error))) die(error);
     double decoded = seconds_now();
 
     size_t count = (size_t)frames.frames * (size_t)frames.height *
@@ -74,14 +87,14 @@ int main(int argc, char **argv) {
             error, sizeof(error));
     if (!encoded) die(error);
     double finished = seconds_now();
-    printf("decode latent_shape=1x24x%dx%dx%d frames=%d pixels=%dx%d "
-           "finite=%zu/%zu rgb_mean=%.9g rgb_std=%.9g decode_seconds=%.3f "
-           "total_seconds=%.3f gpu_seconds=%.3f peak_metal_gib=%.3f "
+    printf("decode resident=%d latent_shape=1x24x%dx%dx%d frames=%d pixels=%dx%d "
+            "finite=%zu/%zu rgb_mean=%.9g rgb_std=%.9g decode_seconds=%.3f "
+           "load_seconds=%.3f total_seconds=%.3f gpu_seconds=%.3f peak_metal_gib=%.3f "
            "host_reads=%llu host_writes=%llu submissions=%llu output=%s\n",
-           latent.time, latent.height, latent.width, frames.frames,
+           resident, latent.time, latent.height, latent.width, frames.frames,
            frames.width, frames.height, finite, count, mean,
            count > 1 ? sqrt(m2 / (double)(count - 1)) : 0.0,
-           decoded - started, finished - started,
+           decoded - loaded, loaded - started, finished - started,
            frames.gpu_stats.gpu_seconds,
            (double)frames.gpu_stats.peak_live_bytes /
                (1024.0 * 1024.0 * 1024.0),
@@ -90,6 +103,7 @@ int main(int argc, char **argv) {
            (unsigned long long)frames.gpu_stats.submissions, argv[4]);
     free(rgb);
     h3_video_frames_free(&frames);
+    h3_video_vae_decoder_free(decoder);
     h3_video_latent_free(&latent);
     return 0;
 }
