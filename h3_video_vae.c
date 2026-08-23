@@ -1017,10 +1017,11 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
         return 0;
     }
     int tile_count = decoder->y_axis.count * decoder->x_axis.count;
+    int gpu_stitch = decoder->vae.stitch_video && selected_frame < 0;
     int chunk_count = selected_frame >= 0 ? 1 : (latent_time - 2) / 5;
     int progress_chunk = selected_frame >= 0 ? 0 : chunk;
-    float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
-    if (!tiles) {
+    float **tiles = gpu_stitch ? NULL : calloc((size_t)tile_count, sizeof(*tiles));
+    if (!gpu_stitch && !tiles) {
         fail(error, error_size, "out of memory retaining video VAE tiles");
         return 0;
     }
@@ -1044,6 +1045,17 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
                 break;
             }
             free_tensor(&decoder->vae.latent);
+            if (gpu_stitch) {
+                decoder->vae.stitch_chunk_index = (uint32_t)chunk;
+                decoder->vae.stitch_tile_index = (uint32_t)(tile_y * decoder->x_axis.count + tile_x);
+                decoder->vae.stitch_start_y = (uint32_t)decoder->y_axis.starts[tile_y];
+                decoder->vae.stitch_start_x = (uint32_t)decoder->x_axis.starts[tile_x];
+                decoder->vae.stitch_overlap_y = (uint32_t)(tile_y ? decoder->y_axis.overlaps[tile_y - 1] : 0);
+                decoder->vae.stitch_overlap_x = (uint32_t)(tile_x ? decoder->x_axis.overlaps[tile_x - 1] : 0);
+                decoder->vae.stitch_keep_h = (uint32_t)(decoder->y_axis.length - (tile_y + 1 < decoder->y_axis.count ? decoder->y_axis.overlaps[tile_y] : 0));
+                decoder->vae.stitch_keep_w = (uint32_t)(decoder->x_axis.length - (tile_x + 1 < decoder->x_axis.count ? decoder->x_axis.overlaps[tile_x] : 0));
+                decoder->vae.stitch_last_tile = tile_y + 1 == decoder->y_axis.count && tile_x + 1 == decoder->x_axis.count;
+            }
             ok = prepare_input(&decoder->vae, input,
                                decoder->latent_mean, decoder->latent_std,
                                error, error_size) &&
@@ -1053,6 +1065,7 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
                                    decoder, error, error_size);
             free(input);
             if (!ok) break;
+            if (gpu_stitch) continue;
             h3_video_frames tile;
             memset(&tile, 0, sizeof(tile));
             ok = selected_frame >= 0 ?
@@ -1064,7 +1077,7 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
                 tiles[index] = tile.rgb;
             }
         }
-    if (ok) ok = stitch_tiles(tiles, &decoder->y_axis, &decoder->x_axis,
+    if (ok && !gpu_stitch) ok = stitch_tiles(tiles, &decoder->y_axis, &decoder->x_axis,
                               frame_count, output, error, error_size);
     for (int index = 0; index < tile_count; index++) free(tiles[index]);
     free(tiles);
@@ -1185,6 +1198,36 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     int pixel_w = decoder->latent_w * SPATIAL_RATIO;
     size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
     size_t output_elements = (size_t)output_frames * frame_elements;
+    if (decoder->vae.fp16) {
+        h3_gpu_tensor *chunk_canvas = h3_gpu_tensor_new_f32(decoder->vae.gpu,
+            (size_t)FIRST_CHUNK_FRAMES * frame_elements);
+        h3_gpu_tensor *final_canvas = h3_gpu_tensor_new_f32(decoder->vae.gpu,
+            output_elements);
+        size_t tile_elements = (size_t)FIRST_CHUNK_FRAMES * decoder->vae.latent_h * 16 * decoder->vae.latent_w * 16 * 3;
+        h3_gpu_tensor *tile_store = h3_gpu_tensor_new_f32(decoder->vae.gpu,
+            (size_t)decoder->y_axis.count * decoder->x_axis.count * tile_elements);
+        int ok = chunk_canvas && final_canvas && tile_store;
+        if (!ok) fail(error, error_size, "cannot allocate resident GPU VAE stitch canvases");
+        decoder->vae.stitch_tiles = tile_store; decoder->vae.stitch_chunk = chunk_canvas;
+        decoder->vae.stitch_video = final_canvas; decoder->vae.stitch_chunks = (uint32_t)chunks;
+        decoder->vae.stitch_full_h = (uint32_t)pixel_h; decoder->vae.stitch_full_w = (uint32_t)pixel_w;
+        decoder->vae.stitch_tile_columns = (uint32_t)decoder->x_axis.count;
+        for (int chunk = 0; chunk < chunks && ok; chunk++) {
+            h3_video_frames ignored; memset(&ignored, 0, sizeof(ignored));
+            ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
+                                      chunk, -1, &ignored, error, error_size);
+            h3_video_frames_free(&ignored);
+        }
+        float *rgb = ok ? malloc(output_elements * sizeof(*rgb)) : NULL;
+        if (ok && (!rgb || !h3_gpu_tensor_read_f32(final_canvas, rgb, output_elements))) {
+            free(rgb); rgb = NULL; ok = 0; fail(error, error_size, "cannot read resident GPU-stitched video");
+        }
+        decoder->vae.stitch_tiles = NULL; decoder->vae.stitch_chunk = NULL; decoder->vae.stitch_video = NULL;
+        h3_gpu_tensor_free(tile_store); h3_gpu_tensor_free(chunk_canvas); h3_gpu_tensor_free(final_canvas);
+        if (ok) { output->frames = output_frames; output->height = pixel_h; output->width = pixel_w; output->rgb = rgb; ok = h3_gpu_get_stats(decoder->vae.gpu, &output->gpu_stats); }
+        if (!ok) { free(rgb); h3_video_frames_free(output); }
+        return ok;
+    }
     float *final_rgb = malloc(output_elements * sizeof(*final_rgb));
     float *temporal_overlap = malloc(5 * frame_elements *
                                      sizeof(*temporal_overlap));
