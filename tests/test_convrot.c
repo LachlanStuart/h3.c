@@ -186,11 +186,13 @@ static void test_convrot(h3_gpu *gpu) {
             maximum = fmaxf(maximum, fabsf(bf16_to_f32(rounded)));
         }
         float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f / 127.0f;
-        float inverse = maximum > 0.0f ? 127.0f / maximum : 127.0f;
+        float quantization_scale = bf16_to_f32(f32_to_bf16(scale));
+        float inverse = 1.0f / quantization_scale;
         input_scales_want[row] = scale;
         for (unsigned column = 0; column < INPUT; column++) {
-            long rounded = lrintf(bf16_to_f32(
-                rotated_want[(size_t)row * INPUT + column]) * inverse);
+            float ratio = bf16_to_f32(f32_to_bf16(bf16_to_f32(
+                rotated_want[(size_t)row * INPUT + column]) * inverse));
+            long rounded = lrintf(ratio);
             if (rounded < -128) rounded = -128;
             if (rounded > 127) rounded = 127;
             quantized_want[(size_t)row * INPUT + column] = (int8_t)rounded;
@@ -578,6 +580,70 @@ static void print_bf16_stats(const char *name, const h3_gpu_tensor *tensor,
     free(values);
 }
 
+/* The CUDA reference can optionally write the BF16 value at every block
+ * boundary.  Keep this outside the normal numerical smoke so a missing oracle
+ * never turns a local unit test into an accidental pass/fail gate. */
+static void compare_bf16_stage(const char *directory, const char *name,
+                               const h3_gpu_tensor *tensor, size_t elements) {
+    if (!directory || !*directory) return;
+    size_t path_size = strlen(directory) + strlen(name) + 7;
+    char *path = malloc(path_size);
+    uint16_t *actual = malloc(elements * sizeof(*actual));
+    uint16_t *expected = malloc(elements * sizeof(*expected));
+    require(path && actual && expected, "cannot allocate stage comparison");
+    snprintf(path, path_size, "%s/%s.bf16", directory, name);
+    FILE *stream = fopen(path, "rb");
+    require(stream && fread(expected, sizeof(*expected), elements, stream) == elements &&
+            h3_gpu_tensor_read_bf16(tensor, actual, elements),
+            "cannot read block stage oracle");
+    fclose(stream);
+    double absolute_sum = 0.0, reference_sum = 0.0;
+    float maximum_error = 0.0f;
+    size_t mismatches = 0;
+    for (size_t index = 0; index < elements; index++) {
+        float got = bf16_to_f32(actual[index]);
+        float want = bf16_to_f32(expected[index]);
+        float error = fabsf(got - want);
+        maximum_error = fmaxf(maximum_error, error);
+        absolute_sum += error;
+        reference_sum += fabs((double)want);
+        mismatches += actual[index] != expected[index];
+    }
+    printf("block stage %-14s mismatches=%zu/%zu max_abs=%.7g mean_abs=%.7g relative_l1=%.7g\n",
+           name, mismatches, elements, maximum_error,
+           absolute_sum / (double)elements, absolute_sum / reference_sum);
+    if (getenv("H3_CONVROT_BLOCK_DIAG") && mismatches) {
+        size_t shown = 0;
+        for (size_t index = 0; index < elements && shown < 8; index++) {
+            if (actual[index] == expected[index]) continue;
+            printf("block stage %s first_diff[%zu]=%.7g expected=%.7g\n",
+                   name, index, bf16_to_f32(actual[index]),
+                   bf16_to_f32(expected[index]));
+            shown++;
+        }
+    }
+    free(path); free(actual); free(expected);
+}
+
+static h3_gpu_tensor *load_bf16_stage_oracle(h3_gpu *gpu,
+                                              const char *directory,
+                                              const char *name,
+                                              size_t elements) {
+    size_t path_size = strlen(directory) + strlen(name) + 7;
+    char *path = malloc(path_size);
+    uint16_t *values = malloc(elements * sizeof(*values));
+    require(path && values, "cannot allocate stage oracle");
+    snprintf(path, path_size, "%s/%s.bf16", directory, name);
+    FILE *stream = fopen(path, "rb");
+    require(stream && fread(values, sizeof(*values), elements, stream) == elements,
+            "cannot read stage oracle");
+    fclose(stream);
+    h3_gpu_tensor *tensor = h3_gpu_tensor_from_bf16(gpu, values, elements);
+    free(path); free(values);
+    require(tensor != NULL, "cannot upload stage oracle");
+    return tensor;
+}
+
 static h3_gpu_tensor *checkpoint_matrix(h3_weight_store *store, h3_gpu *gpu,
                                         const char *stem, uint64_t rows,
                                         uint64_t columns, int scales,
@@ -747,6 +813,32 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
     print_bf16_stats("swiglu", activated, (size_t)B_ROWS * FFN);
     print_bf16_stats("mlp_output", mlp_output, hidden_count);
     print_bf16_stats("output", output, hidden_count);
+    const char *stage_directory = getenv("H3_CONVROT_BLOCK_INTERMEDIATES");
+    if (stage_directory && *stage_directory) {
+        compare_bf16_stage(stage_directory, "attention_adaln", mod_attention,
+                           hidden_count);
+        compare_bf16_stage(stage_directory, "qkv", qkv,
+                           (size_t)B_ROWS * INNER * 3);
+        compare_bf16_stage(stage_directory, "query", query,
+                           (size_t)B_ROWS * INNER);
+        compare_bf16_stage(stage_directory, "key", key,
+                           (size_t)B_ROWS * INNER);
+        compare_bf16_stage(stage_directory, "value", value,
+                           (size_t)B_ROWS * INNER);
+        compare_bf16_stage(stage_directory, "attention_heads", attention_heads,
+                           (size_t)B_ROWS * INNER);
+        compare_bf16_stage(stage_directory, "attention_output", attention_output,
+                           hidden_count);
+        compare_bf16_stage(stage_directory, "attention_residual", after_attention,
+                           hidden_count);
+        compare_bf16_stage(stage_directory, "mlp_adaln", mod_mlp, hidden_count);
+        compare_bf16_stage(stage_directory, "fc1", fc1,
+                           (size_t)B_ROWS * FFN * 2);
+        compare_bf16_stage(stage_directory, "swiglu", activated,
+                           (size_t)B_ROWS * FFN);
+        compare_bf16_stage(stage_directory, "mlp_output", mlp_output, hidden_count);
+        compare_bf16_stage(stage_directory, "output", output, hidden_count);
+    }
     if (expected_path && *expected_path) {
         uint16_t *actual = malloc(hidden_count * sizeof(*actual));
         uint16_t *expected = malloc(hidden_count * sizeof(*expected));
@@ -769,6 +861,8 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
         printf("block output comparison max_abs=%.7g mean_abs=%.7g relative_l1=%.7g\n",
                maximum_error, absolute_sum / (double)hidden_count,
                absolute_sum / reference_sum);
+        require(absolute_sum / reference_sum <= 1e-3,
+                "native block-0 output diverges from the captured Comfy oracle");
         free(actual); free(expected);
     }
 
