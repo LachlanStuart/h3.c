@@ -6,13 +6,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum {
-    H3_REFERENCE_AUDIO_RATE = 32000,
-    H3_REFERENCE_AUDIO_MAX_SECONDS = 45,
-    H3_REFERENCE_AUDIO_MAX_SAMPLES =
-        H3_REFERENCE_AUDIO_RATE * H3_REFERENCE_AUDIO_MAX_SECONDS
-};
-
 typedef enum {
     H3_IMAGE_FIT_STRETCH = 0,
     H3_IMAGE_FIT_COVER = 1
