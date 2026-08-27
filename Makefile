@@ -145,6 +145,16 @@ test: h3_mutex_tests h3_tests h3_latent_io_tests h3_metal_tests h3_bf16_tests \
 	else \
 		echo "skip: released tokenizer is not installed"; \
 	fi
+	@if test -f MiniMax-H3/FL2VA/tokenizer/tokenizer.json; then \
+		./h3_tokenizer_tests MiniMax-H3/FL2VA/tokenizer/tokenizer.json; \
+	else \
+		echo "skip: released FL2VA tokenizer is not installed"; \
+	fi
+	@if test -f MiniMax-H3/Ref2VA/tokenizer/tokenizer.json; then \
+		./h3_tokenizer_tests MiniMax-H3/Ref2VA/tokenizer/tokenizer.json; \
+	else \
+		echo "skip: released Ref2VA tokenizer is not installed"; \
+	fi
 	@if test -f misc/fixtures/h3_text_bf16.safetensors; then \
 		./h3_text_tests misc/fixtures/h3_text_bf16.safetensors; \
 	else \

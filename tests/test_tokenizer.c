@@ -51,6 +51,15 @@ int main(int argc, char **argv) {
                sizeof(emoji) / sizeof(emoji[0]));
     const uint32_t special[] = {151644};
     check_case(tokenizer, "<|im_start|>", special, 1);
+    const uint32_t minimax_extras[] = {151669, 151670, 151671, 151672,
+                                       151673, 151674, 151675};
+    check_case(tokenizer,
+               "<d></d><|cutoff|><|lyrics_start|><|lyrics_end|>"
+               "<|caption_start|><|caption_end|>",
+               minimax_extras, sizeof(minimax_extras) / sizeof(minimax_extras[0]));
+    const uint32_t dialogue[] = {151669, 32, 151670};
+    check_case(tokenizer, "<d>A</d>", dialogue,
+               sizeof(dialogue) / sizeof(dialogue[0]));
     const uint32_t cinematic[] = {32, 64665, 3265, 5239, 315, 264, 8866,
                                   1778, 11958, 4633, 10971, 13};
     check_case(tokenizer,

@@ -29,6 +29,20 @@ typedef struct {
 @implementation H3Tokenizer
 @end
 
+static NSArray<NSDictionary *> *h3_minimax_extra_tokens(void) {
+    // These tokens are declared in tokenizer_config.json but omitted from the
+    // released tokenizer.json. Their IDs are part of the H3 model contract.
+    return @[
+        @{ @"content": @"<d>",               @"id": @(151669) },
+        @{ @"content": @"</d>",              @"id": @(151670) },
+        @{ @"content": @"<|cutoff|>",        @"id": @(151671) },
+        @{ @"content": @"<|lyrics_start|>",  @"id": @(151672) },
+        @{ @"content": @"<|lyrics_end|>",    @"id": @(151673) },
+        @{ @"content": @"<|caption_start|>", @"id": @(151674) },
+        @{ @"content": @"<|caption_end|>",   @"id": @(151675) },
+    ];
+}
+
 static H3Tokenizer *TOK(const h3_tokenizer *tokenizer) {
     return (__bridge H3Tokenizer *)(void *)tokenizer;
 }
@@ -323,12 +337,45 @@ h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
         }
         H3Tokenizer *tokenizer = [[H3Tokenizer alloc] init];
         tokenizer.vocab = model[@"vocab"];
+        id serialized_added = config[@"added_tokens"];
+        NSMutableArray *added = [serialized_added isKindOfClass:NSArray.class] ?
+            [serialized_added mutableCopy] : [NSMutableArray array];
+        NSMutableDictionary *added_by_content = [NSMutableDictionary dictionary];
+        NSMutableDictionary *content_by_id = [NSMutableDictionary dictionary];
+        for (NSDictionary *token in added) {
+            NSString *content = token[@"content"];
+            NSNumber *identifier = token[@"id"];
+            if ([content isKindOfClass:NSString.class] &&
+                [identifier isKindOfClass:NSNumber.class]) {
+                added_by_content[content] = identifier;
+                content_by_id[identifier] = content;
+            }
+        }
+        for (NSDictionary *token in h3_minimax_extra_tokens()) {
+            NSString *content = token[@"content"];
+            NSNumber *expected = token[@"id"];
+            NSNumber *existing = added_by_content[content];
+            if (existing && existing.unsignedIntegerValue != expected.unsignedIntegerValue) {
+                h3_tok_error(error, error_size, [NSString stringWithFormat:
+                    @"H3 token %@ has ID %@, expected %@", content, existing, expected]);
+                return NULL;
+            }
+            NSString *occupied = content_by_id[expected];
+            if (occupied && ![occupied isEqual:content]) {
+                h3_tok_error(error, error_size, [NSString stringWithFormat:
+                    @"H3 token ID %@ is already assigned to %@", expected, occupied]);
+                return NULL;
+            }
+            if (!existing) {
+                [added addObject:token];
+                added_by_content[content] = expected;
+                content_by_id[expected] = content;
+            }
+        }
         NSUInteger maximum_id = 0;
         for (NSNumber *number in tokenizer.vocab.allValues) {
             maximum_id = MAX(maximum_id, number.unsignedIntegerValue);
         }
-        NSArray *added = config[@"added_tokens"];
-        if (!added) added = @[];
         for (NSDictionary *token in added) {
             maximum_id = MAX(maximum_id, [token[@"id"] unsignedIntegerValue]);
         }
