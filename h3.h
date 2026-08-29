@@ -130,6 +130,8 @@ typedef struct {
     h3_video_preset video_preset;
     /* libx264 CRF in [0, 51]. Ignored for FFV1. */
     int video_crf;
+    /* Structural boundary inputs. They may accompany ordered references when
+     * dit_checkpoint selects a Hybrid model that supports both paths. */
     const char *first_frame;
     const char *last_frame;
     const h3_reference *references;

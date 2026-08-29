@@ -332,20 +332,22 @@ static int h3_augment_conditions(const h3_params *params, int ref2va,
                                  float *audio, size_t audio_elements) {
     size_t video_offset = 0;
     size_t audio_offset = 0;
-    if (!ref2va) {
+    {
         int latent_w, latent_h;
         h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
         size_t span = (size_t)h3_video_encoder_latent_t(1) *
                       (size_t)latent_h * (size_t)latent_w / 4 * 96;
         size_t count = (size_t)(params->first_frame != NULL) +
                        (size_t)(params->last_frame != NULL);
-        if (count && (span > SIZE_MAX / count || span * count != video_elements))
+        if (count && (span > SIZE_MAX / count ||
+                      span * count > video_elements))
             return 0;
         for (size_t index = 0; index < count; index++) {
             h3_augment_span(video + video_offset, span, params->seed);
             video_offset += span;
         }
-        return video_offset == video_elements && audio_elements == 0;
+        if (!ref2va)
+            return video_offset == video_elements && audio_elements == 0;
     }
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_layout_ref *reference = &references[index];
@@ -714,8 +716,11 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "unknown reference image sizing policy");
         return 0;
     }
-    if (params->reference_count && (params->first_frame || params->last_frame)) {
-        h3_set_error(ctx, "full references cannot be combined with frame anchors");
+    if (params->reference_count &&
+        (params->first_frame || params->last_frame) &&
+        !params->dit_checkpoint) {
+        h3_set_error(ctx,
+            "frame anchors with full references require a Hybrid DiT checkpoint");
         return 0;
     }
     size_t images = 0, videos = 0, audio_inputs = 0;
@@ -1003,9 +1008,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_tokenizer *tokenizer = NULL;
     uint32_t *ids = NULL;
     size_t token_count = 0;
-    size_t visual_capacity = ref2va ? params->reference_count :
-        (size_t)(params->first_frame != NULL) +
-        (size_t)(params->last_frame != NULL);
+    size_t anchor_count = (size_t)(params->first_frame != NULL) +
+                          (size_t)(params->last_frame != NULL);
+    size_t visual_capacity = anchor_count +
+        (ref2va ? params->reference_count : 0);
     size_t visual_count = 0;
     float **condition_pixels = NULL;
     int *condition_widths = NULL;
@@ -1108,11 +1114,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "cannot restore cached conditioning");
             goto cleanup;
         }
-        if (!ref2va) {
-            if (params->first_frame) keyframes[keyframe_count++] = 0;
-            if (params->last_frame)
-                keyframes[keyframe_count++] = temporal.frame_count - 1;
-        }
+        if (params->first_frame) keyframes[keyframe_count++] = 0;
+        if (params->last_frame)
+            keyframes[keyframe_count++] = temporal.frame_count - 1;
         fprintf(stderr, "h3: conditioning cache hit\n");
     } else {
     if (visual_capacity) {
@@ -1127,8 +1131,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         if (reference_visual_indices)
             for (size_t index = 0; index < params->reference_count; index++)
                 reference_visual_indices[index] = SIZE_MAX;
+        if (visual_reference_indices)
+            for (size_t index = 0; index < visual_capacity; index++)
+                visual_reference_indices[index] = SIZE_MAX;
         if (ref2va) {
-            layout_references = calloc(visual_capacity,
+            layout_references = calloc(params->reference_count,
                                        sizeof(*layout_references));
             presentations = calloc(params->reference_count,
                                    sizeof(*presentations));
@@ -1152,6 +1159,34 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     h3_progress_emit(&progress, "tokenizer", 1, 1);
     if (progress.cancelled) goto cleanup;
+    if (params->first_frame) {
+        keyframes[keyframe_count++] = 0;
+        if (!h3_ffmpeg_read_image_f32(
+                params->first_frame, render_width, render_height,
+                H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
+                detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        condition_widths[visual_count] = render_width;
+        condition_heights[visual_count] = render_height;
+        condition_frames[visual_count] = 1;
+        visual_count++;
+    }
+    if (params->last_frame) {
+        keyframes[keyframe_count++] = temporal.frame_count - 1;
+        if (!h3_ffmpeg_read_image_f32(
+                params->last_frame, render_width, render_height,
+                H3_IMAGE_FIT_COVER, &condition_pixels[visual_count],
+                detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        condition_widths[visual_count] = render_width;
+        condition_heights[visual_count] = render_height;
+        condition_frames[visual_count] = 1;
+        visual_count++;
+    }
     if (ref2va) {
         for (size_t index = 0; index < params->reference_count; index++) {
             const h3_reference *reference = &params->references[index];
@@ -1352,34 +1387,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (progress.cancelled) goto cleanup;
         }
     } else {
-        if (params->first_frame) {
-            keyframes[keyframe_count++] = 0;
-            if (!h3_ffmpeg_read_image_f32(
-                    params->first_frame, render_width, render_height,
-                    H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
-                    detail, sizeof(detail))) {
-                h3_set_error(ctx, "%s", detail);
-                goto cleanup;
-            }
-            condition_widths[visual_count] = render_width;
-            condition_heights[visual_count] = render_height;
-            condition_frames[visual_count] = 1;
-            visual_count++;
-        }
-        if (params->last_frame) {
-            keyframes[keyframe_count++] = temporal.frame_count - 1;
-            if (!h3_ffmpeg_read_image_f32(
-                    params->last_frame, render_width, render_height,
-                    H3_IMAGE_FIT_COVER, &condition_pixels[visual_count],
-                    detail, sizeof(detail))) {
-                h3_set_error(ctx, "%s", detail);
-                goto cleanup;
-            }
-            condition_widths[visual_count] = render_width;
-            condition_heights[visual_count] = render_height;
-            condition_frames[visual_count] = 1;
-            visual_count++;
-        }
         vision_output_count = visual_count;
     }
     if (vision_output_count) {
@@ -1467,6 +1474,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         size_t vision_cursor = 0;
         for (size_t image = 0; image < visual_count; image++) {
             size_t reference_index = visual_reference_indices[image];
+            if (ref2va && reference_index == SIZE_MAX) {
+                free(condition_pixels[image]);
+                condition_pixels[image] = NULL;
+                continue;
+            }
             if (!ref2va ||
                 params->references[reference_index].kind == H3_REFERENCE_IMAGE) {
                 if (!h3_vision_encode_bf16(

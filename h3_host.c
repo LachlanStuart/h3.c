@@ -372,10 +372,6 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
         spec->frame_count < 5) {
         return h3_builder_fail(&builder, "invalid target layout dimensions");
     }
-    if (spec->keyframe_count && spec->reference_count) {
-        return h3_builder_fail(&builder, "keyframes and references are mutually exclusive");
-    }
-
     h3_position *frame = NULL;
     double *w_axis = NULL;
     size_t frame_rows = 0;

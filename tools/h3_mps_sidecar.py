@@ -1,4 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11,<3.14"
+# dependencies = [
+#   "einops>=0.8,<1",
+#   "numpy>=2,<3",
+#   "psutil>=7,<8",
+#   "safetensors>=0.6,<1",
+#   "torch>=2.8,<3",
+#   "typing-extensions>=4.15,<5",
+# ]
+# ///
 """Run the published MiniMax-H3 3D latent upscaler on Apple MPS.
 
 The script deliberately imports the publisher's implementation, loads the

@@ -460,6 +460,19 @@ Standalone audio must accompany an image or video reference. Audio references
 must be 2–45 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 45 seconds.
 
+An isolated Hybrid DiT checkpoint may combine structural frame anchors with
+the same ordered references. The anchors remain separate inputs and do not
+consume or renumber reference slots:
+
+```sh
+./h3 -d ./MiniMax-H3 --dit-checkpoint hybrid.safetensors \
+  -p "Use the declared identity while following the structural endpoints." \
+  --width 512 --height 256 --frames 56 --steps 20 \
+  --first-frame first.png --last-frame last.png \
+  --ref-image identity.png --ref-audio voice.wav \
+  -o outputs/hybrid.mp4
+```
+
 ## Distilled sampling: fold the Turbo LoRA into the checkpoint
 
 h3.c does not implement a LoRA runtime; step-distillation adapters can instead

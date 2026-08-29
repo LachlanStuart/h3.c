@@ -324,11 +324,13 @@ static void add_reference_image(h3_cli_state *state, char *argument) {
         fprintf(stderr, "Usage: !ref-image PATH\n");
         return;
     }
-    if (state->first_frame || state->last_frame) {
-        fprintf(stderr, "h3: Ref2VA references cannot be combined with frame anchors\n");
+    if ((state->first_frame || state->last_frame) &&
+        !state->params.dit_checkpoint) {
+        fprintf(stderr, "h3: references with frame anchors require a Hybrid DiT checkpoint\n");
         return;
     }
-    if (!h3_model(state->ctx)->ref2va_transformer.files) {
+    if (!h3_model(state->ctx)->ref2va_transformer.files &&
+        !state->params.dit_checkpoint) {
         fprintf(stderr, "h3: !ref-image requires the Ref2VA checkpoint\n");
         return;
     }
@@ -390,8 +392,8 @@ static void set_anchor(h3_cli_state *state, int first, char *argument) {
         printf("%s: none\n", name);
         return;
     }
-    if (state->params.reference_count) {
-        fprintf(stderr, "h3: frame anchors cannot be combined with Ref2VA references\n");
+    if (state->params.reference_count && !state->params.dit_checkpoint) {
+        fprintf(stderr, "h3: frame anchors with references require a Hybrid DiT checkpoint\n");
         return;
     }
     if (!validate_anchor(argument)) return;

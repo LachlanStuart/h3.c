@@ -624,6 +624,34 @@ static void test_layout_ref2va(void) {
     h3_layout_free(&layout);
 }
 
+static void test_layout_hybrid(void) {
+    int keyframes[] = {0, 55};
+    h3_layout_ref references[] = {
+        {H3_LAYOUT_REF_IMAGE, 0, 16, 24, 0},
+        {H3_LAYOUT_REF_VIDEO, 7, 16, 24, 48},
+        {H3_LAYOUT_REF_AUDIO, 0, 0, 0, 80}
+    };
+    h3_layout_spec spec = {192, 17, 30, 54, 93, 56,
+                           keyframes, 2, references, 3};
+    h3_layout layout;
+    char error[256];
+    CHECK(h3_layout_build(&spec, &layout, error, sizeof(error)));
+    CHECK(layout.seq_len == 9097);
+    const size_t bounds[][2] = {
+        {0, 192}, {192, 597}, {597, 1002}, {1002, 1098}, {1098, 1194},
+        {1194, 1866}, {1866, 2026}, {2026, 2212}, {2212, 9097}
+    };
+    const h3_segment_kind kinds[] = {
+        H3_SEG_TEXT, H3_SEG_COND, H3_SEG_COND, H3_SEG_REF_IMAGE,
+        H3_SEG_REF_AUDIO, H3_SEG_REF_IMAGE, H3_SEG_REF_AUDIO, H3_SEG_AUDIO,
+        H3_SEG_VIDEO
+    };
+    check_segments(&layout, bounds, kinds, 9);
+    CHECK(layout.img_cond_rows == 1578);
+    CHECK(layout.audio_cond_rows == 256);
+    h3_layout_free(&layout);
+}
+
 static void write_all(int descriptor, const void *data, size_t size) {
     const unsigned char *bytes = data;
     while (size) {
@@ -825,6 +853,7 @@ int main(void) {
     test_layout_tiny();
     test_layout_fl2va();
     test_layout_ref2va();
+    test_layout_hybrid();
     test_safetensors();
     test_rng_and_solver();
     test_gpu_res_solver();
