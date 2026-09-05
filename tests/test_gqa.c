@@ -7,7 +7,9 @@
 #include <string.h>
 
 enum {
-    SEQUENCE = 32,
+    /* More than one SIMD group's keys must contribute to softmax. A
+     * 32-token fixture cannot expose the maximum-to-sum reuse race. */
+    SEQUENCE = 128,
     QUERY_HEADS = 8,
     KV_HEADS = 2,
     HEAD_DIM = 128,
