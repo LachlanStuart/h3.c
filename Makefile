@@ -36,6 +36,11 @@ h3_tests: tests/test_h3.o $(LIB_OBJ)
 h3_adapter_tests: tests/test_adapter.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# This test includes the private application helper and adapter runtime so it
+# must not also link their ordinary object files.
+h3_adapter_scale_tests: tests/test_adapter_scale.o $(filter-out h3_dit.o h3_adapter.o,$(LIB_OBJ))
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_pdd_tests: tests/test_pdd.o h3_pdd.o
 	$(CC) -o $@ $^ -lm
 
@@ -135,7 +140,7 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_mutex_tests h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests h3_bf16_tests h3_refiner_layout_test \
+test: h3_mutex_tests h3_tests h3_adapter_tests h3_adapter_scale_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests h3_bf16_tests h3_refiner_layout_test \
 	h3_convrot_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 	h3_real_audio_encoder_test \
@@ -148,6 +153,7 @@ test: h3_mutex_tests h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests
 	./h3_mutex_tests
 	./h3_tests
 	./h3_adapter_tests
+	./h3_adapter_scale_tests
 	./h3_pdd_tests
 	./h3_cli_options_tests
 	./h3_latent_io_tests
@@ -277,7 +283,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 -include $(wildcard *.d tests/*.d)
 
 clean:
-	rm -f h3 h3_latent_decode h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests \
+	rm -f h3 h3_latent_decode h3_tests h3_adapter_tests h3_adapter_scale_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests \
 		h3_bf16_tests h3_convrot_tests h3_tokenizer_tests \
 		h3_refiner_layout_test \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \

@@ -45,6 +45,10 @@ void h3_adapter_runtime_free(h3_adapter_runtime *adapter);
 unsigned h3_adapter_runtime_rank(const h3_adapter_runtime *adapter);
 h3_adapter_kind h3_adapter_runtime_kind(const h3_adapter_runtime *adapter);
 float h3_adapter_runtime_strength(const h3_adapter_runtime *adapter);
+/* ModelTC's official inference profile applies the public strength together
+ * with its validated alpha/rank factor. PAI's scale remains its public
+ * strength because its factor layout is a different adapter family. */
+float h3_adapter_runtime_scale(const h3_adapter_runtime *adapter);
 const h3_st_tensor *h3_adapter_runtime_tensor(
     const h3_adapter_runtime *adapter, const char *name);
 const h3_st_header *h3_adapter_runtime_header(

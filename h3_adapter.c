@@ -13,6 +13,12 @@ struct h3_adapter_runtime {
     unsigned rank;
 };
 
+/* LightX2V's official MiniMax-H3 Turbo inference applies its documented
+ * lora_alpha=8 over the rank-128 factors. The safetensors container metadata
+ * describes export provenance (and varies across releases), so this is part
+ * of the named ModelTC serving profile rather than an inferred file field. */
+enum { H3_MODELTC_PROFILE_LORA_ALPHA = 8 };
+
 typedef struct {
     const char *name;
     h3_adapter_profile profile;
@@ -306,6 +312,16 @@ h3_adapter_kind h3_adapter_runtime_kind(const h3_adapter_runtime *adapter) {
 
 float h3_adapter_runtime_strength(const h3_adapter_runtime *adapter) {
     return adapter ? adapter->strength : 0.0f;
+}
+
+float h3_adapter_runtime_scale(const h3_adapter_runtime *adapter) {
+    if (!adapter) return 0.0f;
+    if (adapter->kind == H3_ADAPTER_MODELTC_TURBO) {
+        if (!adapter->rank) return 0.0f;
+        return adapter->strength *
+            (float)H3_MODELTC_PROFILE_LORA_ALPHA / (float)adapter->rank;
+    }
+    return adapter->strength;
 }
 
 const h3_st_tensor *h3_adapter_runtime_tensor(

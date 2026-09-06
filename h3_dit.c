@@ -487,9 +487,9 @@ static int adapter_apply(h3_dit *dit, const h3_dit_adapter_factor *factor,
             label) || !gpu_op(dit, h3_gpu_linear_bf16(dit->gpu,
             dit->adapter_delta, dit->adapter_rank, factor->up, NULL, rows,
             rank, factor->output), error, error_size, label)) return 0;
-    float strength = h3_adapter_runtime_strength(dit->adapter.runtime);
-    if (strength != 1.0f && !gpu_op(dit, h3_gpu_scale_bf16(dit->gpu,
-            dit->adapter_delta, dit->adapter_delta, strength, (uint32_t)elements),
+    float scale = h3_adapter_runtime_scale(dit->adapter.runtime);
+    if (scale != 1.0f && !gpu_op(dit, h3_gpu_scale_bf16(dit->gpu,
+            dit->adapter_delta, dit->adapter_delta, scale, (uint32_t)elements),
             error, error_size, label)) return 0;
     return qkv_component >= 0 ? gpu_op(dit,
         h3_gpu_add_qkv_component_bf16(dit->gpu, output, dit->adapter_delta,

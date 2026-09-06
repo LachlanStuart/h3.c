@@ -499,7 +499,10 @@ count, but `--steps` may select another count for an explicit ablation; sampler,
 grid, and shift arguments still must match. PAI remains fixed at eight
 evaluations. `--adapter-strength` defaults to 1; PAI requires exactly 1.
 Select an adapter file matching the profile's task and resolution. File schema
-validation does not establish quality at an untested ModelTC count.
+validation does not establish quality at an untested ModelTC count. ModelTC's
+public strength is scaled by the official profile's alpha/rank factor (8/128),
+so strength 1 matches its published inference setting rather than the raw
+factor-product magnitude.
 
 ```sh
 ./h3 -d ../models/compact \
