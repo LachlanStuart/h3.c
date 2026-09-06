@@ -76,6 +76,7 @@ struct h3_dit {
     int int8_mlp;
     int int8_qkv;
     int int8_attention_out;
+    int convrot;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
     int use_slower_row_major_attention_output;
@@ -181,6 +182,7 @@ struct h3_dit {
     h3_gpu_tensor *mlp_output;
     h3_gpu_tensor *int8_activation;
     h3_gpu_tensor *int8_activation_scales;
+    h3_gpu_tensor *convrot_activation;
     h3_gpu_tensor *final_audio_input;
     h3_gpu_tensor *final_video_input;
     h3_gpu_tensor *final_audio_inverse;
@@ -261,6 +263,13 @@ static h3_gpu_tensor *f2(h3_dit *dit, const char *name, uint64_t rows,
     uint64_t shape[] = {rows, columns};
     return h3_weight_load_f32(dit->weights, dit->gpu, name, 2, shape,
                               error, error_size);
+}
+
+static h3_gpu_tensor *i82(h3_dit *dit, const char *name, uint64_t rows,
+                          uint64_t columns, char *error, size_t error_size) {
+    uint64_t shape[] = {rows, columns};
+    return h3_weight_load_i8(dit->weights, dit->gpu, name, 2, shape,
+                             error, error_size);
 }
 
 static int copy_layout(h3_dit *dit, const h3_layout *layout,
@@ -542,6 +551,44 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
+static int load_convrot_matrix(h3_dit *dit, h3_gpu_tensor **weight,
+                               h3_gpu_tensor **scales, const char *prefix,
+                               const char *stem, uint64_t rows,
+                               uint64_t columns, char *error,
+                               size_t error_size) {
+    static const uint8_t metadata[] =
+        "{\"format\": \"int8_tensorwise\", \"convrot\": true, "
+        "\"convrot_groupsize\": 256}";
+    char name[192];
+    snprintf(name, sizeof(name), "%s%s.weight", prefix, stem);
+    *weight = i82(dit, name, rows, columns, error, error_size);
+    if (!*weight) return 0;
+    snprintf(name, sizeof(name), "%s%s.weight_scale", prefix, stem);
+    *scales = f2(dit, name, rows, 1, error, error_size);
+    if (!*scales) return 0;
+    snprintf(name, sizeof(name), "%s%s.comfy_quant", prefix, stem);
+    return h3_weight_match_u8(dit->weights, name, metadata,
+                              sizeof(metadata) - 1, error, error_size);
+}
+
+static int load_block_convrot(h3_dit *dit, h3_dit_block *block,
+                              const char *prefix,
+                              char *error, size_t error_size) {
+    return load_block_norms(dit, block, prefix, error, error_size) &&
+        load_convrot_matrix(dit, &block->qkv_int8, &block->qkv_scales,
+                            prefix, "attn.qkv_proj", INNER * 3, HIDDEN,
+                            error, error_size) &&
+        load_convrot_matrix(dit, &block->out_int8, &block->out_scales,
+                            prefix, "attn.out_proj", HIDDEN, INNER,
+                            error, error_size) &&
+        load_convrot_matrix(dit, &block->fc1_int8, &block->fc1_scales,
+                            prefix, "mlp.fc1", FFN * 2, HIDDEN,
+                            error, error_size) &&
+        load_convrot_matrix(dit, &block->fc2_int8, &block->fc2_scales,
+                            prefix, "mlp.fc2", HIDDEN, FFN,
+                            error, error_size);
+}
+
 static void free_block(h3_dit_block *block) {
     free_tensor(&block->norm1);
     free_tensor(&block->norm2);
@@ -775,7 +822,7 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              HIDDEN, 1e-5f), "refiner attention norm");
     OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
                            HIDDEN, INNER * 3), "refiner QKV");
-    OP(h3_gpu_grouped_qkv_rope_bf16(
+    OP((dit->convrot ? h3_gpu_qkv_rope_bf16 : h3_gpu_grouped_qkv_rope_bf16)(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
                              rows, HEADS, HEAD_DIM, 0, 1e-5f),
@@ -1253,6 +1300,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (dit->convrot) {
+            if (!load_block_convrot(dit, &dit->blocks[index], prefix,
+                                    error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -1475,12 +1525,13 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (!dit->fused_mlp) {
+    if (!dit->fused_mlp || dit->convrot) {
         dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
     }
-    if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp) {
+    if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp || dit->convrot) {
         dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
-        if ((!dit->fused_mlp && !dit->fc1) || !dit->activated) {
+        if (((!dit->fused_mlp || dit->convrot) && !dit->fc1) ||
+            !dit->activated) {
             fail(error, error_size,
                  "cannot allocate diagnostic DiT MLP tensors: %s",
                  h3_gpu_error(dit->gpu));
@@ -1496,6 +1547,16 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         if (!dit->int8_activation || !dit->int8_activation_scales) {
             fail(error, error_size,
                  "cannot allocate int8 DiT activation arena: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (dit->convrot) {
+        dit->convrot_activation = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * FFN);
+        if (!dit->convrot_activation) {
+            fail(error, error_size,
+                 "cannot allocate ConvRot activation arena: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -1627,19 +1688,33 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
+    dit->convrot = h3_weight_find(dit->weights, "adaln_t_table", NULL) != NULL;
+    if (dit->convrot &&
+        (active_blocks != H3_DIT_BLOCKS || core_reuse_interval != 1 ||
+         token_reduction || ssd_streaming || use_int8_row_fc2)) {
+        fail(error, error_size,
+             "ConvRot checkpoint requires 50 layers, core reuse 1, and no "
+             "token reduction, SSD streaming, or row-FC2 override");
+        goto failed;
+    }
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
-    dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
+    if (dit->convrot && !h3_gpu_has_int8_mlp(dit->gpu)) {
+        fail(error, error_size,
+             "ConvRot checkpoint requires Apple Metal INT8 tensor support");
+        goto failed;
+    }
+    dit->int8_mlp = dit->convrot || (!dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
-                    h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
+                    h3_gpu_has_int8_mlp(dit->gpu));
+    dit->int8_qkv = dit->convrot || (!dit->ssd_streaming && !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
-                    h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_attention_out = !dit->ssd_streaming &&
+                    h3_gpu_has_int8_mlp(dit->gpu));
+    dit->int8_attention_out = dit->convrot || (!dit->ssd_streaming &&
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
-                              h3_gpu_has_int8_mlp(dit->gpu);
+                              h3_gpu_has_int8_mlp(dit->gpu));
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
@@ -1898,7 +1973,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    if (dit->convrot) {
+        OP(h3_gpu_linear_convrot_int8_bf16(
+            dit->gpu, dit->qkv, dit->convrot_activation,
+            dit->int8_activation, dit->int8_activation_scales,
+            dit->mod_attention, weight->qkv_int8, weight->qkv_scales,
+            rows, HIDDEN, INNER * 3), "DiT ConvRot QKV projection");
+        OP(h3_gpu_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin,
+            rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "DiT ConvRot QKV norm/RoPE");
+    } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -1919,7 +2005,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
-    int head_major_attention_output = int8_attention_output &&
+    int head_major_attention_output = int8_attention_output && !dit->convrot &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
@@ -1933,7 +2019,13 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
-    if (int8_attention_output) {
+    if (dit->convrot) {
+        OP(h3_gpu_linear_convrot_int8_bf16(
+            dit->gpu, dit->attention_output, dit->convrot_activation,
+            dit->int8_activation, dit->int8_activation_scales,
+            dit->attention_heads, weight->out_int8, weight->out_scales,
+            rows, INNER, HIDDEN), "DiT ConvRot attention output");
+    } else if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
                 dit->gpu, dit->attention_output, dit->int8_activation,
@@ -1952,7 +2044,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
-    int fused_int8_mlp_input = dit->int8_mlp &&
+    int fused_int8_mlp_input = dit->int8_mlp && !dit->convrot &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
         !getenv("H3_INT8_MLP_STAGE");
@@ -1982,7 +2074,21 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->int8_mlp &&
+    if (dit->convrot) {
+        OP(h3_gpu_linear_convrot_int8_bf16(
+            dit->gpu, dit->fc1, dit->convrot_activation,
+            dit->int8_activation, dit->int8_activation_scales,
+            dit->mod_mlp, weight->fc1_int8, weight->fc1_scales,
+            rows, HIDDEN, FFN * 2), "DiT ConvRot MLP input");
+        OP(h3_gpu_swiglu_bf16(
+            dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "DiT ConvRot SwiGLU");
+        OP(h3_gpu_linear_convrot_int8_bf16(
+            dit->gpu, mlp_output, dit->convrot_activation,
+            dit->int8_activation, dit->int8_activation_scales,
+            dit->activated, weight->fc2_int8, weight->fc2_scales,
+            rows, FFN, HIDDEN), "DiT ConvRot MLP output");
+    } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
@@ -2016,7 +2122,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         h3_dit_block *next_weight = &dit->blocks[next_index];
         const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
             dit->schedule, next_index);
-        int fuse_int8_qkv_input = dit->int8_qkv &&
+        int fuse_int8_qkv_input = dit->int8_qkv && !dit->convrot &&
             !dit->use_slower_unfused_int8_inputs &&
             !getenv("H3_DISABLE_INT8_QKV") &&
             !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT");
@@ -3036,7 +3142,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);
-    FREE(int8_activation_scales); FREE(final_audio_input);
+    FREE(int8_activation_scales); FREE(convrot_activation);
+    FREE(final_audio_input);
     FREE(final_video_input); FREE(final_audio_inverse);
     FREE(final_video_inverse); FREE(final_audio_norm); FREE(final_video_norm);
     FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);

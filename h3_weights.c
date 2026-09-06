@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct h3_weight_store {
     h3_st_header *headers;
@@ -44,9 +45,39 @@ h3_weight_store *h3_weight_store_open(const char *directory,
         fail(error, error_size, "weight directory is required");
         return NULL;
     }
-    DIR *stream = opendir(directory);
+    struct stat status;
+    if (stat(directory, &status) != 0) {
+        fail(error, error_size, "cannot stat weight path: %s", directory);
+        return NULL;
+    }
+    DIR *stream = S_ISDIR(status.st_mode) ? opendir(directory) : NULL;
+    if (S_ISREG(status.st_mode)) {
+        if (!safetensors_name(directory)) {
+            fail(error, error_size, "weight file is not safetensors: %s",
+                 directory);
+            return NULL;
+        }
+        h3_weight_store *store = calloc(1, sizeof(*store));
+        if (!store) {
+            fail(error, error_size, "out of memory creating weight store");
+            return NULL;
+        }
+        store->headers = calloc(1, sizeof(*store->headers));
+        if (!store->headers) {
+            free(store);
+            fail(error, error_size, "out of memory allocating weight header");
+            return NULL;
+        }
+        store->count = 1;
+        if (!h3_st_read_header(directory, store->headers, error, error_size)) {
+            h3_weight_store_free(store);
+            return NULL;
+        }
+        return store;
+    }
     if (!stream) {
-        fail(error, error_size, "cannot open weight directory: %s", directory);
+        fail(error, error_size, "weight path is not a file or directory: %s",
+             directory);
         return NULL;
     }
     char **paths = NULL;
@@ -174,11 +205,19 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
         fail(error, error_size, "weight %s is too large for this process", name);
         return NULL;
     }
-    h3_gpu_tensor *result = dtype == H3_DTYPE_BF16 ?
-        h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
-                                (size_t)elements) :
-        h3_gpu_tensor_load_f32(gpu, header->path, tensor->file_offset,
-                               (size_t)elements);
+    h3_gpu_tensor *result = NULL;
+    if (dtype == H3_DTYPE_BF16)
+        result = h3_gpu_tensor_load_bf16(
+            gpu, header->path, tensor->file_offset, (size_t)elements);
+    else if (dtype == H3_DTYPE_F32)
+        result = h3_gpu_tensor_load_f32(
+            gpu, header->path, tensor->file_offset, (size_t)elements);
+    else if (dtype == H3_DTYPE_F16)
+        result = h3_gpu_tensor_load_f16(
+            gpu, header->path, tensor->file_offset, (size_t)elements);
+    else if (dtype == H3_DTYPE_I8)
+        result = h3_gpu_tensor_load_i8(
+            gpu, header->path, tensor->file_offset, (size_t)elements);
     if (!result) {
         fail(error, error_size, "cannot load %s: %s", name, h3_gpu_error(gpu));
     }
@@ -199,4 +238,49 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   char *error, size_t error_size) {
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F32,
                        error, error_size);
+}
+
+h3_gpu_tensor *h3_weight_load_f16(const h3_weight_store *store, h3_gpu *gpu,
+                                  const char *name, int ndim,
+                                  const uint64_t *shape,
+                                  char *error, size_t error_size) {
+    return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F16,
+                       error, error_size);
+}
+
+h3_gpu_tensor *h3_weight_load_i8(const h3_weight_store *store, h3_gpu *gpu,
+                                 const char *name, int ndim,
+                                 const uint64_t *shape,
+                                 char *error, size_t error_size) {
+    return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_I8,
+                       error, error_size);
+}
+
+int h3_weight_match_u8(const h3_weight_store *store, const char *name,
+                       const uint8_t *expected, size_t expected_size,
+                       char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || !header) {
+        fail(error, error_size, "required metadata is absent: %s", name);
+        return 0;
+    }
+    if (tensor->dtype != H3_DTYPE_U8 || tensor->ndim != 1 ||
+        tensor->shape[0] != expected_size || (!expected && expected_size)) {
+        fail(error, error_size, "metadata %s has an unexpected schema", name);
+        return 0;
+    }
+    uint8_t *actual = expected_size ? malloc(expected_size) : NULL;
+    if (expected_size && !actual) {
+        fail(error, error_size, "out of memory validating metadata %s", name);
+        return 0;
+    }
+    int ok = h3_st_read_data(header, tensor, actual, expected_size,
+                             error, error_size) &&
+             (!expected_size || memcmp(actual, expected, expected_size) == 0);
+    free(actual);
+    if (!ok && error && error_size && !error[0])
+        fail(error, error_size, "metadata %s does not describe ConvRot INT8",
+             name);
+    return ok;
 }
