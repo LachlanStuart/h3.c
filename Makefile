@@ -101,7 +101,8 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
-	h3_real_multimodal_text_test h3_real_ref_video_text_test
+	h3_real_multimodal_text_test h3_real_ref_video_text_test \
+	h3_semantic_vae_test
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -176,6 +177,29 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		./h3_real_ref_video_text_test; \
 	else \
 		echo "skip: Ref2VA video presentation fixture is not installed"; \
+	fi
+	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors && \
+	         test -f misc/fixtures/h3_semantic_256x22_seed42.safetensors; then \
+		./h3_semantic_vae_test; \
+	else \
+		echo "skip: FP16 VideoVAE direct-decode fixture is not installed"; \
+	fi
+	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors && \
+	         test -f misc/fixtures/h3_semantic_256x22_seed42.safetensors && \
+	         test -f misc/fixtures/h3_real_video_vae_256x288_f32.safetensors; then \
+		./h3_semantic_vae_test MiniMax-H3 \
+			misc/fixtures/h3_semantic_256x22_seed42.safetensors --tiled-smoke; \
+	else \
+		echo "skip: FP16 VideoVAE tiled-decode fixture is not installed"; \
+	fi
+	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors && \
+	         test -f misc/fixtures/h3_semantic_256x22_seed42.safetensors && \
+	         test -f misc/fixtures/h3_real_video_vae_256x256x39_f32.safetensors; then \
+		./h3_semantic_vae_test MiniMax-H3 \
+			misc/fixtures/h3_semantic_256x22_seed42.safetensors --chunked-smoke; \
+		./h3_semantic_vae_test --resident-preview MiniMax-H3; \
+	else \
+		echo "skip: FP16 VideoVAE temporal/resident fixture is not installed"; \
 	fi
 
 parity: h3_metal_tests h3_bf16_tests h3_text_tests
