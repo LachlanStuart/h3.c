@@ -50,6 +50,8 @@ static void test_resident_preview(const char *model_root) {
         TEST_PIXELS = 3 * TEST_FRAMES * HEIGHT * WIDTH
     };
     char error[512];
+    if (setenv("H3_VIDEO_DECODER_FP16", "1", 1))
+        die("cannot enable resident FP16 VAE test mode");
     h3_st_header fixture;
     if (!h3_st_read_header(
             "misc/fixtures/h3_real_video_vae_256x256x39_f32.safetensors",
@@ -115,12 +117,22 @@ int main(int argc, char **argv) {
     float *want = load_f32(&fixture, "x.frames", FRAME_COUNT);
     char weights[1024];
     snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
+    /* This test is the model-backed 7-token/22-frame direct FP16 regression.
+     * Force the tested mode so a caller's shell cannot silently test F32. */
+    if (setenv("H3_VIDEO_DECODER_FP16", "1", 1))
+        die("cannot enable FP16 VideoVAE test mode");
     h3_video_frames got;
     if (!h3_video_vae_decode(weights, "h3_shaders.metal", latent,
                              LATENT_T, LATENT_H, LATENT_W, progress, NULL,
                              &got, error, sizeof(error))) die(error);
     if (got.frames != FRAMES || got.height != HEIGHT || got.width != WIDTH)
         die("semantic VAE returned the wrong shape");
+    /* LATENT_T is seven, so this exercises h3_video_vae_decode's direct
+     * one-tile route rather than the two-token diagnostic or tiled decoder.
+     * The FP16 route has one resident-weight conversion and one decode
+     * submission; sequence packing is a compute kernel, never a blit. */
+    if (got.gpu_stats.submissions != 2 || got.gpu_stats.blit_copies != 0)
+        die("seven-token direct FP16 VAE violated its GPU transfer contract");
     double maximum = 0.0, scale = 0.0, square_error = 0.0, square_value = 0.0;
     for (int frame = 0; frame < FRAMES; frame++)
         for (int y = 0; y < HEIGHT; y++)
@@ -149,6 +161,31 @@ int main(int argc, char **argv) {
            (double)got.gpu_stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0),
            got.gpu_stats.gpu_seconds,
            (unsigned long long)got.gpu_stats.submissions);
+    float *fp16_rgb = malloc((size_t)FRAME_COUNT * sizeof(*fp16_rgb));
+    if (!fp16_rgb) die("out of memory retaining FP16 decode for comparison");
+    memcpy(fp16_rgb, got.rgb, (size_t)FRAME_COUNT * sizeof(*fp16_rgb));
+    h3_video_frames f32;
+    if (setenv("H3_VIDEO_DECODER_FP16", "0", 1) ||
+        !h3_video_vae_decode(weights, "h3_shaders.metal", latent,
+                             LATENT_T, LATENT_H, LATENT_W, progress, NULL,
+                             &f32, error, sizeof(error)))
+        die("cannot run F32 seven-token VideoVAE comparison");
+    double fp16_f32_error = 0.0, fp16_f32_value = 0.0;
+    for (size_t index = 0; index < FRAME_COUNT; index++) {
+        double delta = (double)fp16_rgb[index] - (double)f32.rgb[index];
+        fp16_f32_error += delta * delta;
+        fp16_f32_value += (double)f32.rgb[index] * (double)f32.rgb[index];
+    }
+    double fp16_f32_l2 = sqrt(fp16_f32_error /
+        (fp16_f32_value > 1e-24 ? fp16_f32_value : 1e-24));
+    printf("seven-token FP16/F32 RGB rel-L2 %.6g\n", fp16_f32_l2);
+    if (f32.frames != FRAMES || f32.height != HEIGHT || f32.width != WIDTH ||
+        fp16_f32_l2 >= 0.03)
+        die("seven-token FP16 VideoVAE exceeds F32 tolerance");
+    free(fp16_rgb);
+    h3_video_frames_free(&f32);
+    if (setenv("H3_VIDEO_DECODER_FP16", "1", 1))
+        die("cannot restore FP16 VideoVAE test mode");
     h3_video_frames_free(&got);
     if (argc > 3 && !strcmp(argv[3], "--tiled-smoke")) {
         enum { TILED_W = 18, TILED_COUNT = 24 * LATENT_T * LATENT_H * TILED_W };
