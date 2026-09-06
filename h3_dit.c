@@ -1051,9 +1051,12 @@ static int run_refiner_block(h3_dit *dit, unsigned adapter_block,
                            HIDDEN, INNER * 3), "refiner QKV");
     for (unsigned part = ADAPTER_Q; part <= ADAPTER_V; part++)
         if (!adapter_apply(dit, &dit->adapter.refiner[adapter_block][part],
-            norm, qkv, rows, (int)part, 1, error, error_size, "refiner QKV adapter"))
+            norm, qkv, rows, (int)part, !dit->convrot, error, error_size, "refiner QKV adapter"))
             return 0;
-    OP(h3_gpu_grouped_qkv_rope_bf16(
+    /* Comfy stores contiguous Q/K/V in both the core and text refiner;
+     * native BF16 shards group Q/K/V per head. Mixing these layouts destroys
+     * text conditioning even though every tensor remains finite. */
+    OP((dit->convrot ? h3_gpu_qkv_rope_bf16 : h3_gpu_grouped_qkv_rope_bf16)(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
                              rows, HEADS, HEAD_DIM, 0, 1e-5f),

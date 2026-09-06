@@ -60,6 +60,11 @@ h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
 h3_convrot_tests: tests/test_convrot.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# The test compiles h3_dit.c directly to exercise its private text-refiner
+# dispatch.  Do not also link h3_dit.o, whose public symbols would duplicate it.
+h3_refiner_layout_test: tests/test_refiner_layout.o $(filter-out h3_dit.o,$(LIB_OBJ))
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -130,7 +135,7 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_mutex_tests h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests h3_bf16_tests \
+test: h3_mutex_tests h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests h3_bf16_tests h3_refiner_layout_test \
 	h3_convrot_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 	h3_real_audio_encoder_test \
@@ -148,6 +153,13 @@ test: h3_mutex_tests h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests
 	./h3_latent_io_tests
 	./h3_latent_upscale_tests
 	./h3_convrot_tests
+	@if test -f MiniMax-H3/FL2VA/transformer/model.safetensors.index.json && \
+	         test -f ../models/comfy-int8/minimax_h3_fl2va_pruned_int8_convrot.safetensors; then \
+		./h3_refiner_layout_test MiniMax-H3/FL2VA/transformer \
+			../models/comfy-int8/minimax_h3_fl2va_pruned_int8_convrot.safetensors; \
+	else \
+		echo "skip: BF16/ConvRot text-refiner comparison weights are not installed"; \
+	fi
 	./h3_video_encoder_fp16_test
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
@@ -267,6 +279,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_latent_decode h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests \
 		h3_bf16_tests h3_convrot_tests h3_tokenizer_tests \
+		h3_refiner_layout_test \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 		h3_real_audio_encoder_test \
