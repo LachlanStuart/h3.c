@@ -433,6 +433,34 @@ static int adapter_load_pdd_heads(h3_dit *dit, const h3_params *params,
     return 1;
 }
 
+/* The same temporary LoRA projections serve text refinement and DiT blocks.
+ * A retained model can release a geometry session between inline stages, so
+ * callers must prepare this workspace again before either kind of dispatch. */
+static int adapter_prepare_scratch(h3_dit *dit, size_t rows, const char *stage,
+                                   char *error, size_t error_size) {
+    if (!dit->adapter.runtime) return 1;
+    unsigned rank = h3_adapter_runtime_rank(dit->adapter.runtime);
+    if (!rows || !rank || rows > SIZE_MAX / rank ||
+        rows > SIZE_MAX / ((size_t)FFN * 2)) {
+        fail(error, error_size, "invalid %s adapter workspace dimensions",
+             stage ? stage : "runtime");
+        return 0;
+    }
+    free_tensor(&dit->adapter_rank);
+    free_tensor(&dit->adapter_delta);
+    dit->adapter_rank = h3_gpu_tensor_new_bf16(dit->gpu, rows * rank);
+    dit->adapter_delta = h3_gpu_tensor_new_bf16(dit->gpu,
+        rows * (size_t)FFN * 2);
+    if (!dit->adapter_rank || !dit->adapter_delta) {
+        free_tensor(&dit->adapter_rank);
+        free_tensor(&dit->adapter_delta);
+        fail(error, error_size, "cannot allocate %s adapter workspace: %s",
+             stage ? stage : "runtime", h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    return 1;
+}
+
 static int configure_adapter(h3_dit *dit, const h3_params *params,
                              char *error, size_t error_size) {
     if (!params || params->adapter_kind == H3_ADAPTER_NONE) return 1;
@@ -445,15 +473,8 @@ static int configure_adapter(h3_dit *dit, const h3_params *params,
         params->adapter_kind, params->adapter_strength, error, error_size);
     if (!dit->adapter.runtime || !adapter_load_factors(dit, error, error_size)) return 0;
     /* Token refinement runs before geometry-specific activations exist. */
-    dit->adapter_rank = h3_gpu_tensor_new_bf16(dit->gpu,
-        (size_t)dit->text_rows * h3_adapter_runtime_rank(dit->adapter.runtime));
-    dit->adapter_delta = h3_gpu_tensor_new_bf16(dit->gpu,
-        (size_t)dit->text_rows * FFN * 2);
-    if (!dit->adapter_rank || !dit->adapter_delta) {
-        fail(error, error_size, "cannot allocate token-refiner adapter buffers: %s",
-             h3_gpu_error(dit->gpu));
-        return 0;
-    }
+    if (!adapter_prepare_scratch(dit, dit->text_rows, "token-refiner", error,
+                                 error_size)) return 0;
     if (params->adapter_kind == H3_ADAPTER_ALIBABA_PAI_PDD) {
         /* PDD heads replace the final dense heads. Keep their inputs visible
          * to the ordinary final projection path and preserve BF16 arithmetic. */
@@ -479,6 +500,8 @@ static int adapter_apply(h3_dit *dit, const h3_dit_adapter_factor *factor,
                          char *error,
                          size_t error_size, const char *label) {
     if (!factor || !factor->down) return 1;
+    float scale = h3_adapter_runtime_scale(dit->adapter.runtime);
+    if (scale == 0.0f) return 1;
     unsigned rank = h3_adapter_runtime_rank(dit->adapter.runtime);
     size_t elements = (size_t)rows * factor->output;
     if (!dit->adapter_rank || !dit->adapter_delta ||
@@ -487,7 +510,6 @@ static int adapter_apply(h3_dit *dit, const h3_dit_adapter_factor *factor,
             label) || !gpu_op(dit, h3_gpu_linear_bf16(dit->gpu,
             dit->adapter_delta, dit->adapter_rank, factor->up, NULL, rows,
             rank, factor->output), error, error_size, label)) return 0;
-    float scale = h3_adapter_runtime_scale(dit->adapter.runtime);
     if (scale != 1.0f && !gpu_op(dit, h3_gpu_scale_bf16(dit->gpu,
             dit->adapter_delta, dit->adapter_delta, scale, (uint32_t)elements),
             error, error_size, label)) return 0;
@@ -1729,17 +1751,8 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         return 0;
     }
     if (dit->adapter.runtime) {
-        free_tensor(&dit->adapter_rank);
-        free_tensor(&dit->adapter_delta);
-        dit->adapter_rank = h3_gpu_tensor_new_bf16(dit->gpu,
-            activation_sequence * h3_adapter_runtime_rank(dit->adapter.runtime));
-        dit->adapter_delta = h3_gpu_tensor_new_bf16(dit->gpu,
-            activation_sequence * FFN * 2);
-        if (!dit->adapter_rank || !dit->adapter_delta) {
-            fail(error, error_size, "cannot allocate runtime adapter buffers: %s",
-                 h3_gpu_error(dit->gpu));
-            return 0;
-        }
+        if (!adapter_prepare_scratch(dit, activation_sequence, "DiT", error,
+                                     error_size)) return 0;
     }
     if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         dit->final_audio_input = h3_gpu_tensor_new_bf16(
@@ -2195,6 +2208,11 @@ int h3_dit_reconfigure_conditioned(
         goto failed;
     }
     dit->sigmas = *sigmas;
+    /* free_session() releases geometry-sized temporary tensors.  The adapter
+     * factors remain resident, but target text refinement needs its own
+     * workspace before allocate_activations() later resizes it for DiT rows. */
+    if (!adapter_prepare_scratch(dit, dit->text_rows, "target token-refiner",
+                                 error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
@@ -3805,6 +3823,10 @@ static void free_session(h3_dit *dit) {
     free(dit->reduced_row_maps);
     free(dit->final_audio_maps);
     free(dit->final_video_maps);
+    dit->row_maps = NULL;
+    dit->reduced_row_maps = NULL;
+    dit->final_audio_maps = NULL;
+    dit->final_video_maps = NULL;
     free_tensor(&dit->refined_text);
     free_tensor(&dit->rope_cos);
     free_tensor(&dit->rope_sin);
