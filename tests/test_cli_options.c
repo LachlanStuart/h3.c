@@ -44,6 +44,12 @@ int main(void) {
     expect_command("-d /not-a-model -p test --adapter fake.safetensors "
                    "--adapter-profile modeltc-fl2va-544-4 --scheduler beta",
                    2, "conflicts with an explicitly supplied");
+    /* A ModelTC profile accepts an explicit evaluation count. The expected
+     * failure is the deliberately nonexistent model directory, proving the
+     * CLI did not reject the 6-step ablation as a profile conflict. */
+    expect_command("-d /not-a-model -p test --adapter fake.safetensors "
+                   "--adapter-profile modeltc-fl2va-768-8 --steps 6",
+                   1, "missing required model file");
     expect_command("-d /not-a-model -p test --adapter-strength 0", 2,
                    "require --adapter-profile");
     expect_command("-d /not-a-model -p test --target-width 1024", 2,

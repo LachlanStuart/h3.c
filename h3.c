@@ -580,27 +580,33 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
                          "adapter path requires a named profile");
             return 0;
         }
+        int modeltc = h3_adapter_profile_is_modeltc(params->adapter_profile);
         if (params->adapter_kind != expected.adapter_kind ||
             params->sampler != expected.sampler ||
             params->scheduler != expected.scheduler ||
-            params->steps != expected.steps ||
+            (!modeltc && params->steps != expected.steps) ||
             fabsf(params->video_shift - expected.video_shift) > 1e-6f ||
             fabsf(params->audio_shift - expected.audio_shift) > 1e-6f) {
             h3_set_error(ctx, "runtime adapter parameters must match its named profile");
             return 0;
         }
-        if (params->refine_video_path || params->inline_refine ||
-            params->dit_layers != H3_DEFAULT_DIT_LAYERS ||
+        if ((params->refine_video_path || params->inline_refine) && !modeltc) {
+            h3_set_error(ctx,
+                "only ModelTC Turbo adapters support restart refinement");
+            return 0;
+        }
+        if (params->dit_layers != H3_DEFAULT_DIT_LAYERS ||
             params->core_reuse != 1 || params->denoise_reuse != 1 ||
             params->token_reduction || params->ssd_streaming ||
             params->use_int8_row_fc2) {
             h3_set_error(ctx,
                 "runtime adapters require a base generation with 50 DiT layers, "
-                "reuse 1, no token reduction, SSD streaming, row-FC2, or restart");
+                "reuse 1, no token reduction, SSD streaming, or row-FC2");
             return 0;
         }
         int ref_profile = params->adapter_profile ==
                 H3_ADAPTER_PROFILE_MODELTC_REF2VA_544_4 ||
+            params->adapter_profile == H3_ADAPTER_PROFILE_MODELTC_REF2VA_768_8 ||
             params->adapter_profile == H3_ADAPTER_PROFILE_PAI_REF2VA_8;
         if (ref_profile && !params->reference_count) {
             h3_set_error(ctx, "Ref2VA adapter profiles require at least one reference");
@@ -2200,12 +2206,30 @@ h3_result *h3_generate_inline_production(
     ctx->error[0] = '\0';
     const h3_params *working_input = &production->working;
     const h3_params *target_input = &production->target;
-    if (working_input->adapter_path || target_input->adapter_path ||
-        working_input->adapter_kind != H3_ADAPTER_NONE ||
-        target_input->adapter_kind != H3_ADAPTER_NONE ||
-        working_input->adapter_profile != H3_ADAPTER_PROFILE_NONE ||
-        target_input->adapter_profile != H3_ADAPTER_PROFILE_NONE) {
-        h3_set_error(ctx, "inline production does not yet support runtime adapters");
+    /* The target is derived below from the working request. ModelTC factors
+     * live in the resident DiT and survive geometry reconfiguration, so the
+     * same adapter is valid for both stages. PAI's schedule-indexed heads do
+     * not have that property and remain intentionally unsupported here. */
+    if ((working_input->adapter_profile != H3_ADAPTER_PROFILE_NONE &&
+         !h3_adapter_profile_is_modeltc(working_input->adapter_profile)) ||
+        (target_input->adapter_profile != H3_ADAPTER_PROFILE_NONE &&
+         !h3_adapter_profile_is_modeltc(target_input->adapter_profile))) {
+        h3_set_error(ctx,
+            "inline production supports ModelTC Turbo adapters, not PAI PDD");
+        return NULL;
+    }
+    if ((target_input->adapter_path &&
+         (!working_input->adapter_path ||
+          strcmp(target_input->adapter_path, working_input->adapter_path))) ||
+        (target_input->adapter_profile != H3_ADAPTER_PROFILE_NONE &&
+         target_input->adapter_profile != working_input->adapter_profile) ||
+        (target_input->adapter_kind != H3_ADAPTER_NONE &&
+         target_input->adapter_kind != working_input->adapter_kind) ||
+        (target_input->adapter_strength != 0.0f &&
+         fabsf(target_input->adapter_strength - working_input->adapter_strength) >
+             1e-6f)) {
+        h3_set_error(ctx,
+            "inline production target adapter must match the working adapter");
         return NULL;
     }
     if (!production->upscaler_script || !*production->upscaler_script ||

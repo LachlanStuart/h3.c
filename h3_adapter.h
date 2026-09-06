@@ -11,11 +11,17 @@
 int h3_adapter_profile_parse(const char *name, h3_adapter_profile *profile);
 const char *h3_adapter_profile_name(h3_adapter_profile profile);
 
-/* Set the complete trained sampling contract. The caller must reject a
- * conflicting explicitly supplied sampler/scheduler/step/shift before it
- * calls this helper; this function cannot know which params were defaults. */
+/* Set the trained sampler/scheduler/shift contract. ModelTC Turbo profiles
+ * deliberately leave `steps` untouched so callers can evaluate the adapter
+ * at a chosen count; their names retain the published nominal count for
+ * provenance. PAI PDD still pins its published count. */
 int h3_adapter_profile_apply(h3_params *params, char *error,
                              size_t error_size);
+
+/* The published nominal count is a CLI default. ModelTC users may explicitly
+ * choose another count, while PAI PDD may not. */
+int h3_adapter_profile_default_steps(h3_adapter_profile profile);
+int h3_adapter_profile_is_modeltc(h3_adapter_profile profile);
 
 /* Published PDD plan: the N fine intervals are grouped into blocks of L.
  * The result has N entries, zero outside `coarse_step * L .. + L`, and sums

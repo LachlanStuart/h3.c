@@ -86,8 +86,9 @@ static void usage(const char *program) {
         "      --adapter-profile P  Turbo profile: modeltc-fl2va-544-4,\n"
         "                           modeltc-fl2va-544-8, modeltc-fl2va-768-4,\n"
         "                           modeltc-fl2va-768-8, modeltc-ref2va-544-4,\n"
-        "                           pai-fl2va-8, or pai-ref2va-8\n"
+        "                           modeltc-ref2va-768-8, pai-fl2va-8, or pai-ref2va-8\n"
         "      --adapter-strength F  LoRA strength (default: 1)\n"
+        "                           ModelTC profiles permit --steps N; PAI is fixed\n"
         "      --video-shift F    Video sigma shift (default: 12)\n"
         "      --audio-shift F    Audio sigma shift (default: 3)\n"
         "Inline production options:\n"
@@ -752,6 +753,9 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (params.adapter_profile != H3_ADAPTER_PROFILE_NONE) {
+        if (!steps_given && h3_adapter_profile_is_modeltc(params.adapter_profile))
+            params.steps = h3_adapter_profile_default_steps(
+                params.adapter_profile);
         h3_params profiled = params;
         char error[256];
         if (!h3_adapter_profile_apply(&profiled, error, sizeof(error))) {
@@ -760,7 +764,8 @@ int main(int argc, char **argv) {
         }
         if ((sampler_given && params.sampler != profiled.sampler) ||
             (scheduler_given && params.scheduler != profiled.scheduler) ||
-            (steps_given && params.steps != profiled.steps) ||
+            (!h3_adapter_profile_is_modeltc(params.adapter_profile) &&
+             steps_given && params.steps != profiled.steps) ||
             (video_shift_given &&
              fabsf(params.video_shift - profiled.video_shift) > 1e-6f) ||
             (audio_shift_given &&

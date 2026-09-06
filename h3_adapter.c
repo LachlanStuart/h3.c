@@ -33,6 +33,8 @@ static const h3_adapter_profile_info profiles[] = {
      H3_ADAPTER_MODELTC_TURBO, 8, 6.0f, 3.0f},
     {"modeltc-ref2va-544-4", H3_ADAPTER_PROFILE_MODELTC_REF2VA_544_4,
      H3_ADAPTER_MODELTC_TURBO, 4, 12.0f, 3.0f},
+    {"modeltc-ref2va-768-8", H3_ADAPTER_PROFILE_MODELTC_REF2VA_768_8,
+     H3_ADAPTER_MODELTC_TURBO, 8, 12.0f, 3.0f},
     {"pai-fl2va-8", H3_ADAPTER_PROFILE_PAI_FL2VA_8,
      H3_ADAPTER_ALIBABA_PAI_PDD, 8, 12.0f, 3.0f},
     {"pai-ref2va-8", H3_ADAPTER_PROFILE_PAI_REF2VA_8,
@@ -74,6 +76,16 @@ const char *h3_adapter_profile_name(h3_adapter_profile profile) {
     return info ? info->name : NULL;
 }
 
+int h3_adapter_profile_default_steps(h3_adapter_profile profile) {
+    const h3_adapter_profile_info *info = profile_info(profile);
+    return info ? info->steps : 0;
+}
+
+int h3_adapter_profile_is_modeltc(h3_adapter_profile profile) {
+    const h3_adapter_profile_info *info = profile_info(profile);
+    return info && info->kind == H3_ADAPTER_MODELTC_TURBO;
+}
+
 int h3_adapter_profile_apply(h3_params *params, char *error,
                              size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -102,7 +114,11 @@ int h3_adapter_profile_apply(h3_params *params, char *error,
     params->adapter_kind = info->kind;
     params->sampler = H3_SAMPLER_EULER;
     params->scheduler = H3_SCHEDULER_SIMPLE;
-    params->steps = info->steps;
+    /* ModelTC's published files are named for their nominal 4/8-step
+     * profiles, but their LoRA factors do not encode a fixed evaluation
+     * count. Preserve an explicit caller choice for ablations and restart
+     * suffixes. PAI PDD's heads are schedule-indexed and must stay at 8. */
+    if (info->kind == H3_ADAPTER_ALIBABA_PAI_PDD) params->steps = info->steps;
     params->video_shift = info->video_shift;
     params->audio_shift = info->audio_shift;
     return 1;

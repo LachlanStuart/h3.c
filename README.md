@@ -490,15 +490,16 @@ their dense AdaLN updates do not fit the pruned ConvRot time embedding.
 | --- | ---: | --- |
 | `modeltc-fl2va-544-4`, `modeltc-fl2va-544-8` | 4 / 8 | 12 / 3 |
 | `modeltc-fl2va-768-4`, `modeltc-fl2va-768-8` | 4 / 8 | 6 / 3 |
-| `modeltc-ref2va-544-4` | 4 | 12 / 3 |
+| `modeltc-ref2va-544-4`, `modeltc-ref2va-768-8` | 4 / 8 | 12 / 3 |
 | `pai-fl2va-8`, `pai-ref2va-8` | 8 | 12 / 3 |
 
 All profiles use Euler/simple, 50 blocks, reuse 1, and core-reuse 1. Profile
-selection supplies those defaults. Explicit conflicting step, sampler, grid,
-or shift arguments are errors. `--adapter-strength` defaults to 1; PAI requires
-exactly 1. Select an adapter file matching the profile's task, resolution and
-evaluation count. File schema validation does not establish that a differently
-trained adapter has the same sampling contract.
+selection supplies those defaults. ModelTC names retain the published nominal
+count, but `--steps` may select another count for an explicit ablation; sampler,
+grid, and shift arguments still must match. PAI remains fixed at eight
+evaluations. `--adapter-strength` defaults to 1; PAI requires exactly 1.
+Select an adapter file matching the profile's task and resolution. File schema
+validation does not establish quality at an untested ModelTC count.
 
 ```sh
 ./h3 -d ../models/compact \
@@ -508,10 +509,13 @@ trained adapter has the same sampling contract.
   --width 1280 --height 704 --frames 124 -o outputs/compass.mp4
 ```
 
-Adapters are currently for complete, ordinary denoising trajectories; restart,
-inline Production and approximate block/reuse modes reject them. The older
-`tools/fold_turbo_lora.py` remains an offline experiment for its specific Larry
-adapter format. It is not the runtime path and cannot substitute for PDD heads.
+ModelTC factors remain resident through restart refinement and inline
+Production's geometry reconfiguration. Both stages use the same loaded factors;
+the target may therefore be a suffix of a schedule independent of the working
+trajectory's count. PAI's schedule-indexed heads and approximate block/reuse
+modes remain rejected on those paths. The older `tools/fold_turbo_lora.py`
+remains an offline experiment for its specific Larry adapter format. It is not
+the runtime path and cannot substitute for PDD heads.
 
 ## Inline learned latent upscale
 

@@ -32,12 +32,14 @@ static void test_profile_contracts(void) {
     h3_params params = H3_PARAMS_DEFAULT;
     params.adapter_path = "adapter.safetensors";
     params.adapter_profile = profile;
+    params.steps = 6;
     char error[256];
     CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
     CHECK(params.adapter_kind == H3_ADAPTER_MODELTC_TURBO);
     CHECK(params.sampler == H3_SAMPLER_EULER);
     CHECK(params.scheduler == H3_SCHEDULER_SIMPLE);
-    CHECK(params.steps == 4);
+    CHECK(params.steps == 6);
+    CHECK(h3_adapter_profile_default_steps(profile) == 4);
     CHECK(close_enough(params.video_shift, 6.0f));
     CHECK(close_enough(params.audio_shift, 3.0f));
     params.adapter_strength = 0.0f;
@@ -53,6 +55,16 @@ static void test_profile_contracts(void) {
     CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
     CHECK(params.adapter_kind == H3_ADAPTER_ALIBABA_PAI_PDD);
     CHECK(params.steps == 8 && params.scheduler == H3_SCHEDULER_SIMPLE);
+
+    CHECK(h3_adapter_profile_parse("modeltc-ref2va-768-8", &profile));
+    CHECK(profile == H3_ADAPTER_PROFILE_MODELTC_REF2VA_768_8);
+    CHECK(h3_adapter_profile_default_steps(profile) == 8);
+    params = (h3_params)H3_PARAMS_DEFAULT;
+    params.adapter_path = "ref.safetensors";
+    params.adapter_profile = profile;
+    params.steps = 3;
+    CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
+    CHECK(params.steps == 3 && close_enough(params.video_shift, 12.0f));
 
     params = (h3_params)H3_PARAMS_DEFAULT;
     params.adapter_path = "unexpected.safetensors";
@@ -132,7 +144,9 @@ static void test_public_parameter_validation(void) {
     params = (h3_params)H3_PARAMS_DEFAULT;
     params.adapter_path = "adapter.safetensors";
     params.adapter_profile = H3_ADAPTER_PROFILE_MODELTC_FL2VA_768_4;
+    params.steps = 3;
     CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
+    CHECK(params.steps == 3);
     params.scheduler = H3_SCHEDULER_BETA;
     expect_public_rejection(&params, "must match");
     CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
@@ -140,8 +154,10 @@ static void test_public_parameter_validation(void) {
     expect_public_rejection(&params, "reuse 1");
     CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
     params.core_reuse = 1;
+    params.adapter_profile = H3_ADAPTER_PROFILE_PAI_FL2VA_8;
+    CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
     params.refine_video_path = "source.mp4";
-    expect_public_rejection(&params, "no token reduction");
+    expect_public_rejection(&params, "only ModelTC");
 
     params = (h3_params)H3_PARAMS_DEFAULT;
     params.video_shift = 0.0f;
@@ -160,6 +176,33 @@ static void test_public_parameter_validation(void) {
     CHECK(h3_adapter_profile_apply(&params, error, sizeof(error)));
     params.reference_count = 1;
     expect_public_rejection(&params, "cannot be used with references");
+}
+
+static void test_inline_adapter_gates(void) {
+    char error[256];
+    h3_ctx *ctx = calloc(1, sizeof(*ctx));
+    CHECK(ctx != NULL);
+    if (!ctx) return;
+    h3_production_params production = {
+        .working = H3_PARAMS_DEFAULT,
+        .target = H3_PARAMS_DEFAULT
+    };
+    production.working.adapter_path = "adapter.safetensors";
+    production.working.adapter_profile = H3_ADAPTER_PROFILE_PAI_FL2VA_8;
+    CHECK(h3_adapter_profile_apply(&production.working, error, sizeof(error)));
+    production.target = production.working;
+    CHECK(h3_generate_inline_production(ctx, "adapter validation", &production) == NULL);
+    CHECK(strstr(h3_last_error(ctx), "not PAI PDD") != NULL);
+
+    production.working = (h3_params)H3_PARAMS_DEFAULT;
+    production.working.adapter_path = "adapter.safetensors";
+    production.working.adapter_profile = H3_ADAPTER_PROFILE_MODELTC_FL2VA_768_8;
+    production.working.steps = 8;
+    CHECK(h3_adapter_profile_apply(&production.working, error, sizeof(error)));
+    production.target = production.working;
+    CHECK(h3_generate_inline_production(ctx, "adapter validation", &production) == NULL);
+    CHECK(strstr(h3_last_error(ctx), "requires upscaler") != NULL);
+    free(ctx);
 }
 
 static void test_shifted_grids(void) {
@@ -209,5 +252,6 @@ int main(void) {
     test_published_modeltc_file();
     test_published_pai_file();
     test_public_parameter_validation();
+    test_inline_adapter_gates();
     return failures ? 1 : 0;
 }
