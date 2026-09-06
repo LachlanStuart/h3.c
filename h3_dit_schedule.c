@@ -1,4 +1,5 @@
 #include "h3_dit_schedule.h"
+#include "h3_adapter.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -279,10 +280,10 @@ cleanup:
     return result;
 }
 
-h3_dit_schedule *h3_dit_schedule_precompute(
+h3_dit_schedule *h3_dit_schedule_precompute_adapter(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
-    int audio_condition,
+    int audio_condition, const h3_adapter_runtime *adapter,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -322,6 +323,8 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     times = NULL;
     if (!time) goto failed;
 
+    if (adapter && h3_adapter_runtime_kind(adapter) != H3_ADAPTER_ALIBABA_PAI_PDD)
+        adapter = NULL;
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         char weight_name[128], bias_name[128], operation[128];
         snprintf(weight_name, sizeof(weight_name),
@@ -362,6 +365,38 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         if (!ok) {
             h3_gpu_tensor_free(time);
             goto failed;
+        }
+        if (adapter) {
+            char down_name[160], up_name[160];
+            snprintf(down_name, sizeof(down_name),
+                "transformer_blocks.%u.adaln_proj.linear.lora_down", block);
+            snprintf(up_name, sizeof(up_name),
+                "transformer_blocks.%u.adaln_proj.linear.lora_up", block);
+            unsigned rank = h3_adapter_runtime_rank(adapter);
+            h3_gpu_tensor *down = h3_adapter_runtime_load_bf16(adapter, gpu,
+                down_name, rank, H3_DIT_TIME_DIM, error, error_size);
+            h3_gpu_tensor *up = down ? h3_adapter_runtime_load_bf16(adapter, gpu,
+                up_name, BLOCK_OUTPUT, rank, error, error_size) : NULL;
+            h3_gpu_tensor *rank_values = down ? h3_gpu_tensor_new_bf16(gpu,
+                (size_t)schedule->time_rows * rank) : NULL;
+            h3_gpu_tensor *delta = up ? h3_gpu_tensor_new_bf16(gpu,
+                (size_t)schedule->time_rows * BLOCK_OUTPUT) : NULL;
+            ok = down && up && rank_values && delta && h3_gpu_begin(gpu) &&
+                h3_gpu_linear_bf16(gpu, rank_values, time, down, NULL,
+                    schedule->time_rows, H3_DIT_TIME_DIM, rank) &&
+                h3_gpu_linear_bf16(gpu, delta, rank_values, up, NULL,
+                    schedule->time_rows, rank, BLOCK_OUTPUT) &&
+                h3_gpu_add_bf16(gpu, schedule->blocks[block],
+                    schedule->blocks[block], delta,
+                    schedule->time_rows * BLOCK_OUTPUT) && h3_gpu_submit(gpu);
+            free_tensor(&down); free_tensor(&up); free_tensor(&rank_values);
+            free_tensor(&delta);
+            if (!ok) {
+                if (!error || !*error) fail(error, error_size,
+                    "cannot apply AdaLN runtime adapter block %u: %s", block,
+                    h3_gpu_error(gpu));
+                h3_gpu_tensor_free(time); goto failed;
+            }
         }
         if (progress) progress((int)block + 1, (int)H3_DIT_BLOCKS,
                                progress_opaque);
@@ -408,6 +443,16 @@ failed:
     free(times);
     h3_dit_schedule_free(schedule);
     return NULL;
+}
+
+h3_dit_schedule *h3_dit_schedule_precompute(
+    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_sigma_schedule *sigmas, int visual_condition, int audio_condition,
+    h3_dit_schedule_progress progress, void *progress_opaque,
+    char *error, size_t error_size) {
+    return h3_dit_schedule_precompute_adapter(weights, gpu, sigmas,
+        visual_condition, audio_condition, NULL, progress, progress_opaque,
+        error, error_size);
 }
 
 void h3_dit_schedule_free(h3_dit_schedule *schedule) {

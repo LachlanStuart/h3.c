@@ -1,4 +1,5 @@
 #include "h3.h"
+#include "h3_adapter.h"
 #include "h3_cli.h"
 #include "h3_ffmpeg.h"
 #include "h3_host.h"
@@ -79,6 +80,28 @@ static void usage(const char *program) {
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
         program, program, program);
+    fputs(
+        "Turbo adapter options:\n"
+        "      --adapter PATH     Runtime LoRA safetensors adapter\n"
+        "      --adapter-profile P  Turbo profile: modeltc-fl2va-544-4,\n"
+        "                           modeltc-fl2va-544-8, modeltc-fl2va-768-4,\n"
+        "                           modeltc-fl2va-768-8, modeltc-ref2va-544-4,\n"
+        "                           pai-fl2va-8, or pai-ref2va-8\n"
+        "      --adapter-strength F  LoRA strength (default: 1)\n"
+        "      --video-shift F    Video sigma shift (default: 12)\n"
+        "      --audio-shift F    Audio sigma shift (default: 3)\n"
+        "Inline production options:\n"
+        "      --inline-production  Run low-resolution generation and latent\n"
+        "                           upsample/restart refinement in one process\n"
+        "      --target-width N   Inline-production output width\n"
+        "      --target-height N  Inline-production output height\n"
+        "      --target-sampler S Inline-production sampler: euler or res\n"
+        "      --target-scheduler S  Inline-production sigma grid: beta or simple\n"
+        "      --upscaler-python PATH  Python executable for latent upscaling\n"
+        "      --upscaler-script PATH  Latent upscaler script\n"
+        "      --upscaler-source PATH  Latent upscaler source directory\n"
+        "      --upscaler-checkpoint PATH  Latent upscaler checkpoint\n",
+        stderr);
 }
 
 static int parse_int(const char *value, const char *label) {
@@ -90,6 +113,28 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static float parse_positive_float(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    float parsed = strtof(value, &end);
+    if (errno || !end || *end || !isfinite(parsed) || parsed <= 0.0f) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return parsed;
+}
+
+static float parse_nonnegative_float(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    float parsed = strtof(value, &end);
+    if (errno || !end || *end || !isfinite(parsed) || parsed < 0.0f) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return parsed;
 }
 
 static h3_scheduler parse_scheduler(const char *value) {
@@ -296,12 +341,19 @@ int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_DIT_CHECKPOINT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_SAMPLER, OPT_SCHEDULER, OPT_REUSE,
+           OPT_ADAPTER, OPT_ADAPTER_PROFILE, OPT_ADAPTER_STRENGTH,
+           OPT_VIDEO_SHIFT, OPT_AUDIO_SHIFT,
            OPT_AUDIO_ONLY,
            OPT_VIDEO_CODEC, OPT_VIDEO_PRESET, OPT_VIDEO_CRF,
            OPT_LOSSLESS_OUTPUT, OPT_LATENT_OUTPUT,
            OPT_REFINE_VIDEO, OPT_REFINE_LATENT,
            OPT_RESTART_STEPS, OPT_RESTART_SCHEDULE_STEPS,
            OPT_FREEZE_AUDIO,
+           OPT_INLINE_PRODUCTION,
+           OPT_TARGET_WIDTH, OPT_TARGET_HEIGHT, OPT_TARGET_SAMPLER,
+           OPT_TARGET_SCHEDULER,
+           OPT_UPSCALER_PYTHON, OPT_UPSCALER_SCRIPT, OPT_UPSCALER_SOURCE,
+           OPT_UPSCALER_CHECKPOINT,
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
@@ -338,6 +390,11 @@ int main(int argc, char **argv) {
         {"steps", required_argument, NULL, OPT_STEPS},
         {"sampler", required_argument, NULL, OPT_SAMPLER},
         {"scheduler", required_argument, NULL, OPT_SCHEDULER},
+        {"adapter", required_argument, NULL, OPT_ADAPTER},
+        {"adapter-profile", required_argument, NULL, OPT_ADAPTER_PROFILE},
+        {"adapter-strength", required_argument, NULL, OPT_ADAPTER_STRENGTH},
+        {"video-shift", required_argument, NULL, OPT_VIDEO_SHIFT},
+        {"audio-shift", required_argument, NULL, OPT_AUDIO_SHIFT},
         {"audio-only", no_argument, NULL, OPT_AUDIO_ONLY},
         {"video-codec", required_argument, NULL, OPT_VIDEO_CODEC},
         {"video-preset", required_argument, NULL, OPT_VIDEO_PRESET},
@@ -349,6 +406,15 @@ int main(int argc, char **argv) {
         {"restart-steps", required_argument, NULL, OPT_RESTART_STEPS},
         {"restart-schedule-steps", required_argument, NULL, OPT_RESTART_SCHEDULE_STEPS},
         {"freeze-audio", no_argument, NULL, OPT_FREEZE_AUDIO},
+        {"inline-production", no_argument, NULL, OPT_INLINE_PRODUCTION},
+        {"target-width", required_argument, NULL, OPT_TARGET_WIDTH},
+        {"target-height", required_argument, NULL, OPT_TARGET_HEIGHT},
+        {"target-sampler", required_argument, NULL, OPT_TARGET_SAMPLER},
+        {"target-scheduler", required_argument, NULL, OPT_TARGET_SCHEDULER},
+        {"upscaler-python", required_argument, NULL, OPT_UPSCALER_PYTHON},
+        {"upscaler-script", required_argument, NULL, OPT_UPSCALER_SCRIPT},
+        {"upscaler-source", required_argument, NULL, OPT_UPSCALER_SOURCE},
+        {"upscaler-checkpoint", required_argument, NULL, OPT_UPSCALER_CHECKPOINT},
         {"reuse", required_argument, NULL, OPT_REUSE},
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
@@ -413,6 +479,25 @@ int main(int argc, char **argv) {
     int seconds_given = 0;
     int output_given = 0;
     int seed_given = 0;
+    int steps_given = 0;
+    int sampler_given = 0;
+    int scheduler_given = 0;
+    int video_shift_given = 0;
+    int audio_shift_given = 0;
+    int adapter_strength_given = 0;
+    int inline_production = 0;
+    int target_width_given = 0;
+    int target_height_given = 0;
+    int target_sampler_given = 0;
+    int target_scheduler_given = 0;
+    int target_width = 0;
+    int target_height = 0;
+    h3_sampler target_sampler = H3_SAMPLER_EULER;
+    h3_scheduler target_scheduler = H3_SCHEDULER_BETA;
+    const char *upscaler_python = NULL;
+    const char *upscaler_script = NULL;
+    const char *upscaler_source = NULL;
+    const char *upscaler_checkpoint = NULL;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
@@ -437,9 +522,38 @@ int main(int argc, char **argv) {
                 params.frames = frames_from_seconds(optarg);
                 seconds_given = 1;
                 break;
-            case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
-            case OPT_SAMPLER: params.sampler = parse_sampler(optarg); break;
-            case OPT_SCHEDULER: params.scheduler = parse_scheduler(optarg); break;
+            case OPT_STEPS:
+                params.steps = parse_int(optarg, "steps");
+                steps_given = 1;
+                break;
+            case OPT_SAMPLER:
+                params.sampler = parse_sampler(optarg);
+                sampler_given = 1;
+                break;
+            case OPT_SCHEDULER:
+                params.scheduler = parse_scheduler(optarg);
+                scheduler_given = 1;
+                break;
+            case OPT_ADAPTER: params.adapter_path = optarg; break;
+            case OPT_ADAPTER_PROFILE:
+                if (!h3_adapter_profile_parse(optarg, &params.adapter_profile)) {
+                    fprintf(stderr, "h3: unknown adapter profile: %s\n", optarg);
+                    return 2;
+                }
+                break;
+            case OPT_ADAPTER_STRENGTH:
+                params.adapter_strength = parse_nonnegative_float(
+                    optarg, "adapter strength");
+                adapter_strength_given = 1;
+                break;
+            case OPT_VIDEO_SHIFT:
+                params.video_shift = parse_positive_float(optarg, "video shift");
+                video_shift_given = 1;
+                break;
+            case OPT_AUDIO_SHIFT:
+                params.audio_shift = parse_positive_float(optarg, "audio shift");
+                audio_shift_given = 1;
+                break;
             case OPT_AUDIO_ONLY: params.audio_only = 1; break;
             case OPT_VIDEO_CODEC:
                 params.video_codec = parse_video_codec(optarg);
@@ -460,9 +574,35 @@ int main(int argc, char **argv) {
             case OPT_LATENT_OUTPUT: params.latent_output_path = optarg; break;
             case OPT_REFINE_VIDEO: params.refine_video_path = optarg; break;
             case OPT_REFINE_LATENT: params.refine_latent_path = optarg; break;
-            case OPT_RESTART_STEPS: params.restart_steps = parse_int(optarg, "restart steps"); break;
-            case OPT_RESTART_SCHEDULE_STEPS: params.restart_schedule_steps = parse_int(optarg, "restart schedule steps"); break;
+            case OPT_RESTART_STEPS:
+                params.restart_steps = parse_int(optarg, "restart steps");
+                break;
+            case OPT_RESTART_SCHEDULE_STEPS:
+                params.restart_schedule_steps = parse_int(
+                    optarg, "restart schedule steps");
+                break;
             case OPT_FREEZE_AUDIO: params.freeze_audio = 1; break;
+            case OPT_INLINE_PRODUCTION: inline_production = 1; break;
+            case OPT_TARGET_WIDTH:
+                target_width = parse_int(optarg, "target width");
+                target_width_given = 1;
+                break;
+            case OPT_TARGET_HEIGHT:
+                target_height = parse_int(optarg, "target height");
+                target_height_given = 1;
+                break;
+            case OPT_TARGET_SAMPLER:
+                target_sampler = parse_sampler(optarg);
+                target_sampler_given = 1;
+                break;
+            case OPT_TARGET_SCHEDULER:
+                target_scheduler = parse_scheduler(optarg);
+                target_scheduler_given = 1;
+                break;
+            case OPT_UPSCALER_PYTHON: upscaler_python = optarg; break;
+            case OPT_UPSCALER_SCRIPT: upscaler_script = optarg; break;
+            case OPT_UPSCALER_SOURCE: upscaler_source = optarg; break;
+            case OPT_UPSCALER_CHECKPOINT: upscaler_checkpoint = optarg; break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
@@ -605,6 +745,69 @@ int main(int argc, char **argv) {
             "h3: --audio-only cannot be combined with --frames-dir\n");
         return 2;
     }
+    if (params.adapter_profile == H3_ADAPTER_PROFILE_NONE &&
+        (params.adapter_path || adapter_strength_given)) {
+        fprintf(stderr,
+            "h3: --adapter and --adapter-strength require --adapter-profile\n");
+        return 2;
+    }
+    if (params.adapter_profile != H3_ADAPTER_PROFILE_NONE) {
+        h3_params profiled = params;
+        char error[256];
+        if (!h3_adapter_profile_apply(&profiled, error, sizeof(error))) {
+            fprintf(stderr, "h3: %s\n", error);
+            return 2;
+        }
+        if ((sampler_given && params.sampler != profiled.sampler) ||
+            (scheduler_given && params.scheduler != profiled.scheduler) ||
+            (steps_given && params.steps != profiled.steps) ||
+            (video_shift_given &&
+             fabsf(params.video_shift - profiled.video_shift) > 1e-6f) ||
+            (audio_shift_given &&
+             fabsf(params.audio_shift - profiled.audio_shift) > 1e-6f)) {
+            fprintf(stderr,
+                "h3: --adapter-profile conflicts with an explicitly supplied "
+                "sampler, scheduler, steps, or sigma shift\n");
+            return 2;
+        }
+        params = profiled;
+    }
+    int inline_option_given = target_width_given || target_height_given ||
+        target_sampler_given || target_scheduler_given || upscaler_python ||
+        upscaler_script || upscaler_source || upscaler_checkpoint;
+    if (!inline_production && inline_option_given) {
+        fprintf(stderr,
+            "h3: target and upscaler options require --inline-production\n");
+        return 2;
+    }
+    if (inline_production) {
+        if (!prompt) {
+            fprintf(stderr,
+                "h3: --inline-production requires --prompt\n");
+            return 2;
+        }
+        if (params.audio_only || params.refine_video_path ||
+            params.refine_latent_path || params.freeze_audio ||
+            params.latent_output_path) {
+            fprintf(stderr,
+                "h3: --inline-production cannot be combined with --audio-only, "
+                "--refine-video, --refine-latent, --freeze-audio, or "
+                "--latent-output\n");
+            return 2;
+        }
+        if (!target_width_given || !target_height_given) {
+            fprintf(stderr,
+                "h3: --inline-production requires --target-width and "
+                "--target-height\n");
+            return 2;
+        }
+        if (!upscaler_script || !upscaler_source || !upscaler_checkpoint) {
+            fprintf(stderr,
+                "h3: --inline-production requires --upscaler-script, "
+                "--upscaler-source, and --upscaler-checkpoint\n");
+            return 2;
+        }
+    }
     if (prompt && params.sampler == H3_SAMPLER_EULER &&
         params.steps >= 2 && params.steps <= 7 &&
         params.denoise_reuse > 1) {
@@ -653,7 +856,34 @@ int main(int argc, char **argv) {
         }
         cli.render_clock_active =
             clock_gettime(CLOCK_MONOTONIC, &cli.render_begin) == 0;
-        h3_result *result = h3_generate(ctx, prompt, &params);
+        h3_result *result = NULL;
+        if (inline_production) {
+            h3_production_params production = {
+                .working = params,
+                .target = params,
+                .upscaler_python = upscaler_python,
+                .upscaler_script = upscaler_script,
+                .upscaler_source = upscaler_source,
+                .upscaler_checkpoint = upscaler_checkpoint
+            };
+            /* The working pass stays latent-only. The target owns delivery. */
+            production.working.output_path = NULL;
+            production.working.latent_output_path = NULL;
+            production.working.restart_steps = 0;
+            production.working.restart_schedule_steps = 0;
+            production.target.width = target_width;
+            production.target.height = target_height;
+            if (target_sampler_given)
+                production.target.sampler = target_sampler;
+            if (target_scheduler_given)
+                production.target.scheduler = target_scheduler;
+            /* Render dimensions belong to the working pass, never the target. */
+            production.target.render_width = 0;
+            production.target.render_height = 0;
+            result = h3_generate_inline_production(ctx, prompt, &production);
+        } else {
+            result = h3_generate(ctx, prompt, &params);
+        }
         if (!result) {
             if (cli.active) fputc('\n', stderr);
             fprintf(stderr, "h3: %s\n", h3_last_error(ctx));

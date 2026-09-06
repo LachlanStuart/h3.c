@@ -478,48 +478,71 @@ consume or renumber reference slots:
   -o outputs/hybrid.mp4
 ```
 
-## Distilled sampling: fold the Turbo LoRA into the checkpoint
+## Runtime acceleration adapters
 
-h3.c does not implement a LoRA runtime; step-distillation adapters can instead
-be folded into the checkpoint before inference. `tools/fold_turbo_lora.py`
-applies
-[larryvrh/MiniMax-H3-Turbo-Lora](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
-directly to the bf16 shards. The adapter file,
-`minimax_h3_turbo_v4_step600_ema.safetensors`, is Apache-2.0 and remains subject
-to the MiniMax H3 Community License as a derivative. The tool clones the
-original shards and patches only the affected byte ranges. The headers and
-tensor order remain unchanged, as does their alignment:
+Use `--adapter PATH --adapter-profile NAME` to load an acceleration adapter
+without writing a merged checkpoint. Ordinary ModelTC Turbo factors work with
+the matching BF16 or pruned INT8 ConvRot base. Alibaba PAI's Acc profiles also
+apply their dynamic video/audio output heads and require full BF16 weights;
+their dense AdaLN updates do not fit the pruned ConvRot time embedding.
+
+| Profile | Evaluations | Video/audio shifts |
+| --- | ---: | --- |
+| `modeltc-fl2va-544-4`, `modeltc-fl2va-544-8` | 4 / 8 | 12 / 3 |
+| `modeltc-fl2va-768-4`, `modeltc-fl2va-768-8` | 4 / 8 | 6 / 3 |
+| `modeltc-ref2va-544-4` | 4 | 12 / 3 |
+| `pai-fl2va-8`, `pai-ref2va-8` | 8 | 12 / 3 |
+
+All profiles use Euler/simple, 50 blocks, reuse 1, and core-reuse 1. Profile
+selection supplies those defaults. Explicit conflicting step, sampler, grid,
+or shift arguments are errors. `--adapter-strength` defaults to 1; PAI requires
+exactly 1. Select an adapter file matching the profile's task, resolution and
+evaluation count. File schema validation does not establish that a differently
+trained adapter has the same sampling contract.
 
 ```sh
-python3 tools/fold_turbo_lora.py \
-  --checkpoint ./MiniMax-H3/FL2VA/transformer \
-  --lora ./minimax_h3_turbo_v4_step600_ema.safetensors \
-  --out ./MiniMax-H3-turbo/FL2VA/transformer
+./h3 -d ../models/compact \
+  --adapter ../models/adapters/MiniMax-H3-FL2VA-Acc-8Step.safetensors \
+  --adapter-profile pai-fl2va-8 \
+  -p "A brass compass rotates slowly on a wooden desk." \
+  --width 1280 --height 704 --frames 124 -o outputs/compass.mp4
 ```
 
-The output directory must not already exist. The tool validates every adapter
-pair and target shape first, builds in a sibling staging directory, and only
-publishes the completed checkpoint after all patches pass their parity checks.
+Adapters are currently for complete, ordinary denoising trajectories; restart,
+inline Production and approximate block/reuse modes reject them. The older
+`tools/fold_turbo_lora.py` remains an offline experiment for its specific Larry
+adapter format. It is not the runtime path and cannot substitute for PDD heads.
 
-Point `-d` at a model directory whose `FL2VA/transformer` contains the folded
-tree; everything else can be symlinked to the original snapshot. Sample with
-`--steps 5` or `--steps 6` and no other speed flags. The distilled schedule
-removes the redundancy used by `--reuse` and `--core-reuse`, so neither option
-should be combined with it. On fast action, 4 steps showed motion smear; 5 is
-the validated floor.
+## Inline learned latent upscale
 
-Cold single-shot measurements on an M5 Max used 960x544 and an identical prompt
-and seed. The comparison is against the tutorial's
-`--steps 20 --reuse 2 --layers 45` preset:
+`--inline-production` runs a working trajectory, streams its video latent
+through the existing MPS sidecar, and restart-refines at an exact 2x canvas.
+It keeps the DiT weights resident through both stages and replaces only the
+geometry/schedule state. The working video and audio latents stay in memory;
+there is no low-resolution video decode, latent checkpoint, or audio
+decode/re-encode handoff. Only the final target video and retained audio are
+decoded and muxed.
 
-| | balanced preset | folded turbo, 6 steps |
-|---|---:|---:|
-| 39 frames | 87s | 65s |
-| 124-frame (5 s) clip | 8.8min | 6.2min |
+```sh
+./h3 -d ../models/compact \
+  --dit-checkpoint ../models/comfy-int8/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  -p "A brass compass rotates slowly on a wooden desk." \
+  --width 512 --height 256 --frames 56 --steps 20 \
+  --sampler euler --scheduler beta --inline-production \
+  --target-width 1024 --target-height 512 \
+  --target-sampler euler --target-scheduler beta \
+  --restart-steps 5 --restart-schedule-steps 15 \
+  --upscaler-script tools/h3_mps_sidecar.py \
+  --upscaler-source /path/to/published/upscaler.py \
+  --upscaler-checkpoint /path/to/upscaler.safetensors \
+  --profile -o outputs/compass-production.mp4
+```
 
-On the clips tested, quality at 5-6 steps was comparable to the balanced preset,
-with sharper fine detail as the adapter's card advertises. An interactive
-session also amortizes transformer loading and text encoding across renders.
+The executable sidecar uses its uv shebang by default. An optional
+`--upscaler-python PATH` selects an existing compatible interpreter instead.
+The target sampler/grid default to the working selections when omitted.
+Unlike standalone `--refine-video`, inline mode conditions the target directly
+on the clean audio latent and encodes AAC only for final delivery.
 
 ## Tests and runtime requirements
 
@@ -951,8 +974,9 @@ measured 256-thread kernel. `--use-slower-grouped-quantizer` forces the latter
 at every size for A/B comparison.
 
 The native baseline targets the original `FL2VA/` and `Ref2VA/` checkpoint
-trees. Model phases are loaded and released separately so the 33B transformer,
-Qwen encoder, and decoders never have to coexist in unified memory.
+trees. Ordinary uncached generation releases model phases separately. Inline
+Production retains the DiT across its two denoising stages and final delivery;
+budget its resident weights alongside the upscaler and decoder allocations.
 
 The community hybrid ConvRot checkpoint
 `minimax_h3_hybrid_fl2va_ref2va_b20-49-int8.safetensors` is supported as an
@@ -975,3 +999,8 @@ rank-8 AdaLN curve schema. It requires all 50 blocks, disables core reuse,
 token reduction and SSD streaming, and requires Metal INT8 TensorOps. The I8
 matrices are memory-mapped directly on M5; per-row activation rotation,
 quantization, and projection remain on the GPU.
+The Comfy-Org `minimax_h3_fl2va_pruned_int8_convrot.safetensors` and
+`minimax_h3_ref2va_pruned_int8_convrot.safetensors` files use this same supported
+schema. They are 20.97 GB DiT-only files; keep the matching shared tokenizer,
+text encoder and VAEs in the model root. The unpruned INT8 and quantized text
+encoder packages use different representations and are not drop-in inputs.

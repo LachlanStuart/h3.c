@@ -742,6 +742,14 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
+int h3_gpu_scale_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, float scale,
+                      uint32_t elements);
+/* Add a [rows,width] branch into a component of row-major [rows,3*width]. */
+int h3_gpu_add_qkv_component_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *branch,
+                                  uint32_t rows, uint32_t width,
+                                  uint32_t component, int grouped_layout);
 int h3_gpu_add_f16(h3_gpu *gpu, h3_gpu_tensor *output,
                    const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                    uint32_t elements);

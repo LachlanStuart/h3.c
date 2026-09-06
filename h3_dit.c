@@ -1,6 +1,8 @@
 #include "h3_dit.h"
 
+#include "h3_adapter.h"
 #include "h3_dit_schedule.h"
+#include "h3_pdd.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -48,6 +50,23 @@ typedef struct {
     h3_gpu_tensor *fc2_scales;
 } h3_dit_block;
 
+enum { ADAPTER_Q, ADAPTER_K, ADAPTER_V, ADAPTER_OUT, ADAPTER_FC1,
+       ADAPTER_FC2, ADAPTER_ADALN, ADAPTER_TARGETS };
+
+typedef struct {
+    h3_gpu_tensor *down;
+    h3_gpu_tensor *up;
+    uint32_t input, output;
+} h3_dit_adapter_factor;
+
+typedef struct {
+    h3_adapter_runtime *runtime;
+    h3_dit_adapter_factor blocks[H3_DIT_BLOCKS][ADAPTER_TARGETS];
+    h3_dit_adapter_factor refiner[2][ADAPTER_TARGETS - 1];
+    h3_gpu_tensor *pdd_video_w[8], *pdd_video_b[8];
+    h3_gpu_tensor *pdd_audio_w[8], *pdd_audio_b[8];
+} h3_dit_adapter;
+
 enum {
     STREAM_QKV,
     STREAM_OUT,
@@ -71,6 +90,7 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    h3_dit_adapter adapter;
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
@@ -203,6 +223,8 @@ struct h3_dit {
      * GPU resident. */
     h3_gpu_tensor *previous_audio_denoised;
     h3_gpu_tensor *previous_video_denoised;
+    h3_gpu_tensor *adapter_rank;
+    h3_gpu_tensor *adapter_delta;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -243,6 +265,8 @@ static void free_tensor(h3_gpu_tensor **tensor) {
     *tensor = NULL;
 }
 
+static void free_session(h3_dit *dit);
+
 static h3_gpu_tensor *bf1(h3_dit *dit, const char *name, uint64_t width,
                           char *error, size_t error_size) {
     uint64_t shape[] = {width};
@@ -276,6 +300,202 @@ static h3_gpu_tensor *i82(h3_dit *dit, const char *name, uint64_t rows,
     uint64_t shape[] = {rows, columns};
     return h3_weight_load_i8(dit->weights, dit->gpu, name, 2, shape,
                              error, error_size);
+}
+
+static const char *adapter_target_name(unsigned target) {
+    static const char *names[] = {"attn.to_q", "attn.to_k", "attn.to_v",
+        "attn.to_out.0", "ff.net.0.proj", "ff.net.2", "adaln_proj.linear"};
+    return target < ADAPTER_TARGETS ? names[target] : NULL;
+}
+
+static void adapter_free(h3_dit *dit) {
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        for (unsigned target = 0; target < ADAPTER_TARGETS; target++) {
+            free_tensor(&dit->adapter.blocks[block][target].down);
+            free_tensor(&dit->adapter.blocks[block][target].up);
+        }
+    for (unsigned block = 0; block < 2; block++)
+        for (unsigned target = 0; target < ADAPTER_TARGETS - 1; target++) {
+            free_tensor(&dit->adapter.refiner[block][target].down);
+            free_tensor(&dit->adapter.refiner[block][target].up);
+        }
+    for (unsigned step = 0; step < 8; step++) {
+        free_tensor(&dit->adapter.pdd_video_w[step]);
+        free_tensor(&dit->adapter.pdd_video_b[step]);
+        free_tensor(&dit->adapter.pdd_audio_w[step]);
+        free_tensor(&dit->adapter.pdd_audio_b[step]);
+    }
+    h3_adapter_runtime_free(dit->adapter.runtime);
+    memset(&dit->adapter, 0, sizeof(dit->adapter));
+}
+
+static int adapter_load_factor(h3_dit *dit, h3_dit_adapter_factor *factor,
+                               const char *prefix, unsigned target,
+                               char *error, size_t error_size) {
+    const uint32_t inputs[] = {HIDDEN,HIDDEN,HIDDEN,INNER,HIDDEN,FFN,2688};
+    const uint32_t outputs[] = {INNER,INNER,INNER,HIDDEN,FFN * 2,HIDDEN,96768};
+    char down[224], up[224];
+    const char *tail = h3_adapter_runtime_kind(dit->adapter.runtime) ==
+        H3_ADAPTER_MODELTC_TURBO ? ".lora_A.default.weight" : ".lora_down";
+    const char *head = h3_adapter_runtime_kind(dit->adapter.runtime) ==
+        H3_ADAPTER_MODELTC_TURBO ? ".lora_B.default.weight" : ".lora_up";
+    snprintf(down, sizeof(down), "%s%s%s", prefix, adapter_target_name(target), tail);
+    snprintf(up, sizeof(up), "%s%s%s", prefix, adapter_target_name(target), head);
+    unsigned rank = h3_adapter_runtime_rank(dit->adapter.runtime);
+    factor->down = h3_adapter_runtime_load_bf16(dit->adapter.runtime, dit->gpu,
+        down, rank, inputs[target], error, error_size);
+    factor->up = factor->down ? h3_adapter_runtime_load_bf16(
+        dit->adapter.runtime, dit->gpu, up, outputs[target], rank,
+        error, error_size) : NULL;
+    factor->input = inputs[target]; factor->output = outputs[target];
+    return factor->down && factor->up;
+}
+
+static int adapter_load_factors(h3_dit *dit, char *error, size_t error_size) {
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        char prefix[72];
+        snprintf(prefix, sizeof(prefix), "transformer_blocks.%u.", block);
+        for (unsigned target = 0; target < ADAPTER_TARGETS - 1; target++) {
+            if (!adapter_load_factor(dit, &dit->adapter.blocks[block][target],
+                                     prefix, target, error, error_size)) return 0;
+        }
+    }
+    for (unsigned block = 0; block < 2; block++) {
+        char prefix[96];
+        snprintf(prefix, sizeof(prefix), "token_refiner.refiner_blocks.%u.", block);
+        for (unsigned target = 0; target < ADAPTER_TARGETS - 1; target++)
+            if (!adapter_load_factor(dit, &dit->adapter.refiner[block][target],
+                                     prefix, target, error, error_size)) return 0;
+    }
+    fprintf(stderr, "h3: runtime adapter applied 600 DiT and 24 text-refiner "
+            "factor tensors%s\n",
+            h3_adapter_runtime_kind(dit->adapter.runtime) == H3_ADAPTER_ALIBABA_PAI_PDD ?
+            " plus 100 AdaLN factors and dynamic PDD heads" : "");
+    return 1;
+}
+
+static int adapter_load_pdd_heads(h3_dit *dit, const h3_params *params,
+                                  char *error, size_t error_size) {
+    const h3_st_header *header = h3_adapter_runtime_header(dit->adapter.runtime);
+    const h3_st_tensor *vw = h3_adapter_runtime_tensor(dit->adapter.runtime,
+        H3_PDD_VIDEO_WEIGHT_NAME), *vb = h3_adapter_runtime_tensor(
+        dit->adapter.runtime, H3_PDD_VIDEO_BIAS_NAME), *aw =
+        h3_adapter_runtime_tensor(dit->adapter.runtime, H3_PDD_AUDIO_WEIGHT_NAME),
+        *ab = h3_adapter_runtime_tensor(dit->adapter.runtime, H3_PDD_AUDIO_BIAS_NAME);
+    size_t video_w_count = (size_t)H3_PDD_HEAD_STEPS * VIDEO_PATCH * HIDDEN;
+    size_t audio_w_count = (size_t)H3_PDD_HEAD_STEPS * AUDIO_CHANNELS * HIDDEN;
+    uint16_t *video_w = malloc(video_w_count * sizeof(*video_w));
+    uint16_t *audio_w = malloc(audio_w_count * sizeof(*audio_w));
+    uint16_t video_b[H3_PDD_HEAD_STEPS * VIDEO_PATCH];
+    uint16_t audio_b[H3_PDD_HEAD_STEPS * AUDIO_CHANNELS];
+    if (!header || !video_w || !audio_w || !h3_st_read_data(header, vw, video_w,
+        video_w_count * sizeof(*video_w), error, error_size) ||
+        !h3_st_read_data(header, vb, video_b, sizeof(video_b), error, error_size) ||
+        !h3_st_read_data(header, aw, audio_w, audio_w_count * sizeof(*audio_w),
+                         error, error_size) || !h3_st_read_data(header, ab,
+        audio_b, sizeof(audio_b), error, error_size)) {
+        free(video_w); free(audio_w); return 0;
+    }
+    for (unsigned coarse = 0; coarse < 8; coarse++) {
+        float video_plan[H3_PDD_HEAD_STEPS], audio_plan[H3_PDD_HEAD_STEPS];
+        size_t vw_one = (size_t)VIDEO_PATCH * HIDDEN;
+        size_t aw_one = (size_t)AUDIO_CHANNELS * HIDDEN;
+        uint16_t *fvw = malloc(vw_one * sizeof(*fvw));
+        uint16_t *fav = malloc((size_t)VIDEO_PATCH * sizeof(*fav));
+        uint16_t *faw = malloc(aw_one * sizeof(*faw));
+        uint16_t *faa = malloc((size_t)AUDIO_CHANNELS * sizeof(*faa));
+        int ok = fvw && fav && faw && faa && h3_adapter_pdd_plan(
+            params->video_shift, H3_PDD_HEAD_STEPS, 4, coarse, video_plan,
+            H3_PDD_HEAD_STEPS, error, error_size) && h3_adapter_pdd_plan(
+            params->audio_shift, H3_PDD_HEAD_STEPS, 4, coarse, audio_plan,
+            H3_PDD_HEAD_STEPS, error, error_size) && h3_pdd_head_fuse_bf16(
+            video_w, video_b, H3_PDD_HEAD_STEPS, VIDEO_PATCH, HIDDEN,
+            video_plan, H3_PDD_HEAD_STEPS, fvw, fav, error, error_size) &&
+            h3_pdd_head_fuse_bf16(audio_w, audio_b, H3_PDD_HEAD_STEPS,
+            AUDIO_CHANNELS, HIDDEN, audio_plan, H3_PDD_HEAD_STEPS, faw, faa,
+            error, error_size);
+        if (ok) {
+            dit->adapter.pdd_video_w[coarse] = h3_gpu_tensor_from_bf16(
+                dit->gpu, fvw, vw_one);
+            dit->adapter.pdd_video_b[coarse] = h3_gpu_tensor_from_bf16(
+                dit->gpu, fav, VIDEO_PATCH);
+            dit->adapter.pdd_audio_w[coarse] = h3_gpu_tensor_from_bf16(
+                dit->gpu, faw, aw_one);
+            dit->adapter.pdd_audio_b[coarse] = h3_gpu_tensor_from_bf16(
+                dit->gpu, faa, AUDIO_CHANNELS);
+            ok = dit->adapter.pdd_video_w[coarse] && dit->adapter.pdd_video_b[coarse]
+                && dit->adapter.pdd_audio_w[coarse] && dit->adapter.pdd_audio_b[coarse];
+        }
+        free(fvw); free(fav); free(faw); free(faa);
+        if (!ok) { free(video_w); free(audio_w); return 0; }
+    }
+    free(video_w); free(audio_w);
+    return 1;
+}
+
+static int configure_adapter(h3_dit *dit, const h3_params *params,
+                             char *error, size_t error_size) {
+    if (!params || params->adapter_kind == H3_ADAPTER_NONE) return 1;
+    if (!params->adapter_path || !*params->adapter_path) {
+        fail(error, error_size, "adapter profile requires an adapter path"); return 0;
+    }
+    if (params->adapter_kind == H3_ADAPTER_ALIBABA_PAI_PDD &&
+        !h3_pdd_require_full_bf16_base(dit->convrot, error, error_size)) return 0;
+    dit->adapter.runtime = h3_adapter_runtime_open(params->adapter_path,
+        params->adapter_kind, params->adapter_strength, error, error_size);
+    if (!dit->adapter.runtime || !adapter_load_factors(dit, error, error_size)) return 0;
+    /* Token refinement runs before geometry-specific activations exist. */
+    dit->adapter_rank = h3_gpu_tensor_new_bf16(dit->gpu,
+        (size_t)dit->text_rows * h3_adapter_runtime_rank(dit->adapter.runtime));
+    dit->adapter_delta = h3_gpu_tensor_new_bf16(dit->gpu,
+        (size_t)dit->text_rows * FFN * 2);
+    if (!dit->adapter_rank || !dit->adapter_delta) {
+        fail(error, error_size, "cannot allocate token-refiner adapter buffers: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    if (params->adapter_kind == H3_ADAPTER_ALIBABA_PAI_PDD) {
+        /* PDD heads replace the final dense heads. Keep their inputs visible
+         * to the ordinary final projection path and preserve BF16 arithmetic. */
+        dit->int8_qkv = dit->int8_mlp = dit->int8_attention_out = 0;
+        dit->fused_mlp = dit->nax_mlp = 0;
+        dit->bf16_final = 1;
+        if (!adapter_load_pdd_heads(dit, params, error, error_size)) return 0;
+    } else if (!dit->convrot) {
+        /* The base may remain quantized only when its output can be exposed;
+         * use dense BF16 projections for the activation-space LoRA addends. */
+        dit->int8_qkv = dit->int8_mlp = dit->int8_attention_out = 0;
+        dit->fused_mlp = dit->nax_mlp = 0;
+    }
+    return 1;
+}
+
+/* Adapter factors are evaluated from the original projection activation.  In
+ * particular ConvRot's base matrix sees its rotated activation, while this
+ * dense LoRA branch must see the unrotated tensor used by the source model. */
+static int adapter_apply(h3_dit *dit, const h3_dit_adapter_factor *factor,
+                         const h3_gpu_tensor *input, h3_gpu_tensor *output,
+                         uint32_t rows, int qkv_component, int qkv_grouped,
+                         char *error,
+                         size_t error_size, const char *label) {
+    if (!factor || !factor->down) return 1;
+    unsigned rank = h3_adapter_runtime_rank(dit->adapter.runtime);
+    size_t elements = (size_t)rows * factor->output;
+    if (!dit->adapter_rank || !dit->adapter_delta ||
+        !gpu_op(dit, h3_gpu_linear_bf16(dit->gpu, dit->adapter_rank, input,
+            factor->down, NULL, rows, factor->input, rank), error, error_size,
+            label) || !gpu_op(dit, h3_gpu_linear_bf16(dit->gpu,
+            dit->adapter_delta, dit->adapter_rank, factor->up, NULL, rows,
+            rank, factor->output), error, error_size, label)) return 0;
+    float strength = h3_adapter_runtime_strength(dit->adapter.runtime);
+    if (strength != 1.0f && !gpu_op(dit, h3_gpu_scale_bf16(dit->gpu,
+            dit->adapter_delta, dit->adapter_delta, strength, (uint32_t)elements),
+            error, error_size, label)) return 0;
+    return qkv_component >= 0 ? gpu_op(dit,
+        h3_gpu_add_qkv_component_bf16(dit->gpu, output, dit->adapter_delta,
+        rows, factor->output, (uint32_t)qkv_component, qkv_grouped), error, error_size,
+        label) : gpu_op(dit, h3_gpu_add_bf16(dit->gpu, output, output,
+        dit->adapter_delta, (uint32_t)elements), error, error_size, label);
 }
 
 static int copy_layout(h3_dit *dit, const h3_layout *layout,
@@ -813,7 +1033,8 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
-static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
+static int run_refiner_block(h3_dit *dit, unsigned adapter_block,
+                             const h3_dit_block *weight,
                              h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                              h3_gpu_tensor *qkv, h3_gpu_tensor *query,
                              h3_gpu_tensor *key, h3_gpu_tensor *value,
@@ -828,6 +1049,10 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              HIDDEN, 1e-5f), "refiner attention norm");
     OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
                            HIDDEN, INNER * 3), "refiner QKV");
+    for (unsigned part = ADAPTER_Q; part <= ADAPTER_V; part++)
+        if (!adapter_apply(dit, &dit->adapter.refiner[adapter_block][part],
+            norm, qkv, rows, (int)part, 1, error, error_size, "refiner QKV adapter"))
+            return 0;
     OP(h3_gpu_grouped_qkv_rope_bf16(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
@@ -838,16 +1063,22 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
        "refiner attention");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
                            INNER, HIDDEN), "refiner attention output");
+    if (!adapter_apply(dit, &dit->adapter.refiner[adapter_block][ADAPTER_OUT],
+        heads, branch, rows, -1, 0, error, error_size, "refiner output adapter")) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner attention residual");
     OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
                              HIDDEN, 1e-5f), "refiner MLP norm");
     OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
                            HIDDEN, FFN * 2), "refiner MLP input");
+    if (!adapter_apply(dit, &dit->adapter.refiner[adapter_block][ADAPTER_FC1],
+        norm, fc1, rows, -1, 0, error, error_size, "refiner FC1 adapter")) return 0;
     OP(h3_gpu_swiglu_bf16(dit->gpu, activated, fc1, rows, FFN),
        "refiner SwiGLU");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, activated, weight->fc2, NULL,
                            rows, FFN, HIDDEN), "refiner MLP output");
+    if (!adapter_apply(dit, &dit->adapter.refiner[adapter_block][ADAPTER_FC2],
+        activated, branch, rows, -1, 0, error, error_size, "refiner FC2 adapter")) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner MLP residual");
 #undef OP
@@ -902,10 +1133,10 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
              dit->gpu, dit->refined_text, source, condition_w, condition_b,
              dit->text_rows, TEXT_DIM, HIDDEN), error, error_size,
              "condition projection") &&
-         run_refiner_block(dit, &refiner[0], dit->refined_text, norm, qkv,
+         run_refiner_block(dit, 0, &refiner[0], dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
              error, error_size) &&
-         run_refiner_block(dit, &refiner[1], dit->refined_text, norm, qkv,
+         run_refiner_block(dit, 1, &refiner[1], dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
              error, error_size) &&
          gpu_op(dit, h3_gpu_rms_norm_bf16(
@@ -1411,6 +1642,11 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
 
 static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t sequence = dit->sequence;
+    /* ConvRot's cooperative INT8 projection uses 128-row tiles. Its
+     * semantic layout and every non-ConvRot operation retain `sequence`, but
+     * these internal BF16 projection buffers need a complete final tile. */
+    size_t activation_sequence = dit->convrot ?
+        (sequence + 127u) & ~(size_t)127u : sequence;
     size_t audio = dit->audio_rows;
     size_t video = dit->video_rows;
     size_t audio_total = dit->audio_total_rows;
@@ -1425,13 +1661,13 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     h3_gpu_tensor *all[] = {
         F32(video_input, video_total * VIDEO_PATCH),
         F32(audio_input, audio_total * AUDIO_CHANNELS),
-        BF(hidden, sequence * HIDDEN),
-        BF(mod_attention, sequence * HIDDEN),
-        BF(qkv, sequence * INNER * 3),
-        BF(query, sequence * INNER),
-        BF(key, sequence * INNER),
-        BF(value, sequence * INNER),
-        BF(attention_output, sequence * HIDDEN),
+        BF(hidden, activation_sequence * HIDDEN),
+        BF(mod_attention, activation_sequence * HIDDEN),
+        BF(qkv, activation_sequence * INNER * 3),
+        BF(query, activation_sequence * INNER),
+        BF(key, activation_sequence * INNER),
+        BF(value, activation_sequence * INNER),
+        BF(attention_output, activation_sequence * HIDDEN),
         F32(final_audio_inverse, audio),
         F32(final_video_inverse, video),
         BF(audio_output_bf16, audio * AUDIO_CHANNELS),
@@ -1476,11 +1712,11 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         dit->mlp_output = NULL;
     } else {
         dit->attention_heads = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * INNER);
+            dit->gpu, activation_sequence * INNER);
         dit->mod_mlp = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * HIDDEN);
+            dit->gpu, activation_sequence * HIDDEN);
         dit->mlp_output = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * HIDDEN);
+            dit->gpu, activation_sequence * HIDDEN);
     }
     if (!dit->attention_heads || !dit->mod_mlp ||
         (!dit->activation_aliases && !dit->mlp_output)) {
@@ -1488,6 +1724,19 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
              "cannot allocate DiT activation buffers: %s",
              h3_gpu_error(dit->gpu));
         return 0;
+    }
+    if (dit->adapter.runtime) {
+        free_tensor(&dit->adapter_rank);
+        free_tensor(&dit->adapter_delta);
+        dit->adapter_rank = h3_gpu_tensor_new_bf16(dit->gpu,
+            activation_sequence * h3_adapter_runtime_rank(dit->adapter.runtime));
+        dit->adapter_delta = h3_gpu_tensor_new_bf16(dit->gpu,
+            activation_sequence * FFN * 2);
+        if (!dit->adapter_rank || !dit->adapter_delta) {
+            fail(error, error_size, "cannot allocate runtime adapter buffers: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
     }
     if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
         dit->final_audio_input = h3_gpu_tensor_new_bf16(
@@ -1532,10 +1781,12 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     if (!dit->fused_mlp || dit->convrot) {
-        dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
+        dit->fc1 = h3_gpu_tensor_new_bf16(
+            dit->gpu, activation_sequence * FFN * 2);
     }
     if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp || dit->convrot) {
-        dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
+        dit->activated = h3_gpu_tensor_new_bf16(
+            dit->gpu, activation_sequence * FFN);
         if (((!dit->fused_mlp || dit->convrot) && !dit->fc1) ||
             !dit->activated) {
             fail(error, error_size,
@@ -1559,7 +1810,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     }
     if (dit->convrot) {
         dit->convrot_activation = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * FFN);
+            dit->gpu, activation_sequence * FFN);
         if (!dit->convrot_activation) {
             fail(error, error_size,
                  "cannot allocate ConvRot activation arena: %s",
@@ -1645,6 +1896,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_dynamic_fc1_k,
                         int use_slower_grouped_quantizer,
                         int use_int8_row_fc2,
+                        const h3_params *adapter_params,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -1696,6 +1948,9 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
     dit->convrot = h3_weight_find(dit->weights, "adaln_t_table", NULL) != NULL;
+    if (adapter_params && adapter_params->adapter_kind ==
+        H3_ADAPTER_ALIBABA_PAI_PDD && !h3_pdd_require_full_bf16_base(
+            dit->convrot, error, error_size)) goto failed;
     if (dit->convrot &&
         (active_blocks != H3_DIT_BLOCKS || core_reuse_interval != 1 ||
          token_reduction || ssd_streaming || use_int8_row_fc2)) {
@@ -1746,14 +2001,15 @@ static h3_dit *load_dit(const char *weight_directory,
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
+    if (!configure_adapter(dit, adapter_params, error, error_size)) goto failed;
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
     schedule_progress schedule_state = {progress, progress_opaque};
-    dit->schedule = h3_dit_schedule_precompute(
+    dit->schedule = h3_dit_schedule_precompute_adapter(
         dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
+        dit->audio_condition_rows != 0, dit->adapter.runtime, schedule_report, &schedule_state,
         error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
@@ -1804,6 +2060,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const h3_params *adapter_params,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -1820,7 +2077,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_uncached_int8_scales,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
-                    use_int8_row_fc2,
+                    use_int8_row_fc2, adapter_params,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -1848,6 +2105,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const h3_params *adapter_params,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -1868,10 +2126,102 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_uncached_int8_scales,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
-                    use_int8_row_fc2,
+                    use_int8_row_fc2, adapter_params,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
+}
+
+int h3_dit_reconfigure_conditioned(
+                         h3_dit *dit,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
+                         unsigned core_reuse_interval,
+                         int token_reduction,
+                         int ssd_streaming,
+                         float spatial_rope_scale,
+                         const float *condition_video_rows,
+                         size_t condition_video_elements,
+                         const float *condition_audio_rows,
+                         size_t condition_audio_elements,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!dit || !text || !layout || !sigmas ||
+        active_blocks != dit->active_block_count ||
+        core_reuse_interval != dit->core_reuse_interval ||
+        token_reduction != dit->token_reduction ||
+        ssd_streaming != dit->ssd_streaming ||
+        !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f) {
+        fail(error, error_size,
+             "DiT reconfiguration changes static checkpoint execution settings");
+        return 0;
+    }
+
+    /* The original load selected and uploaded only its active core blocks.
+     * A stage may change geometry and sigma grid, but not that core policy. */
+    uint8_t active[H3_DIT_BLOCKS];
+    memcpy(active, dit->block_active, sizeof(active));
+    free_session(dit);
+    memcpy(dit->block_active, active, sizeof(active));
+    /* The native 256 canvas uses a half-scale RoPE grid, while its 2x target
+     * uses the released full scale.  RoPE tables are geometry-session state. */
+    dit->spatial_rope_scale = spatial_rope_scale;
+    dit->token_reduction = 0;
+    dit->reduced_sequence = 0;
+    dit->reduced_video_rows = 0;
+    dit->token_baseline_rows = 0;
+    dit->token_reduction_active = 0;
+
+    if (!copy_layout(dit, layout, error, error_size) ||
+        !validate_layout(dit, text, error, error_size) ||
+        !configure_token_reduction(dit, token_reduction, error, error_size))
+        goto failed;
+    size_t wanted_video_condition =
+        (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t wanted_audio_condition =
+        (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (condition_video_elements != wanted_video_condition ||
+        condition_audio_elements != wanted_audio_condition ||
+        (wanted_video_condition && !condition_video_rows) ||
+        (wanted_audio_condition && !condition_audio_rows)) {
+        fail(error, error_size,
+             "condition row elements do not match the reconfigured DiT layout");
+        goto failed;
+    }
+    dit->sigmas = *sigmas;
+    report(progress, progress_opaque, "refine text", 0, 1);
+    if (!refine_text(dit, text, error, error_size)) goto failed;
+    report(progress, progress_opaque, "refine text", 1, 1);
+    schedule_progress schedule_state = {progress, progress_opaque};
+    dit->schedule = h3_dit_schedule_precompute_adapter(
+        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
+        dit->audio_condition_rows != 0, dit->adapter.runtime, schedule_report, &schedule_state,
+        error, error_size);
+    if (!dit->schedule) goto failed;
+    h3_dit_schedule_prune(dit->schedule, dit->block_active, H3_DIT_BLOCKS);
+    if (!prepare_rope(dit, error, error_size) ||
+        !prepare_maps(dit, text, error, error_size) ||
+        !prepare_projection_maps(dit, error, error_size) ||
+        !prepare_token_reduction_maps(dit, error, error_size) ||
+        !allocate_activations(dit, error, error_size) ||
+        (wanted_video_condition && !h3_gpu_tensor_write_f32_range(
+             dit->video_input, 0, condition_video_rows,
+             wanted_video_condition)) ||
+        (wanted_audio_condition && !h3_gpu_tensor_write_f32_range(
+             dit->audio_input, 0, condition_audio_rows,
+             wanted_audio_condition))) {
+        if (!error || !*error)
+            fail(error, error_size, "cannot prepare reconfigured DiT session");
+        goto failed;
+    }
+    h3_gpu_profile_mark(dit->gpu, "reconfigure");
+    return 1;
+failed:
+    free_session(dit);
+    return 0;
 }
 
 static int enter_token_reduction(h3_dit *dit, char *error,
@@ -1992,6 +2342,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->int8_activation, dit->int8_activation_scales,
             dit->mod_attention, weight->qkv_int8, weight->qkv_scales,
             rows, HIDDEN, INNER * 3), "DiT ConvRot QKV projection");
+        for (unsigned part = ADAPTER_Q; part <= ADAPTER_V; part++)
+            if (!adapter_apply(dit, &dit->adapter.blocks[index][part],
+                dit->mod_attention, dit->qkv, rows, (int)part, 0, error,
+                error_size, "DiT ConvRot QKV adapter")) return 0;
         /* Comfy TensorWiseINT8 checkpoints preserve the model's three
          * contiguous [Q][K][V] output ranges.  Released native H3 shards use
          * the per-head grouped layout handled by the ordinary load path. */
@@ -2000,6 +2354,17 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->q_norm, weight->k_norm, rope_cos, rope_sin,
             rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
            "DiT ConvRot QKV norm/RoPE");
+    } else if (dit->adapter.runtime) {
+        OP(h3_gpu_linear_bf16(dit->gpu, dit->qkv, dit->mod_attention,
+            weight->qkv, NULL, rows, HIDDEN, INNER * 3), "DiT QKV projection");
+        for (unsigned part = ADAPTER_Q; part <= ADAPTER_V; part++)
+            if (!adapter_apply(dit, &dit->adapter.blocks[index][part],
+                dit->mod_attention, dit->qkv, rows, (int)part, 1, error,
+                error_size, "DiT QKV adapter")) return 0;
+        OP(h3_gpu_grouped_qkv_rope_bf16(dit->gpu, dit->query, dit->key,
+            dit->value, dit->qkv, weight->q_norm, weight->k_norm, rope_cos,
+            rope_sin, rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "DiT QKV norm/RoPE");
     } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
@@ -2041,6 +2406,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->int8_activation, dit->int8_activation_scales,
             dit->attention_heads, weight->out_int8, weight->out_scales,
             rows, INNER, HIDDEN), "DiT ConvRot attention output");
+        if (!adapter_apply(dit, &dit->adapter.blocks[index][ADAPTER_OUT],
+            dit->attention_heads, dit->attention_output, rows, -1, 0, error,
+            error_size, "DiT ConvRot output adapter")) return 0;
     } else if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -2059,6 +2427,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
+        if (!adapter_apply(dit, &dit->adapter.blocks[index][ADAPTER_OUT],
+            dit->attention_heads, dit->attention_output, rows, -1, 0, error,
+            error_size, "DiT output adapter")) return 0;
     }
     int fused_int8_mlp_input = dit->int8_mlp && !dit->convrot &&
         !dit->use_slower_unfused_int8_inputs &&
@@ -2096,6 +2467,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->int8_activation, dit->int8_activation_scales,
             dit->mod_mlp, weight->fc1_int8, weight->fc1_scales,
             rows, HIDDEN, FFN * 2), "DiT ConvRot MLP input");
+        if (!adapter_apply(dit, &dit->adapter.blocks[index][ADAPTER_FC1],
+            dit->mod_mlp, dit->fc1, rows, -1, 0, error, error_size,
+            "DiT ConvRot FC1 adapter")) return 0;
         OP(h3_gpu_swiglu_bf16(
             dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT ConvRot SwiGLU");
@@ -2104,6 +2478,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->int8_activation, dit->int8_activation_scales,
             dit->activated, weight->fc2_int8, weight->fc2_scales,
             rows, FFN, HIDDEN), "DiT ConvRot MLP output");
+        if (!adapter_apply(dit, &dit->adapter.blocks[index][ADAPTER_FC2],
+            dit->activated, mlp_output, rows, -1, 0, error, error_size,
+            "DiT ConvRot FC2 adapter")) return 0;
     } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
@@ -2129,10 +2506,16 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
             NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
+        if (!adapter_apply(dit, &dit->adapter.blocks[index][ADAPTER_FC1],
+            dit->mod_mlp, dit->fc1, rows, -1, 0, error, error_size,
+            "DiT FC1 adapter")) return 0;
         OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT SwiGLU");
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
+        if (!adapter_apply(dit, &dit->adapter.blocks[index][ADAPTER_FC2],
+            dit->activated, mlp_output, rows, -1, 0, error, error_size,
+            "DiT FC2 adapter")) return 0;
     }
     if (fuse_next_attention) {
         h3_dit_block *next_weight = &dit->blocks[next_index];
@@ -2438,6 +2821,21 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     }
     dit->core_forward_count++;
     const h3_gpu_tensor *final = h3_dit_schedule_final(dit->schedule);
+    const h3_gpu_tensor *final_video_w = dit->final_video_w;
+    const h3_gpu_tensor *final_video_b = dit->final_video_b;
+    const h3_gpu_tensor *final_audio_w = dit->final_audio_w;
+    const h3_gpu_tensor *final_audio_b = dit->final_audio_b;
+    if (h3_adapter_runtime_kind(dit->adapter.runtime) ==
+        H3_ADAPTER_ALIBABA_PAI_PDD) {
+        if (step < 0 || step >= 8) {
+            fail(error, error_size, "PAI PDD requires exactly eight Euler steps");
+            return 0;
+        }
+        final_video_w = dit->adapter.pdd_video_w[step];
+        final_video_b = dit->adapter.pdd_video_b[step];
+        final_audio_w = dit->adapter.pdd_audio_w[step];
+        final_audio_b = dit->adapter.pdd_audio_b[step];
+    }
     int fused_final_head = dit->bf16_final &&
         !getenv("H3_DISABLE_FUSED_FINAL_HEAD") &&
         !getenv("H3_DISABLE_FUSED_FINAL_SLICE");
@@ -2446,14 +2844,14 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->gpu, dit->audio_output_bf16, dit->final_audio_inverse,
             dit->hidden, (size_t)dit->audio_target_start * HIDDEN,
             dit->final_norm, final, dit->final_audio_maps[step],
-            dit->final_audio_w, dit->final_audio_b, dit->audio_rows, HIDDEN,
+            final_audio_w, final_audio_b, dit->audio_rows, HIDDEN,
             AUDIO_CHANNELS, FINAL_SLOTS, 0, 1, 1e-5f),
            "fused final audio AdaLN/head");
         OP(h3_gpu_adaln_linear_bf16(
             dit->gpu, dit->video_output_bf16, dit->final_video_inverse,
             dit->hidden, (size_t)dit->video_target_start * HIDDEN,
             dit->final_norm, final, dit->final_video_maps[step],
-            dit->final_video_w, dit->final_video_b, dit->video_rows, HIDDEN,
+            final_video_w, final_video_b, dit->video_rows, HIDDEN,
             VIDEO_PATCH, FINAL_SLOTS, 0, 1, 1e-5f),
            "fused final video AdaLN/head");
     } else if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
@@ -2485,11 +2883,11 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     }
     if (dit->bf16_final && !fused_final_head) {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->audio_output_bf16,
-            dit->final_audio_norm, dit->final_audio_w, dit->final_audio_b,
+            dit->final_audio_norm, final_audio_w, final_audio_b,
             dit->audio_rows, HIDDEN, AUDIO_CHANNELS),
            "BF16 final audio head");
         OP(h3_gpu_linear_bf16(dit->gpu, dit->video_output_bf16,
-            dit->final_video_norm, dit->final_video_w, dit->final_video_b,
+            dit->final_video_norm, final_video_w, final_video_b,
             dit->video_rows, HIDDEN, VIDEO_PATCH),
            "BF16 final video head");
     } else if (!dit->bf16_final) {
@@ -3385,7 +3783,11 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
         progress, progress_opaque, NULL, NULL, error, error_size);
 }
 
-void h3_dit_free(h3_dit *dit) {
+/* Release allocations whose size or contents depend on the packed H3 layout,
+ * prompt, schedule, or target canvas.  The Metal device and model tensors stay
+ * owned by the surrounding h3_dit so a staged resolution change can retain
+ * the static checkpoint rather than reading it again. */
+static void free_session(h3_dit *dit) {
     if (!dit) return;
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
@@ -3405,15 +3807,6 @@ void h3_dit_free(h3_dit *dit) {
     free_tensor(&dit->rope_sin);
     free_tensor(&dit->reduced_rope_cos);
     free_tensor(&dit->reduced_rope_sin);
-    free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
-    free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
-        free_block(&dit->blocks[block]);
-    free_block(&dit->stream_slots[0]);
-    free_block(&dit->stream_slots[1]);
-    free_tensor(&dit->final_norm);
-    free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
-    free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
 #define FREE(field) free_tensor(&dit->field)
     if (dit->activation_aliases) {
         dit->attention_heads = NULL;
@@ -3438,8 +3831,40 @@ void h3_dit_free(h3_dit *dit) {
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
     FREE(previous_audio_denoised); FREE(previous_video_denoised);
+    FREE(adapter_rank); FREE(adapter_delta);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
+    dit->schedule = NULL;
+    h3_layout_free(&dit->layout);
+    memset(&dit->layout, 0, sizeof(dit->layout));
+    dit->latent_t = dit->latent_h = dit->latent_w = 0;
+    dit->audio_t = 0;
+    dit->text_rows = dit->video_condition_rows = dit->audio_condition_rows = 0;
+    dit->audio_rows = dit->video_rows = 0;
+    dit->audio_total_rows = dit->video_total_rows = 0;
+    dit->audio_target_start = dit->video_target_start = 0;
+    dit->sequence = dit->reduced_sequence = dit->reduced_video_rows = 0;
+    dit->token_baseline_rows = 0;
+    dit->token_reduction_active = 0;
+    dit->token_original_in_qkv = 0;
+    dit->token_original_offset = dit->token_baseline_offset = 0;
+    dit->core_forward_count = 0;
+    dit->core_residual_ready = 0;
+}
+
+void h3_dit_free(h3_dit *dit) {
+    if (!dit) return;
+    free_session(dit);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        free_block(&dit->blocks[block]);
+    free_block(&dit->stream_slots[0]);
+    free_block(&dit->stream_slots[1]);
+    free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
+    free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
+    free_tensor(&dit->final_norm);
+    free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
+    free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
+    adapter_free(dit);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
@@ -3452,7 +3877,6 @@ void h3_dit_free(h3_dit *dit) {
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
-    h3_layout_free(&dit->layout);
     free(dit);
 }
 

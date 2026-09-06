@@ -15,6 +15,7 @@
 #define H3_DIT_ADALN_SLOTS 6u
 
 typedef struct h3_dit_schedule h3_dit_schedule;
+typedef struct h3_adapter_runtime h3_adapter_runtime;
 
 typedef void (*h3_dit_schedule_progress)(int completed_blocks,
                                          int total_blocks, void *opaque);
@@ -28,6 +29,11 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size);
+h3_dit_schedule *h3_dit_schedule_precompute_adapter(
+    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_sigma_schedule *sigmas, int visual_condition, int audio_condition,
+    const h3_adapter_runtime *adapter, h3_dit_schedule_progress progress,
+    void *progress_opaque, char *error, size_t error_size);
 void h3_dit_schedule_free(h3_dit_schedule *schedule);
 
 int h3_dit_schedule_steps(const h3_dit_schedule *schedule);

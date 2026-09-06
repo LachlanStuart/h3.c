@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { ROWS = 128, INPUT = 256, OUTPUT = 128, RANK = 8 };
+enum { FULL_ROWS = 128, SHORT_ROWS = 87, INPUT = 256, OUTPUT = 128, RANK = 8 };
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL tests/test_convrot.c: %s\n", message);
@@ -147,18 +147,19 @@ static void test_dense_hadamard_reference(void) {
             "radix-4 Hadamard differs from independent dense Kronecker reference");
 }
 
-static void test_convrot(h3_gpu *gpu) {
-    size_t input_count = (size_t)ROWS * INPUT;
+static void test_convrot(h3_gpu *gpu, unsigned rows) {
+    size_t input_count = (size_t)rows * INPUT;
     size_t weight_count = (size_t)OUTPUT * INPUT;
-    size_t output_count = (size_t)ROWS * OUTPUT;
+    size_t output_count = (size_t)rows * OUTPUT;
+    size_t padded_rows = ((size_t)rows + 127u) & ~(size_t)127u;
     uint16_t *input = malloc(input_count * sizeof(*input));
     uint16_t *rotated_want = malloc(input_count * sizeof(*rotated_want));
     uint16_t *rotated_got = malloc(input_count * sizeof(*rotated_got));
     int8_t *quantized_want = malloc(input_count);
     int8_t *quantized_got = malloc(input_count);
     int8_t *weight = malloc(weight_count);
-    float *input_scales_want = malloc(ROWS * sizeof(float));
-    float *input_scales_got = malloc(ROWS * sizeof(float));
+    float *input_scales_want = malloc((size_t)rows * sizeof(float));
+    float *input_scales_got = malloc((size_t)rows * sizeof(float));
     float *weight_scales = malloc(OUTPUT * sizeof(float));
     uint16_t *output_got = malloc(output_count * sizeof(*output_got));
     require(input && rotated_want && rotated_got && quantized_want &&
@@ -174,7 +175,7 @@ static void test_convrot(h3_gpu *gpu) {
     for (unsigned column = 0; column < OUTPUT; column++)
         weight_scales[column] = 0.001f +
             (float)(random_u32() % 4000) * 0.000001f;
-    for (unsigned row = 0; row < ROWS; row++) {
+    for (unsigned row = 0; row < rows; row++) {
         float values[256];
         float maximum = 0.0f;
         for (unsigned column = 0; column < INPUT; column++)
@@ -200,8 +201,11 @@ static void test_convrot(h3_gpu *gpu) {
     }
     h3_gpu_tensor *input_gpu = h3_gpu_tensor_from_bf16(gpu, input, input_count);
     h3_gpu_tensor *rotated_gpu = h3_gpu_tensor_new_bf16(gpu, input_count);
-    h3_gpu_tensor *quantized_gpu = h3_gpu_tensor_new_i8(gpu, input_count);
-    h3_gpu_tensor *input_scales_gpu = h3_gpu_tensor_new_f32(gpu, ROWS);
+    /* The ConvRot quantizer pads only its int8 data and per-row scale tiles.
+     * The source, rotated, and output tensors keep their semantic row count. */
+    h3_gpu_tensor *quantized_gpu = h3_gpu_tensor_new_i8(
+        gpu, padded_rows * INPUT);
+    h3_gpu_tensor *input_scales_gpu = h3_gpu_tensor_new_f32(gpu, padded_rows);
     h3_gpu_tensor *weight_gpu = h3_gpu_tensor_from_i8(gpu, weight, weight_count);
     h3_gpu_tensor *weight_scales_gpu = h3_gpu_tensor_from_f32(
         gpu, weight_scales, OUTPUT);
@@ -213,7 +217,7 @@ static void test_convrot(h3_gpu *gpu) {
     if (!h3_gpu_linear_convrot_int8_bf16(
             gpu, output_gpu, rotated_gpu, quantized_gpu, input_scales_gpu,
             input_gpu, weight_gpu, weight_scales_gpu,
-            ROWS, INPUT, OUTPUT)) {
+            rows, INPUT, OUTPUT)) {
         fprintf(stderr, "FAIL tests/test_convrot.c: ConvRot dispatch: %s\n",
                 h3_gpu_error(gpu));
         exit(1);
@@ -223,7 +227,7 @@ static void test_convrot(h3_gpu *gpu) {
             "cannot read rotated activation");
     require(h3_gpu_tensor_read_i8(quantized_gpu, quantized_got, input_count),
             "cannot read quantized activation");
-    require(h3_gpu_tensor_read_f32(input_scales_gpu, input_scales_got, ROWS),
+    require(h3_gpu_tensor_read_f32(input_scales_gpu, input_scales_got, rows),
             "cannot read ConvRot scales");
     require(h3_gpu_tensor_read_bf16(output_gpu, output_got, output_count),
             "cannot read ConvRot output");
@@ -234,10 +238,10 @@ static void test_convrot(h3_gpu *gpu) {
             "Metal ConvRot quantization differs from the scalar reference");
     float maximum_scale_error = 0.0f;
     float maximum_output_error = 0.0f;
-    for (unsigned row = 0; row < ROWS; row++)
+    for (unsigned row = 0; row < rows; row++)
         maximum_scale_error = fmaxf(maximum_scale_error,
             fabsf(input_scales_got[row] - input_scales_want[row]));
-    for (unsigned row = 0; row < ROWS; row++)
+    for (unsigned row = 0; row < rows; row++)
         for (unsigned column = 0; column < OUTPUT; column++) {
             int32_t sum = 0;
             for (unsigned inner = 0; inner < INPUT; inner++)
@@ -254,7 +258,7 @@ static void test_convrot(h3_gpu *gpu) {
             "Metal ConvRot row scale exceeds tolerance");
     require(maximum_output_error <= 0.02f,
             "Metal ConvRot matrix output exceeds tolerance");
-    printf("ConvRot random matrix max abs %.7g, scale %.7g\n",
+    printf("ConvRot %u-row matrix max abs %.7g, scale %.7g\n", rows,
            maximum_output_error, maximum_scale_error);
     h3_gpu_tensor_free(input_gpu); h3_gpu_tensor_free(rotated_gpu);
     h3_gpu_tensor_free(quantized_gpu); h3_gpu_tensor_free(input_scales_gpu);
@@ -1010,6 +1014,40 @@ static void test_checkpoint_block(h3_gpu *gpu, const char *checkpoint,
     h3_weight_store_free(store);
 }
 
+static void test_adapter_qkv_layout(h3_gpu *gpu, int grouped) {
+    enum { ROWS = 3, WIDTH = 256, COMPONENT = 1, ELEMENTS = ROWS * WIDTH };
+    uint16_t output[ROWS * WIDTH * 3], branch[ELEMENTS], expected[ROWS * WIDTH * 3];
+    for (unsigned index = 0; index < ROWS * WIDTH * 3; index++)
+        output[index] = f32_to_bf16((float)((int)(index % 19) - 9) * 0.125f);
+    for (unsigned index = 0; index < ELEMENTS; index++)
+        branch[index] = f32_to_bf16((float)((int)(index % 13) - 6) * 0.0625f);
+    memcpy(expected, output, sizeof(expected));
+    for (unsigned index = 0; index < ELEMENTS; index++) {
+        unsigned row = index / WIDTH, column = index % WIDTH;
+        unsigned target_column = grouped ?
+            ((column / 128) * 3 + COMPONENT) * 128 + column % 128 :
+            COMPONENT * WIDTH + column;
+        unsigned target = row * WIDTH * 3 + target_column;
+        expected[target] = f32_to_bf16(bf16_to_f32(expected[target]) +
+                                       bf16_to_f32(branch[index]));
+    }
+    h3_gpu_tensor *out = h3_gpu_tensor_from_bf16(gpu, output,
+                                                    ROWS * WIDTH * 3);
+    h3_gpu_tensor *delta = h3_gpu_tensor_from_bf16(gpu, branch, ELEMENTS);
+    require(out && delta, "adapter QKV tensor allocation");
+    require(h3_gpu_begin(gpu), "begin adapter QKV layout test");
+    require(h3_gpu_add_qkv_component_bf16(gpu, out, delta, ROWS, WIDTH,
+                                           COMPONENT, grouped),
+            "adapter QKV layout dispatch");
+    require(h3_gpu_submit(gpu), "submit adapter QKV layout test");
+    require(h3_gpu_tensor_read_bf16(out, output, ROWS * WIDTH * 3),
+            "read adapter QKV layout output");
+    require(!memcmp(output, expected, sizeof(expected)),
+            grouped ? "grouped QKV adapter layout mismatch" :
+                      "contiguous QKV adapter layout mismatch");
+    h3_gpu_tensor_free(out); h3_gpu_tensor_free(delta);
+}
+
 int main(void) {
     char error[512];
     h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
@@ -1020,9 +1058,12 @@ int main(void) {
     require(h3_gpu_has_int8_mlp(gpu),
             "this numerical test requires Apple INT8 tensor support");
     test_dense_hadamard_reference();
-    test_convrot(gpu);
+    test_convrot(gpu, FULL_ROWS);
+    test_convrot(gpu, SHORT_ROWS);
     test_rank8(gpu);
     test_comfy_qkv_layout(gpu);
+    test_adapter_qkv_layout(gpu, 0);
+    test_adapter_qkv_layout(gpu, 1);
     const char *checkpoint = getenv("H3_CONVROT_CHECKPOINT");
     if (checkpoint && *checkpoint) {
         test_checkpoint_qkv(gpu, checkpoint);

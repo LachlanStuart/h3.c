@@ -472,7 +472,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
-            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
+            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_scale_bf16", @"h3_add_qkv_component_bf16", @"h3_sub_bf16",
             @"h3_add_f16",
             @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
             @"h3_token_expand_delta_bf16",
@@ -4026,7 +4026,10 @@ static int h3_gpu_linear_int8_quantized_bf16(
                             uint32_t output_dim) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
-    if (!gpu.tensorOpsEnabled || rows < 128 || rows > UINT32_MAX - 127u ||
+    /* Input/scales are padded to the 128-row tensor tile. The shader only
+     * stores rows below args.rows, so short valid sequences need no fake
+     * output rows. */
+    if (!gpu.tensorOpsEnabled || !rows || rows > UINT32_MAX - 127u ||
         input_dim % 128u || output_dim % 128u ||
         !h3_gpu_require_i8(gpu, quantized_input,
                            (size_t)padded_rows * input_dim,
@@ -5489,6 +5492,41 @@ int h3_gpu_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_scale_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, float scale,
+                      uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!isfinite(scale) || !h3_gpu_require_bf16(gpu, input, elements,
+            @"BF16 scale input") || !h3_gpu_require_bf16(gpu, output, elements,
+            @"BF16 scale output")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_scale_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&scale length:sizeof(scale) atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_add_qkv_component_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *branch,
+                                  uint32_t rows, uint32_t width,
+                                  uint32_t component, int grouped_layout) {
+    H3GPU *gpu = GPU(opaque);
+    uint32_t elements = rows * width;
+    if (component > 2 || !h3_gpu_require_bf16(gpu, branch, elements,
+            @"QKV adapter branch") || !h3_gpu_require_bf16(gpu, output,
+            (size_t)rows * width * 3, @"QKV adapter output")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_add_qkv_component_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(branch).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            uint32_t args[5] = {rows, width, component, elements,
+                                 grouped_layout ? 1u : 0u};
+            [encoder setBytes:args length:sizeof(args) atIndex:2];
         });
 }
 

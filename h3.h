@@ -23,6 +23,7 @@ extern "C" {
 
 typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;
+typedef struct h3_joint_latents h3_joint_latents;
 
 typedef struct {
     size_t embedding_entries;
@@ -59,6 +60,23 @@ typedef enum {
     H3_SCHEDULER_SIMPLE = 0,
     H3_SCHEDULER_BETA = 1
 } h3_scheduler;
+
+typedef enum {
+    H3_ADAPTER_NONE = 0,
+    H3_ADAPTER_MODELTC_TURBO = 1,
+    H3_ADAPTER_ALIBABA_PAI_PDD = 2
+} h3_adapter_kind;
+
+typedef enum {
+    H3_ADAPTER_PROFILE_NONE = 0,
+    H3_ADAPTER_PROFILE_MODELTC_FL2VA_544_4,
+    H3_ADAPTER_PROFILE_MODELTC_FL2VA_544_8,
+    H3_ADAPTER_PROFILE_MODELTC_FL2VA_768_4,
+    H3_ADAPTER_PROFILE_MODELTC_FL2VA_768_8,
+    H3_ADAPTER_PROFILE_MODELTC_REF2VA_544_4,
+    H3_ADAPTER_PROFILE_PAI_FL2VA_8,
+    H3_ADAPTER_PROFILE_PAI_REF2VA_8
+} h3_adapter_profile;
 
 /* H.264 is the portable delivery format. FFV1 is an RGB lossless diagnostic
  * format and must be written to a Matroska (.mkv) container. */
@@ -105,6 +123,14 @@ typedef struct {
     int steps;
     h3_sampler sampler;
     h3_scheduler scheduler;
+    /* Runtime-only adapter: its deltas are never written to a checkpoint. */
+    const char *adapter_path;
+    h3_adapter_kind adapter_kind;
+    h3_adapter_profile adapter_profile;
+    float adapter_strength;
+    /* Independent shifted sigma grids; released base defaults are 12/3. */
+    float video_shift;
+    float audio_shift;
     uint64_t seed;
     /* Optional exact DiT safetensors file. The remaining tokenizer, text
      * encoder, and VAEs continue to come from model_dir. */
@@ -129,6 +155,15 @@ typedef struct {
      * restart refinement skips RGB decode/resize/VideoVAE encode entirely;
      * refine_video_path still supplies the clean frozen audio and mux source. */
     const char *refine_latent_path;
+    /* Internal staged-production handoff.  `latent_only` transfers the
+     * post-denoise joint tensors to latent_result; inline_refine supplies the
+     * clean upscaled video plus frozen audio without an intermediate file. */
+    int latent_only;
+    h3_joint_latents *latent_result;
+    const h3_joint_latents *inline_refine;
+    /* Retain the existing same-checkpoint DiT and rebuild only its
+     * geometry-dependent session.  Used by h3_generate_inline_production. */
+    int reuse_prepared_dit;
     int restart_steps;
     int restart_schedule_steps;
     int freeze_audio;
@@ -200,10 +235,35 @@ typedef struct {
     void *callback_opaque;
 } h3_params;
 
+/* Internal/public ABI handoff for a staged generation.  Values are normalized
+ * host F32 tensors in native H3 layout.  A producer transfers ownership to the
+ * caller only when `latent_only` is selected; use h3_joint_latents_free. */
+struct h3_joint_latents {
+    float *video;
+    float *audio;
+    int video_time;
+    int video_height;
+    int video_width;
+    int audio_time;
+};
+
+typedef struct {
+    h3_params working;
+    h3_params target;
+    const char *upscaler_python;
+    const char *upscaler_script;
+    const char *upscaler_source;
+    const char *upscaler_checkpoint;
+    float upscale;
+} h3_production_params;
+
 #define H3_PARAMS_DEFAULT { \
     .width = H3_DEFAULT_WIDTH, .height = H3_DEFAULT_HEIGHT, \
     .frames = H3_DEFAULT_FRAMES, .steps = H3_DEFAULT_STEPS, \
-    .sampler = H3_SAMPLER_EULER, .scheduler = H3_SCHEDULER_BETA, .seed = UINT64_C(42), \
+    .sampler = H3_SAMPLER_EULER, .scheduler = H3_SCHEDULER_BETA, \
+    .adapter_kind = H3_ADAPTER_NONE, .adapter_profile = H3_ADAPTER_PROFILE_NONE, \
+    .adapter_strength = 1.0f, .video_shift = 12.0f, .audio_shift = 3.0f, \
+    .seed = UINT64_C(42), \
     .video_codec = H3_VIDEO_CODEC_H264, \
     .video_preset = H3_VIDEO_PRESET_SLOW, .video_crf = 18, \
     .reference_image_size = H3_REFERENCE_IMAGE_MATCH, \
@@ -263,6 +323,9 @@ void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 /* Generate media, delivering decoded frames incrementally through on_frame. */
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params);
+h3_result *h3_generate_inline_production(
+    h3_ctx *ctx, const char *prompt, const h3_production_params *params);
+void h3_joint_latents_free(h3_joint_latents *latents);
 void h3_result_free(h3_result *result);
 
 #ifdef __cplusplus

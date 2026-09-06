@@ -4955,6 +4955,31 @@ kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
                                   h3_bf16_to_f32(right[gid]));
 }
 
+kernel void h3_scale_bf16(device const ushort *input [[buffer(0)]],
+                           device ushort *output [[buffer(1)]],
+                           constant float &scale [[buffer(2)]],
+                           constant uint &count [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid < count)
+        output[gid] = h3_f32_to_bf16(scale * h3_bf16_to_f32(input[gid]));
+}
+
+struct qkv_add_args { uint rows, width, component, elements, grouped; };
+kernel void h3_add_qkv_component_bf16(device const ushort *branch [[buffer(0)]],
+                                       device ushort *output [[buffer(1)]],
+                                       constant qkv_add_args &args [[buffer(2)]],
+                                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.elements) return;
+    uint row = gid / args.width;
+    uint column = gid - row * args.width;
+    uint output_column = args.grouped ?
+        ((column / 128) * 3 + args.component) * 128 + column % 128 :
+        args.component * args.width + column;
+    uint output_index = row * args.width * 3 + output_column;
+    output[output_index] = h3_f32_to_bf16(h3_bf16_to_f32(output[output_index]) +
+                                           h3_bf16_to_f32(branch[gid]));
+}
+
 kernel void h3_add_f16(device const half *left [[buffer(0)]],
                        device const half *right [[buffer(1)]],
                        device half *output [[buffer(2)]],

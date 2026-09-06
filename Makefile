@@ -8,10 +8,10 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
+LIB_C := h3.c h3_host.c h3_adapter.c h3_pdd.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c
 
-LIB_C += h3_video_vae.c h3_video_encoder.c h3_latent_io.c h3_audio_vae.c h3_ffmpeg.c \
+LIB_C += h3_video_vae.c h3_video_encoder.c h3_latent_io.c h3_latent_upscale.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
@@ -33,7 +33,19 @@ libh3.a: $(LIB_OBJ)
 h3_tests: tests/test_h3.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_adapter_tests: tests/test_adapter.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_pdd_tests: tests/test_pdd.o h3_pdd.o
+	$(CC) -o $@ $^ -lm
+
+h3_cli_options_tests: tests/test_cli_options.o h3
+	$(CC) -o $@ tests/test_cli_options.o
+
 h3_latent_io_tests: tests/test_latent_io.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_latent_upscale_tests: tests/test_latent_upscale.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_latent_decode: tools/h3_latent_decode.o $(LIB_OBJ)
@@ -118,7 +130,7 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_mutex_tests h3_tests h3_latent_io_tests h3_metal_tests h3_bf16_tests \
+test: h3_mutex_tests h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests h3_bf16_tests \
 	h3_convrot_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \
 	h3_real_audio_encoder_test \
@@ -130,7 +142,11 @@ test: h3_mutex_tests h3_tests h3_latent_io_tests h3_metal_tests h3_bf16_tests \
 
 	./h3_mutex_tests
 	./h3_tests
+	./h3_adapter_tests
+	./h3_pdd_tests
+	./h3_cli_options_tests
 	./h3_latent_io_tests
+	./h3_latent_upscale_tests
 	./h3_convrot_tests
 	./h3_video_encoder_fp16_test
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -249,7 +265,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 -include $(wildcard *.d tests/*.d)
 
 clean:
-	rm -f h3 h3_latent_decode h3_tests h3_latent_io_tests h3_metal_tests \
+	rm -f h3 h3_latent_decode h3_tests h3_adapter_tests h3_pdd_tests h3_cli_options_tests h3_latent_io_tests h3_latent_upscale_tests h3_metal_tests \
 		h3_bf16_tests h3_convrot_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_gqa_tests h3_real_audio_vae_test \

@@ -43,18 +43,18 @@ MAGIC = b"H3LATF32"
 CHANNELS = 24
 
 
-def read_latent(path):
-    with open(path, "rb") as file:
-        header = file.read(20)
-        if len(header) != 20:
-            raise ValueError("truncated H3 latent header")
-        magic, time_tokens, height, width = struct.unpack("<8sIII", header)
-        if magic != MAGIC or time_tokens < 2 or height < 1 or width < 1:
-            raise ValueError("malformed H3 latent header")
-        values = np.fromfile(file, dtype="<f4")
+def read_latent_stream(file):
+    header = file.read(20)
+    if len(header) != 20:
+        raise ValueError("truncated H3 latent header")
+    magic, time_tokens, height, width = struct.unpack("<8sIII", header)
+    if magic != MAGIC or time_tokens < 2 or height < 1 or width < 1:
+        raise ValueError("malformed H3 latent header")
     expected = CHANNELS * time_tokens * height * width
-    if values.size != expected:
-        raise ValueError(f"latent has {values.size} floats, expected {expected}")
+    bytes_value = file.read(expected * 4)
+    if len(bytes_value) != expected * 4 or file.read(1):
+        raise ValueError("latent payload size does not match its header")
+    values = np.frombuffer(bytes_value, dtype="<f4")
     if not np.isfinite(values).all():
         raise ValueError("input H3 latent contains non-finite values")
     return torch.from_numpy(values.copy()).reshape(
@@ -62,7 +62,12 @@ def read_latent(path):
     )
 
 
-def write_latent(path, tensor):
+def read_latent(path):
+    with open(path, "rb") as file:
+        return read_latent_stream(file)
+
+
+def write_latent_stream(file, tensor):
     output = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
     batch, channels, time_tokens, height, width = output.shape
     if batch != 1 or channels != CHANNELS:
@@ -70,9 +75,14 @@ def write_latent(path, tensor):
     values = output.numpy()
     if not np.isfinite(values).all():
         raise ValueError("refusing to write non-finite H3 latent")
+    file.write(struct.pack("<8sIII", MAGIC, time_tokens, height, width))
+    file.write(values.astype("<f4", copy=False).tobytes())
+    file.flush()
+
+
+def write_latent(path, tensor):
     with open(path, "wb") as file:
-        file.write(struct.pack("<8sIII", MAGIC, time_tokens, height, width))
-        values.astype("<f4", copy=False).tofile(file)
+        write_latent_stream(file, tensor)
 
 
 class MemorySampler:
@@ -160,12 +170,20 @@ def main():
     parser.add_argument("--source", required=True,
                         help="publisher's minimax_h3_latent_upscaler_3d.py")
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--metrics", required=True)
+    parser.add_argument("--input")
+    parser.add_argument("--output")
+    parser.add_argument("--metrics")
+    parser.add_argument("--stream", action="store_true",
+                        help="read H3LATF32 from stdin and write it to stdout")
     parser.add_argument("--scale", type=float, default=2.0)
     parser.add_argument("--expected-sha256")
     args = parser.parse_args()
+
+    if args.stream:
+        if args.input or args.output or args.metrics:
+            parser.error("--stream cannot be combined with file input/output/metrics")
+    elif not args.input or not args.output or not args.metrics:
+        parser.error("--input, --output, and --metrics are required without --stream")
 
     if not 1.0 < args.scale <= 4.0:
         raise ValueError("proof sidecar requires an upscale in (1, 4]")
@@ -191,7 +209,7 @@ def main():
     module = import_published_upscaler(
         args.source, os.path.dirname(args.checkpoint)
     )
-    input_cpu = read_latent(args.input)
+    input_cpu = read_latent_stream(sys.stdin.buffer) if args.stream else read_latent(args.input)
     input_shape = list(input_cpu.shape)
     input_metrics = tensor_stats(input_cpu)
     if input_metrics["finite"] != input_metrics["elements"] or input_metrics["std"] == 0:
@@ -275,7 +293,10 @@ def main():
         )
         if learned_delta_rmse <= 1e-4:
             raise RuntimeError("learned output collapsed to trilinear substitution")
-        write_latent(args.output, output_cpu)
+        if args.stream:
+            write_latent_stream(sys.stdout.buffer, output_cpu)
+        else:
+            write_latent(args.output, output_cpu)
 
     parameters = sum(parameter.numel() for parameter in model.parameters())
     parameter_bytes = sum(
@@ -326,12 +347,15 @@ def main():
         "sampled_peak_process_rss_gib": gib(memory.peak_rss),
         "sampled_peak_mps_current_gib": gib(memory.peak_mps_current),
         "sampled_peak_mps_driver_gib": gib(memory.peak_mps_driver),
-        "output": os.path.abspath(args.output),
+        "output": "stdout" if args.stream else os.path.abspath(args.output),
     }
-    with open(args.metrics, "w", encoding="utf-8") as file:
-        json.dump(metrics, file, indent=2, sort_keys=True)
-        file.write("\n")
-    print(json.dumps(metrics, indent=2, sort_keys=True))
+    if args.stream:
+        print(json.dumps(metrics, sort_keys=True), file=sys.stderr)
+    else:
+        with open(args.metrics, "w", encoding="utf-8") as file:
+            json.dump(metrics, file, indent=2, sort_keys=True)
+            file.write("\n")
+        print(json.dumps(metrics, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

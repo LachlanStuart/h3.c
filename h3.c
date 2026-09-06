@@ -1,7 +1,9 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
+#include "h3_adapter.h"
 #include "h3_host.h"
 #include "h3_latent_io.h"
+#include "h3_latent_upscale.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
 #include "h3_metal.h"
@@ -166,7 +168,8 @@ static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
                              int render_width, int render_height) {
     h3_key key = {0};
-    int schedule_steps = params->refine_video_path ?
+    int restart = params->refine_video_path || params->inline_refine;
+    int schedule_steps = restart ?
         params->restart_schedule_steps : params->steps;
     if (!h3_key_append(
             &key,
@@ -174,7 +177,7 @@ static char *h3_prepared_key(const char *conditioning,
             "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|fp32-bf16-accum=%d|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
-            schedule_steps, params->scheduler, params->refine_video_path != NULL,
+            schedule_steps, params->scheduler, restart,
             params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
@@ -193,7 +196,27 @@ static char *h3_prepared_key(const char *conditioning,
         free(key.text);
         return NULL;
     }
-    if (!h3_key_file(&key, "dit-checkpoint", params->dit_checkpoint)) {
+    if (!h3_key_file(&key, "dit-checkpoint", params->dit_checkpoint) ||
+        !h3_key_file(&key, "adapter", params->adapter_path) ||
+        !h3_key_append(&key,
+            "|adapter-kind=%d|adapter-profile=%d|adapter-strength=%a"
+            "|video-shift=%a|audio-shift=%a|sampler=%d|restart-steps=%d",
+            params->adapter_kind, params->adapter_profile,
+            (double)params->adapter_strength, (double)params->video_shift,
+            (double)params->audio_shift, params->sampler,
+            restart ? params->restart_steps : 0)) {
+        free(key.text);
+        return NULL;
+    }
+    /* A same-size replacement may preserve mtime. Include inode and change
+     * time so an interactive context cannot reuse the previous adapter. */
+    struct stat adapter_status;
+    if (params->adapter_path && stat(params->adapter_path, &adapter_status) == 0 &&
+        !h3_key_append(&key, "|adapter-file=%llu:%llu:%lld:%ld",
+            (unsigned long long)adapter_status.st_dev,
+            (unsigned long long)adapter_status.st_ino,
+            (long long)adapter_status.st_ctimespec.tv_sec,
+            adapter_status.st_ctimespec.tv_nsec)) {
         free(key.text);
         return NULL;
     }
@@ -540,6 +563,54 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "unknown scheduler");
         return 0;
     }
+    if (!isfinite(params->video_shift) || !isfinite(params->audio_shift) ||
+        params->video_shift <= 0.0f || params->audio_shift <= 0.0f) {
+        h3_set_error(ctx, "video and audio shifts must be finite and positive");
+        return 0;
+    }
+    if (params->adapter_profile != H3_ADAPTER_PROFILE_NONE ||
+        params->adapter_kind != H3_ADAPTER_NONE || params->adapter_path) {
+        h3_params expected = *params;
+        char adapter_error[256] = {0};
+        if (params->adapter_profile == H3_ADAPTER_PROFILE_NONE ||
+            !h3_adapter_profile_apply(&expected, adapter_error,
+                                      sizeof(adapter_error))) {
+            h3_set_error(ctx, "invalid runtime adapter: %s",
+                         adapter_error[0] ? adapter_error :
+                         "adapter path requires a named profile");
+            return 0;
+        }
+        if (params->adapter_kind != expected.adapter_kind ||
+            params->sampler != expected.sampler ||
+            params->scheduler != expected.scheduler ||
+            params->steps != expected.steps ||
+            fabsf(params->video_shift - expected.video_shift) > 1e-6f ||
+            fabsf(params->audio_shift - expected.audio_shift) > 1e-6f) {
+            h3_set_error(ctx, "runtime adapter parameters must match its named profile");
+            return 0;
+        }
+        if (params->refine_video_path || params->inline_refine ||
+            params->dit_layers != H3_DEFAULT_DIT_LAYERS ||
+            params->core_reuse != 1 || params->denoise_reuse != 1 ||
+            params->token_reduction || params->ssd_streaming ||
+            params->use_int8_row_fc2) {
+            h3_set_error(ctx,
+                "runtime adapters require a base generation with 50 DiT layers, "
+                "reuse 1, no token reduction, SSD streaming, row-FC2, or restart");
+            return 0;
+        }
+        int ref_profile = params->adapter_profile ==
+                H3_ADAPTER_PROFILE_MODELTC_REF2VA_544_4 ||
+            params->adapter_profile == H3_ADAPTER_PROFILE_PAI_REF2VA_8;
+        if (ref_profile && !params->reference_count) {
+            h3_set_error(ctx, "Ref2VA adapter profiles require at least one reference");
+            return 0;
+        }
+        if (!ref_profile && params->reference_count) {
+            h3_set_error(ctx, "FL2VA adapter profiles cannot be used with references");
+            return 0;
+        }
+    }
     if (params->latent_output_path && !*params->latent_output_path) {
         h3_set_error(ctx, "latent output path must not be empty");
         return 0;
@@ -558,7 +629,7 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             h3_set_error(ctx, "audio-only output cannot use --lossless-output");
             return 0;
         }
-        if (params->refine_video_path || params->refine_latent_path ||
+        if (params->refine_video_path || params->inline_refine || params->refine_latent_path ||
             params->restart_steps || params->restart_schedule_steps ||
             params->freeze_audio) {
             h3_set_error(ctx, "audio-only output cannot use restart refinement");
@@ -569,8 +640,19 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             return 0;
         }
     }
-    if (params->refine_video_path) {
-        if (!*params->refine_video_path ||
+    int restart = params->refine_video_path || params->inline_refine;
+    if (params->refine_video_path && params->inline_refine) {
+        h3_set_error(ctx, "restart source must be a video path or inline latent, not both");
+        return 0;
+    }
+    if (params->latent_only && (!params->latent_result || restart ||
+                                params->audio_only || params->output_path ||
+                                params->lossless_output_path)) {
+        h3_set_error(ctx, "latent-only generation requires an in-memory result and no delivery options");
+        return 0;
+    }
+    if (restart) {
+        if ((params->refine_video_path && !*params->refine_video_path) ||
             !params->freeze_audio || params->restart_schedule_steps < 2 ||
             params->restart_schedule_steps > H3_MAX_STEPS ||
             params->restart_steps < 1 ||
@@ -594,10 +676,14 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             h3_set_error(ctx, "restart refinement does not emit lossless artifacts");
             return 0;
         }
-        if (params->output_path && *params->output_path &&
+        if (params->refine_video_path && params->output_path && *params->output_path &&
             h3_paths_alias(params->output_path, params->refine_video_path)) {
             h3_set_error(ctx,
                 "restart refinement output must not alias the source video");
+            return 0;
+        }
+        if (params->inline_refine && params->refine_latent_path) {
+            h3_set_error(ctx, "inline restart cannot also read a latent path");
             return 0;
         }
         if (params->refine_latent_path && !*params->refine_latent_path) {
@@ -1099,7 +1185,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         free(ctx->video_decoder_key);
         ctx->video_decoder_key = NULL;
     }
-    if (ctx->cache_enabled && ctx->dit &&
+    if (ctx->cache_enabled && ctx->dit && !params->reuse_prepared_dit &&
         (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key))) {
         h3_dit_free(ctx->dit);
         ctx->dit = NULL;
@@ -1603,13 +1689,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
-    int refine = params->refine_video_path != NULL;
+    int refine = params->refine_video_path != NULL || params->inline_refine != NULL;
     int schedule_steps = refine ? params->restart_schedule_steps : params->steps;
     h3_sigma_schedule sigmas;
     int restart_start = 0;
     int schedule_ok = params->scheduler == H3_SCHEDULER_BETA ?
-        h3_beta_schedule_build(schedule_steps, &sigmas) :
-        h3_serving_schedule_build(schedule_steps, &sigmas);
+        h3_beta_schedule_build_shifted(schedule_steps, params->video_shift,
+                                       params->audio_shift, &sigmas) :
+        h3_serving_schedule_build_shifted(schedule_steps, params->video_shift,
+                                          params->audio_shift, &sigmas);
     if (!schedule_ok || (refine && params->restart_steps > sigmas.steps)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
@@ -1638,6 +1726,27 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
+    } else if (params->reuse_prepared_dit && ctx->cache_enabled && ctx->dit) {
+        dit = ctx->dit;
+        dit_is_cached = 1;
+        if (!h3_dit_reconfigure_conditioned(
+                dit, &text, &layout, &sigmas, (unsigned)params->dit_layers,
+                (unsigned)params->core_reuse, params->token_reduction,
+                params->ssd_streaming, spatial_rope_scale,
+                condition_video_rows, condition_video_elements,
+                condition_audio_rows, condition_audio_elements,
+                h3_dit_progress_bridge, &progress, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        char *reconfigured_key = strdup(prepared_key);
+        if (!reconfigured_key) {
+            h3_set_error(ctx, "out of memory retaining reconfigured DiT key");
+            goto cleanup;
+        }
+        free(ctx->dit_key);
+        ctx->dit_key = reconfigured_key;
+        fprintf(stderr, "h3: reconfigured resident DiT for inline target canvas\n");
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
@@ -1657,6 +1766,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
+            params,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
@@ -1679,6 +1789,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
+            params,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {
@@ -1738,7 +1849,24 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_video_latent source_video = {0};
         h3_audio_latent source_audio = {0};
         int expected_samples = h3_restart_audio_samples(temporal.frame_count);
-        if (!h3_ffmpeg_read_audio_f32(params->refine_video_path,
+        if (params->inline_refine) {
+            const h3_joint_latents *source = params->inline_refine;
+            if (!source->video || !source->audio ||
+                source->video_time != temporal.video_t ||
+                source->video_height != latent_h || source->video_width != latent_w ||
+                source->audio_time != temporal.audio_t) {
+                h3_set_error(ctx, "inline restart latent geometry does not match target canvas");
+                goto cleanup;
+            }
+            memcpy(video, source->video, video_count * sizeof(*video));
+            memcpy(audio, source->audio, audio_count * sizeof(*audio));
+            if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
+                    temporal.audio_t, h3_audio_vae_progress_bridge, &progress,
+                    &waveform, detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+        } else if (!h3_ffmpeg_read_audio_f32(params->refine_video_path,
                 expected_samples, 1, &source_pcm, &source_samples,
                 detail, sizeof(detail)) ||
             !h3_restart_audio_source_valid(source_samples) ||
@@ -1749,9 +1877,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                          "restart source audio must contain one 800-sample AudioVAE hop");
             goto cleanup;
         }
-        source_samples = expected_samples;
+        if (!params->inline_refine) source_samples = expected_samples;
         int video_source_ok;
-        if (params->refine_latent_path) {
+        if (params->inline_refine) {
+            video_source_ok = 1;
+        } else if (params->refine_latent_path) {
             video_source_ok = h3_video_latent_file_read(
                 params->refine_latent_path, &source_video,
                 detail, sizeof(detail));
@@ -1773,21 +1903,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                     h3_video_encoder_progress_bridge, &progress, &source_video,
                     detail, sizeof(detail));
         }
-        if (!video_source_ok ||
+        if (!params->inline_refine && (!video_source_ok ||
             !h3_audio_vae_encode(audio_vae_path, "h3_shaders.metal", source_pcm,
                 source_samples, h3_audio_vae_progress_bridge, &progress,
                 &source_audio, detail, sizeof(detail)) ||
             source_video.time != temporal.video_t || source_video.height != latent_h ||
             source_video.width != latent_w || source_audio.length != temporal.audio_t ||
-            source_audio.channels != 32 || source_audio.stereo != 2) {
+            source_audio.channels != 32 || source_audio.stereo != 2)) {
             free(source_rgb); free(source_pcm); h3_video_latent_free(&source_video);
             h3_audio_latent_free(&source_audio);
             h3_set_error(ctx, "%s", detail[0] ? detail :
                          "restart input latent or audio geometry mismatch");
             goto cleanup;
         }
-        memcpy(video, source_video.values, video_count * sizeof(*video));
-        memcpy(audio, source_audio.values, audio_count * sizeof(*audio));
+        if (!params->inline_refine) {
+            memcpy(video, source_video.values, video_count * sizeof(*video));
+            memcpy(audio, source_audio.values, audio_count * sizeof(*audio));
+        }
         h3_rng noise; h3_rng_seed(&noise, params->seed);
         float *restart_noise = malloc(video_count * sizeof(*restart_noise));
         int start = restart_start;
@@ -1802,8 +1934,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             video[index] = (1.0f - sigmas.video[start]) * video[index] +
                            sigmas.video[start] * restart_noise[index];
         free(restart_noise); free(source_rgb); h3_video_latent_free(&source_video);
-        waveform.channels = 2; waveform.samples = source_samples;
-        waveform.sample_rate = 32000; waveform.pcm = source_pcm;
+        if (!params->inline_refine) {
+            waveform.channels = 2; waveform.samples = source_samples;
+            waveform.sample_rate = 32000; waveform.pcm = source_pcm;
+        }
         h3_audio_latent_free(&source_audio);
     } else {
         /* The released server initializes each modality from a separate generator
@@ -1849,6 +1983,25 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         fprintf(stderr, "h3: wrote clean video latent %s shape=1x24x%dx%dx%d\n",
                 params->latent_output_path, temporal.video_t,
                 latent_h, latent_w);
+    }
+    if (params->latent_only) {
+        h3_joint_latents *latents = params->latent_result;
+        latents->video = video; video = NULL;
+        latents->audio = audio; audio = NULL;
+        latents->video_time = temporal.video_t;
+        latents->video_height = latent_h;
+        latents->video_width = latent_w;
+        latents->audio_time = temporal.audio_t;
+        result = calloc(1, sizeof(*result));
+        if (!result) {
+            h3_set_error(ctx, "out of memory creating latent-only result");
+            h3_joint_latents_free(latents);
+            goto cleanup;
+        }
+        result->width = params->width; result->height = params->height;
+        result->frames = temporal.frame_count; result->fps = H3_FPS;
+        result->sample_rate = H3_REFERENCE_AUDIO_RATE; result->seed = params->seed;
+        goto cleanup;
     }
     if (!refine) h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!refine && !h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
@@ -1956,7 +2109,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (params->output_path && *params->output_path) {
         h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
-        if (refine ? !h3_ffmpeg_write_rgb24_with_source_audio(
+        if (refine && !params->inline_refine ? !h3_ffmpeg_write_rgb24_with_source_audio(
                 params->output_path, rgb8, frames.frames, output_width,
                 output_height, H3_FPS, params->refine_video_path,
                 params->video_preset, params->video_crf, detail, sizeof(detail)) :
@@ -2032,6 +2185,113 @@ cleanup:
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);
     return result;
+}
+
+void h3_joint_latents_free(h3_joint_latents *latents) {
+    if (!latents) return;
+    free(latents->video);
+    free(latents->audio);
+    memset(latents, 0, sizeof(*latents));
+}
+
+h3_result *h3_generate_inline_production(
+        h3_ctx *ctx, const char *prompt, const h3_production_params *production) {
+    if (!ctx || !production) return NULL;
+    ctx->error[0] = '\0';
+    const h3_params *working_input = &production->working;
+    const h3_params *target_input = &production->target;
+    if (working_input->adapter_path || target_input->adapter_path ||
+        working_input->adapter_kind != H3_ADAPTER_NONE ||
+        target_input->adapter_kind != H3_ADAPTER_NONE ||
+        working_input->adapter_profile != H3_ADAPTER_PROFILE_NONE ||
+        target_input->adapter_profile != H3_ADAPTER_PROFILE_NONE) {
+        h3_set_error(ctx, "inline production does not yet support runtime adapters");
+        return NULL;
+    }
+    if (!production->upscaler_script || !*production->upscaler_script ||
+        !production->upscaler_source || !*production->upscaler_source ||
+        !production->upscaler_checkpoint || !*production->upscaler_checkpoint) {
+        h3_set_error(ctx, "inline production requires upscaler script, source, and checkpoint");
+        return NULL;
+    }
+    if ((int64_t)target_input->width != (int64_t)working_input->width * 2 ||
+        (int64_t)target_input->height != (int64_t)working_input->height * 2 ||
+        !isfinite(production->upscale) ||
+        (production->upscale != 0.0f && fabsf(production->upscale - 2.0f) > 1e-6f)) {
+        h3_set_error(ctx, "inline production currently requires an exact 2x target canvas");
+        return NULL;
+    }
+    if (target_input->dit_layers != working_input->dit_layers ||
+        target_input->core_reuse != working_input->core_reuse ||
+        target_input->token_reduction != working_input->token_reduction ||
+        target_input->ssd_streaming != working_input->ssd_streaming ||
+        target_input->use_int8_row_fc2 != working_input->use_int8_row_fc2 ||
+        target_input->use_reference_rope != working_input->use_reference_rope ||
+        target_input->use_slower_bf16_mlp != working_input->use_slower_bf16_mlp ||
+        target_input->use_slower_bf16_qkv != working_input->use_slower_bf16_qkv ||
+        target_input->use_slower_bf16_attention_output != working_input->use_slower_bf16_attention_output ||
+        target_input->use_fp32_bf16_accumulator != working_input->use_fp32_bf16_accumulator ||
+        target_input->use_slower_row_major_attention_output != working_input->use_slower_row_major_attention_output ||
+        target_input->use_slower_unfused_int8_inputs != working_input->use_slower_unfused_int8_inputs ||
+        target_input->use_slower_unfused_qkv_rope != working_input->use_slower_unfused_qkv_rope ||
+        target_input->use_slower_scalar_qkv_rms != working_input->use_slower_scalar_qkv_rms ||
+        target_input->use_slower_uncached_int8_scales != working_input->use_slower_uncached_int8_scales ||
+        target_input->use_slower_dynamic_fc1_k != working_input->use_slower_dynamic_fc1_k ||
+        target_input->use_slower_grouped_quantizer != working_input->use_slower_grouped_quantizer) {
+        h3_set_error(ctx, "inline production requires the same static DiT execution settings in both phases");
+        return NULL;
+    }
+    h3_params working = *working_input;
+    h3_params target = *target_input;
+    /* The target is a continuation of exactly this low stage, not a second
+     * independently configured request. */
+    target.frames = working.frames;
+    target.seed = working.seed;
+    target.first_frame = working.first_frame; target.last_frame = working.last_frame;
+    target.references = working.references; target.reference_count = working.reference_count;
+    target.reference_image_size = working.reference_image_size;
+    target.dit_checkpoint = working.dit_checkpoint;
+    target.adapter_path = working.adapter_path;
+    target.adapter_kind = working.adapter_kind;
+    target.adapter_profile = working.adapter_profile;
+    target.adapter_strength = working.adapter_strength;
+    target.video_shift = target_input->video_shift;
+    target.audio_shift = target_input->audio_shift;
+    target.render_width = target.render_height = 0;
+    target.refine_video_path = NULL; target.refine_latent_path = NULL;
+    target.freeze_audio = 1;
+    target.inline_refine = NULL;
+    target.reuse_prepared_dit = 1;
+    target.latent_only = 0; target.latent_result = NULL;
+    working.output_path = NULL; working.lossless_output_path = NULL;
+    working.latent_output_path = NULL; working.audio_only = 0;
+    working.refine_video_path = NULL; working.refine_latent_path = NULL;
+    working.restart_steps = working.restart_schedule_steps = 0;
+    working.freeze_audio = 0; working.latent_only = 1;
+    h3_joint_latents low = {0};
+    working.latent_result = &low;
+    int was_cached = ctx->cache_enabled;
+    h3_cache_set_enabled(ctx, 1);
+    h3_result *first = h3_generate(ctx, prompt, &working);
+    if (!first) goto finished;
+    h3_result_free(first);
+    first = NULL;
+    float *upscaled = NULL;
+    int time = 0, height = 0, width = 0;
+    if (!h3_latent_upscale_pipe(production->upscaler_python,
+            production->upscaler_script, production->upscaler_source,
+            production->upscaler_checkpoint, low.video, low.video_time,
+            low.video_height, low.video_width, &upscaled, &time, &height, &width,
+            ctx->error, sizeof(ctx->error))) goto finished;
+    free(low.video); low.video = upscaled;
+    low.video_time = time; low.video_height = height; low.video_width = width;
+    target.inline_refine = &low;
+    first = h3_generate(ctx, prompt, &target);
+finished:
+    h3_joint_latents_free(&low);
+    h3_cache_clear(ctx);
+    h3_cache_set_enabled(ctx, was_cached);
+    return first;
 }
 
 void h3_result_free(h3_result *result) {

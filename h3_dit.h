@@ -2,6 +2,7 @@
 #define H3_DIT_H
 
 #include "h3_gpu.h"
+#include "h3.h"
 #include "h3_host.h"
 #include "h3_text_encoder.h"
 
@@ -42,6 +43,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const h3_params *adapter_params,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 
@@ -71,6 +73,29 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const h3_params *adapter_params,
+                         const float *condition_video_rows,
+                         size_t condition_video_elements,
+                         const float *condition_audio_rows,
+                         size_t condition_audio_elements,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
+
+/* Replace a completed DiT's geometry-specific prepared session while retaining
+ * its Metal device and static uploaded transformer weights.  The requested
+ * static execution configuration must match the original load.  This is for
+ * staged same-checkpoint work such as low-resolution generation followed by a
+ * target-resolution restart; it is not a general checkpoint switch. */
+int h3_dit_reconfigure_conditioned(
+                         h3_dit *dit,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
+                         unsigned core_reuse_interval,
+                         int token_reduction,
+                         int ssd_streaming,
+                         float spatial_rope_scale,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,

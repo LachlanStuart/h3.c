@@ -148,21 +148,31 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     return 1;
 }
 
-int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
-    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+int h3_serving_schedule_build_shifted(int evaluations, float video_shift,
+                                      float audio_shift,
+                                      h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS ||
+        !isfinite(video_shift) || !isfinite(audio_shift) ||
+        video_shift <= 0.0f || audio_shift <= 0.0f) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = evaluations;
     float denominator = (float)evaluations;
     for (int index = 0; index <= evaluations; index++) {
         float base = 1.0f - (float)index / denominator;
-        schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
-        schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /
-            (1.0f + ((float)H3_AUDIO_SIGMA_SHIFT - 1.0f) * base);
+        schedule->video[index] = video_shift * base /
+            (1.0f + (video_shift - 1.0f) * base);
+        schedule->audio[index] = audio_shift * base /
+            (1.0f + (audio_shift - 1.0f) * base);
     }
     schedule->video[evaluations] = 0.0f;
     schedule->audio[evaluations] = 0.0f;
     return 1;
+}
+
+int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
+    return h3_serving_schedule_build_shifted(
+        evaluations, (float)H3_VIDEO_SIGMA_SHIFT,
+        (float)H3_AUDIO_SIGMA_SHIFT, schedule);
 }
 
 /* Incomplete beta series on [0,0.5]; symmetry covers the other half.
@@ -194,8 +204,12 @@ static double beta_quantile(double p) {
     return p > 0.5 ? 1.0 - x : x;
 }
 
-int h3_beta_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
-    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+int h3_beta_schedule_build_shifted(int evaluations, float video_shift,
+                                   float audio_shift,
+                                   h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS ||
+        !isfinite(video_shift) || !isfinite(audio_shift) ||
+        video_shift <= 0.0f || audio_shift <= 0.0f) return 0;
     memset(schedule, 0, sizeof(*schedule));
     int previous = -1;
     for (int i = 0; i < evaluations; i++) {
@@ -205,10 +219,18 @@ int h3_beta_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
         previous = index;
         float base = (float)(index + 1) / 1000.0f;
         int step = schedule->steps++;
-        schedule->video[step] = 12.0f * base / (1.0f + 11.0f * base);
-        schedule->audio[step] = 3.0f * base / (1.0f + 2.0f * base);
+        schedule->video[step] = video_shift * base /
+            (1.0f + (video_shift - 1.0f) * base);
+        schedule->audio[step] = audio_shift * base /
+            (1.0f + (audio_shift - 1.0f) * base);
     }
     return 1;
+}
+
+int h3_beta_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
+    return h3_beta_schedule_build_shifted(
+        evaluations, (float)H3_VIDEO_SIGMA_SHIFT,
+        (float)H3_AUDIO_SIGMA_SHIFT, schedule);
 }
 
 int h3_restart_schedule_build(int schedule_steps, int restart_steps,

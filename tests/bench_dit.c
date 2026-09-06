@@ -1641,7 +1641,7 @@ int main(int argc, char **argv) {
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, use_fp32_bf16_accumulator,
             0, 0, 0, 0, 0, 0,
-            use_slower_grouped_quantizer, use_int8_row_fc2,
+            use_slower_grouped_quantizer, use_int8_row_fc2, NULL,
             video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
@@ -1653,7 +1653,7 @@ int main(int argc, char **argv) {
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, use_fp32_bf16_accumulator,
             0, 0, 0, 0, 0, 0,
-            use_slower_grouped_quantizer, use_int8_row_fc2,
+            use_slower_grouped_quantizer, use_int8_row_fc2, NULL,
             NULL, NULL, error,
             sizeof(error));
     }
