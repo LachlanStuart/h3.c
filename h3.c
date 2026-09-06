@@ -188,6 +188,10 @@ static char *h3_prepared_key(const char *conditioning,
         free(key.text);
         return NULL;
     }
+    if (!h3_key_file(&key, "dit-checkpoint", params->dit_checkpoint)) {
+        free(key.text);
+        return NULL;
+    }
     return key.text;
 }
 
@@ -864,7 +868,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     int ref2va = params->reference_count != 0;
-    if (ref2va && !ctx->model.ref2va_transformer.files) {
+    if (ref2va && !ctx->model.ref2va_transformer.files &&
+        !params->dit_checkpoint) {
         h3_set_error(ctx, "ordered references require the Ref2VA checkpoint");
         return NULL;
     }
@@ -922,7 +927,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
     char *text_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/text_encoder" : "FL2VA/text_encoder");
-    char *dit_path = h3_path(ctx->model_dir, ref2va ?
+    char *dit_path = params->dit_checkpoint ?
+        strdup(params->dit_checkpoint) : h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/transformer" : "FL2VA/transformer");
     char *vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");

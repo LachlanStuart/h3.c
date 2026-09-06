@@ -19,6 +19,7 @@ static void usage(const char *program) {
         "       %s -d MODEL_DIR --info\n\n"
         "Options:\n"
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
+        "      --dit-checkpoint PATH  Exact standalone DiT safetensors file\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
         "      --width N          Output width (default: 864)\n"
@@ -230,6 +231,7 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 
 int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
+           OPT_DIT_CHECKPOINT,
            OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_REUSE,
            OPT_LAYERS,
            OPT_CORE_REUSE,
@@ -254,6 +256,7 @@ int main(int argc, char **argv) {
            OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
+        {"dit-checkpoint", required_argument, NULL, OPT_DIT_CHECKPOINT},
         {"prompt", required_argument, NULL, 'p'},
         {"output", required_argument, NULL, 'o'},
         {"width", required_argument, NULL, OPT_WIDTH},
@@ -324,6 +327,7 @@ int main(int argc, char **argv) {
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
             case 'd': model_dir = optarg; break;
+            case OPT_DIT_CHECKPOINT: params.dit_checkpoint = optarg; break;
             case 'p': prompt = optarg; break;
             case 'o': output = optarg; break;
             case 'h': usage(argv[0]); return 0;
