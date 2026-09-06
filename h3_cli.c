@@ -168,6 +168,7 @@ static void print_help(void) {
     puts("  !frames [N]              Set or show requested frames");
     puts("  !seconds [N]             Set duration at 24 fps");
     puts("  !steps [N]               Set or show denoising steps");
+    puts("  !scheduler [beta|simple] Set or show the sigma grid");
     puts("  !sampler [res|euler]     Set or show the sampler");
     puts("  !reuse [N]               Set or show denoiser reuse");
     puts("  !layers [N]              Set or show active DiT blocks");
@@ -201,10 +202,11 @@ static void print_status(const h3_cli_state *state) {
                state->params.render_height);
     printf("\nFrames: %d requested, %d generated (%.3g seconds)\n",
            state->params.frames, aligned, (double)aligned / H3_FPS);
-    printf("Steps: %d | sampler: %s | reuse: %d | layers: %d | core reuse: %d | "
+    printf("Steps: %d | sampler: %s | scheduler: %s | reuse: %d | layers: %d | core reuse: %d | "
            "tokens: %s | weights: %s | FC2: %s\n",
            state->params.steps,
            state->params.sampler == H3_SAMPLER_RES ? "RES" : "Euler",
+           state->params.scheduler == H3_SCHEDULER_BETA ? "beta" : "simple",
            state->params.denoise_reuse,
            state->params.dit_layers, state->params.core_reuse,
            state->params.token_reduction ? "reduced" : "full",
@@ -593,6 +595,15 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         }
     } else if (!strcasecmp(command, "steps")) {
         set_integer(argument, "Steps", 1, H3_MAX_STEPS, &state->params.steps);
+    } else if (!strcasecmp(command, "scheduler")) {
+        if (!*argument)
+            printf("Scheduler: %s\n", state->params.scheduler == H3_SCHEDULER_BETA ?
+                   "beta" : "simple");
+        else if (!strcasecmp(argument, "beta"))
+            state->params.scheduler = H3_SCHEDULER_BETA;
+        else if (!strcasecmp(argument, "simple"))
+            state->params.scheduler = H3_SCHEDULER_SIMPLE;
+        else fprintf(stderr, "h3: scheduler must be beta or simple\n");
     } else if (!strcasecmp(command, "sampler")) {
         if (!*argument)
             printf("Sampler: %s\n", state->params.sampler == H3_SAMPLER_RES ?

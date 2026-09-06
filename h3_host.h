@@ -114,6 +114,9 @@ double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
+/* Beta(0.6,0.6) inverse-CDF spacing on the 1000-entry sigma table.
+ * Repeated rounded indices are omitted, so steps can be below evaluations. */
+int h3_beta_schedule_build(int evaluations, h3_sigma_schedule *schedule);
 /* Full M-step serving video schedule plus frozen-zero audio schedule. */
 int h3_restart_schedule_build(int schedule_steps, int restart_steps,
                               h3_sigma_schedule *schedule, int *start_step);

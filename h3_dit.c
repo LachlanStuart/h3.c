@@ -2895,13 +2895,13 @@ static int denoise_res_gpu(h3_dit *dit, float *video_latent,
 }
 
 int h3_dit_restart_refine(h3_dit *dit, float *video_latent,
-                          const float *frozen_audio, int start_step,
+                          const float *frozen_audio, int start_step, int use_euler,
                           h3_dit_progress progress, void *progress_opaque,
                           char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!dit || !video_latent || !frozen_audio || start_step < 0 ||
         start_step >= dit->sigmas.steps ||
-        !ensure_previous_denoised(dit, error, error_size)) {
+        (!use_euler && !ensure_previous_denoised(dit, error, error_size))) {
         fail(error, error_size, "invalid restart refinement arguments");
         return 0;
     }
@@ -2932,23 +2932,31 @@ int h3_dit_restart_refine(h3_dit *dit, float *video_latent,
         int multistep = 0;
         report(progress, progress_opaque, "restart refine enqueue",
                step - start_step, dit->sigmas.steps - start_step);
-        if (step != start_step &&
+        if (!use_euler && step != start_step &&
             !res_coefficients(dit->sigmas.video, step, dit->sigmas.steps,
                               &decay, &h, &b1, &b2, &multistep)) {
             fail(error, error_size, "cannot derive restart RES coefficients");
             ok = 0;
             break;
         }
-        /* The restart has no x0 at step-1. Bootstrap with the Euler branch
-         * in the resident RES kernel; later transitions retain x0 history. */
-        ok = encode_forward(dit, step, 0, 0, 0, error, error_size) &&
-            gpu_op(dit, h3_gpu_res_velocity_bf16(
+        ok = encode_forward(dit, step, 0, 0, 0, error, error_size);
+        if (ok && use_euler) {
+            ok = gpu_op(dit, h3_gpu_euler_bf16(
+                dit->gpu, dit->video_input, video_offset,
+                dit->video_output_bf16, dit->video_output_bf16,
+                (uint32_t)video_count,
+                dit->sigmas.video[step] - dit->sigmas.video[step + 1],
+                0.0f), error, error_size, "GPU restart Euler transition");
+        } else if (ok) {
+            /* A RES restart has no preceding x0; bootstrap with Euler. */
+            ok = gpu_op(dit, h3_gpu_res_velocity_bf16(
                 dit->gpu, dit->video_input, video_offset,
                 dit->video_output_bf16, dit->previous_video_denoised,
                 (uint32_t)video_count, dit->sigmas.video[step],
                 dit->sigmas.video[step + 1], decay, h, b1, b2,
                 step == start_step ? 0 : multistep), error, error_size,
                 "GPU restart video transition");
+        }
         if (ok) report(progress, progress_opaque, "restart refine enqueue",
                        step - start_step + 1, dit->sigmas.steps - start_step);
     }
@@ -2961,7 +2969,8 @@ int h3_dit_restart_refine(h3_dit *dit, float *video_latent,
     free(video_rows);
     if (!ok && (!error || !*error))
         fail(error, error_size, "GPU restart refinement failed");
-    h3_gpu_profile_mark(dit->gpu, "restart video-only RES");
+    h3_gpu_profile_mark(dit->gpu, use_euler ?
+        "restart video-only Euler" : "restart video-only RES");
     return ok;
 }
 

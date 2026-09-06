@@ -165,6 +165,52 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+/* Incomplete beta series on [0,0.5]; symmetry covers the other half.
+ * Parameters are fixed to the production Beta(0.6,0.6) schedule. */
+static double beta_cdf_lower(double x) {
+    const double a = 0.6;
+    double term = 1.0, sum = 1.0 / a;
+    for (int n = 1; n < 200; n++) {
+        term *= ((double)n - a) * x / (double)n;
+        double increment = term / (a + (double)n);
+        sum += increment;
+        if (increment < 1e-16 * sum) break;
+    }
+    return pow(x, a) * sum / exp(2.0 * lgamma(a) - lgamma(2.0 * a));
+}
+
+static double beta_quantile(double p) {
+    if (p == 0.5) return 0.5;
+    if (p >= 1.0) return 1.0;
+    if (p <= 0.0) return 0.0;
+    double target = p > 0.5 ? 1.0 - p : p;
+    double low = 0.0, high = 0.5;
+    for (int iteration = 0; iteration < 64; iteration++) {
+        double mid = (low + high) * 0.5;
+        if (beta_cdf_lower(mid) < target) low = mid;
+        else high = mid;
+    }
+    double x = (low + high) * 0.5;
+    return p > 0.5 ? 1.0 - x : x;
+}
+
+int h3_beta_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    int previous = -1;
+    for (int i = 0; i < evaluations; i++) {
+        double p = 1.0 - (double)i / (double)evaluations;
+        int index = (int)nearbyint(999.0 * beta_quantile(p));
+        if (index == previous) continue;
+        previous = index;
+        float base = (float)(index + 1) / 1000.0f;
+        int step = schedule->steps++;
+        schedule->video[step] = 12.0f * base / (1.0f + 11.0f * base);
+        schedule->audio[step] = 3.0f * base / (1.0f + 2.0f * base);
+    }
+    return 1;
+}
+
 int h3_restart_schedule_build(int schedule_steps, int restart_steps,
                               h3_sigma_schedule *schedule, int *start_step) {
     if (!schedule || !start_step || restart_steps < 1 ||

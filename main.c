@@ -33,7 +33,8 @@ static void usage(const char *program) {
         "      --frames N         Requested frames (default: 56)\n"
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
         "      --steps N          Denoising passes (default: 20)\n"
-        "      --sampler S        Sampler: res (default) or euler\n"
+        "      --scheduler S      Sigma grid: beta (default, 0.6/0.6) or simple\n"
+        "      --sampler S        Sampler: euler (default) or res\n"
         "      --video-codec C    Video codec: h264 (default) or ffv1 (.mkv)\n"
         "      --video-preset P  libx264 preset (default: slow)\n"
         "      --video-crf N     libx264 CRF 0..51 (default: 18)\n"
@@ -89,6 +90,13 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+static h3_scheduler parse_scheduler(const char *value) {
+    if (!strcmp(value, "beta")) return H3_SCHEDULER_BETA;
+    if (!strcmp(value, "simple")) return H3_SCHEDULER_SIMPLE;
+    fprintf(stderr, "h3: scheduler must be beta or simple\n");
+    exit(2);
 }
 
 static h3_sampler parse_sampler(const char *value) {
@@ -287,7 +295,7 @@ static int cli_frame(const h3_frame *frame, void *opaque) {
 int main(int argc, char **argv) {
     enum { OPT_WIDTH = 1000, OPT_HEIGHT, OPT_RENDER_WIDTH, OPT_RENDER_HEIGHT,
            OPT_DIT_CHECKPOINT,
-           OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_SAMPLER, OPT_REUSE,
+           OPT_FRAMES, OPT_SECONDS, OPT_STEPS, OPT_SAMPLER, OPT_SCHEDULER, OPT_REUSE,
            OPT_AUDIO_ONLY,
            OPT_VIDEO_CODEC, OPT_VIDEO_PRESET, OPT_VIDEO_CRF,
            OPT_LOSSLESS_OUTPUT, OPT_LATENT_OUTPUT,
@@ -329,6 +337,7 @@ int main(int argc, char **argv) {
         {"seconds", required_argument, NULL, OPT_SECONDS},
         {"steps", required_argument, NULL, OPT_STEPS},
         {"sampler", required_argument, NULL, OPT_SAMPLER},
+        {"scheduler", required_argument, NULL, OPT_SCHEDULER},
         {"audio-only", no_argument, NULL, OPT_AUDIO_ONLY},
         {"video-codec", required_argument, NULL, OPT_VIDEO_CODEC},
         {"video-preset", required_argument, NULL, OPT_VIDEO_PRESET},
@@ -430,6 +439,7 @@ int main(int argc, char **argv) {
                 break;
             case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
             case OPT_SAMPLER: params.sampler = parse_sampler(optarg); break;
+            case OPT_SCHEDULER: params.scheduler = parse_scheduler(optarg); break;
             case OPT_AUDIO_ONLY: params.audio_only = 1; break;
             case OPT_VIDEO_CODEC:
                 params.video_codec = parse_video_codec(optarg);

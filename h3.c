@@ -170,11 +170,11 @@ static char *h3_prepared_key(const char *conditioning,
         params->restart_schedule_steps : params->steps;
     if (!h3_key_append(
             &key,
-            "%s|shape=%dx%dx%d|steps=%d|restart=%d|layers=%d|reuse-core=%d|reduce=%d"
+            "%s|shape=%dx%dx%d|steps=%d|scheduler=%d|restart=%d|layers=%d|reuse-core=%d|reduce=%d"
             "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
             "|fp32-bf16-accum=%d|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
-            schedule_steps, params->refine_video_path != NULL,
+            schedule_steps, params->scheduler, params->refine_video_path != NULL,
             params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
@@ -535,6 +535,11 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "unknown sampler");
         return 0;
     }
+    if (params->scheduler != H3_SCHEDULER_SIMPLE &&
+        params->scheduler != H3_SCHEDULER_BETA) {
+        h3_set_error(ctx, "unknown scheduler");
+        return 0;
+    }
     if (params->latent_output_path && !*params->latent_output_path) {
         h3_set_error(ctx, "latent output path must not be empty");
         return 0;
@@ -565,12 +570,12 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         }
     }
     if (params->refine_video_path) {
-        if (!*params->refine_video_path || params->sampler != H3_SAMPLER_RES ||
+        if (!*params->refine_video_path ||
             !params->freeze_audio || params->restart_schedule_steps < 2 ||
             params->restart_schedule_steps > H3_MAX_STEPS ||
             params->restart_steps < 1 ||
             params->restart_steps > params->restart_schedule_steps) {
-            h3_set_error(ctx, "restart refinement requires --sampler res, "
+            h3_set_error(ctx, "restart refinement requires "
                 "--freeze-audio, and 1 <= restart steps <= schedule steps");
             return 0;
         }
@@ -1602,13 +1607,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int schedule_steps = refine ? params->restart_schedule_steps : params->steps;
     h3_sigma_schedule sigmas;
     int restart_start = 0;
-    if (refine ? !h3_restart_schedule_build(schedule_steps,
-                params->restart_steps, &sigmas, &restart_start) :
-            !h3_serving_schedule_build(schedule_steps, &sigmas)) {
+    int schedule_ok = params->scheduler == H3_SCHEDULER_BETA ?
+        h3_beta_schedule_build(schedule_steps, &sigmas) :
+        h3_serving_schedule_build(schedule_steps, &sigmas);
+    if (!schedule_ok || (refine && params->restart_steps > sigmas.steps)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
     if (refine) {
+        restart_start = sigmas.steps - params->restart_steps;
+        memset(sigmas.audio, 0, sizeof(sigmas.audio));
         int start = restart_start;
         fprintf(stderr, "h3: restart refinement video schedule M=%d N=%d indices %d..%d\n",
                 sigmas.steps, params->restart_steps, start, sigmas.steps);
@@ -1807,7 +1815,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_rng_fill_normal(&audio_rng, audio, audio_count);
     }
     int denoised = refine ? h3_dit_restart_refine(dit, video, audio,
-            restart_start, h3_dit_progress_bridge,
+            restart_start, params->sampler == H3_SAMPLER_EULER,
+            h3_dit_progress_bridge,
             &progress, detail, sizeof(detail)) : params->sampler == H3_SAMPLER_RES ?
         h3_dit_denoise(dit, video, audio, h3_dit_progress_bridge, &progress,
                        detail, sizeof(detail)) :

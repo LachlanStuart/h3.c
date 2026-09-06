@@ -120,7 +120,7 @@ For a very short iteration, request four denoising passes directly:
   -o outputs/fox-four-step.mp4
 ```
 
-`--steps N` always means exactly N denoising passes. Four through seven passes
+`--steps N` requests N denoising passes (beta omits duplicate table indices at high counts). Four through seven passes
 use the same schedule that won the low-budget comparison; increasing from 4
 to 7 progressively improves detail and motion. Keep `--reuse 1` at such small
 budgets so every requested pass runs the model. `--show` displays one preview
@@ -193,7 +193,7 @@ These controls are independent unless noted otherwise:
 
 | Control | Slow reference | Default | Aggressive | Main impact |
 |---|---:|---:|---:|---|
-| Denoising passes | `--steps 50` | `--steps 20` | `--steps 4..7` | The number always names actual denoising passes. |
+| Denoising passes | `--steps 50` | `--steps 20` | `--steps 4..7` | Beta omits duplicate table indices at high counts. |
 | Whole denoiser reuse | `--reuse 1` | `--reuse 2` | `--reuse 3` | At 20 steps: 20, 11, or 8 fresh DiT evaluations. |
 | Active DiT blocks | `--layers 50` | `--layers 45` | `--layers 40` | Fewer blocks reduce compute and resident transformer weights. |
 | Core residual reuse | `--core-reuse 1` | `--core-reuse 4` | `--core-reuse 6` | Refreshes patch/head work every step but runs the expensive core less often. |
@@ -327,6 +327,11 @@ the next legal shape, 1093 frames (45.542 seconds).
 
 ### 6. Generate audio only
 
+Euler/beta is also the audio-only default. If the initial audio creation is
+low quality, an optional retry with `--sampler res --scheduler simple --reuse 1`
+may give better results. Keep the same prompt and step budget and save a
+separate candidate.
+
 Pass `--audio-only` to keep the joint DiT denoising and AudioVAE decode while
 skipping VideoVAE RGB decode, frame callbacks, and video muxing. The output is
 a standalone 16-bit PCM WAV at H3's native 32 kHz stereo rate:
@@ -400,7 +405,7 @@ F32 PCM (subject to the FFV1/Matroska support in the local FFmpeg build):
 
 ```sh
 ./h3 -d ./MiniMax-H3 -p "..." --width 608 --height 352 --frames 260 \
-  --steps 10 --sampler res --frames-dir output/frames \
+  --steps 10 --sampler euler --scheduler beta --frames-dir output/frames \
   -o output/slow.mp4 --video-preset slow --video-crf 18 \
   --lossless-output output/lossless.mkv
 ```
@@ -544,24 +549,16 @@ environment variables retained for exact A/B diagnosis.
 
 ### Sampler and DiT controls
 
-`--sampler res` is the local default after paired visual review; `--sampler
-euler` remains available for live denoising previews and whole-denoiser reuse.
-Both use the released shifted video/audio schedules, and both update video and
-audio. RES uses the current and previous denoised estimates on middle steps;
-the present implementation transfers its state through the host and was about
-10.5% slower in denoising in a 10-step 608x352 Ref2VA comparison. `--steps`
-always names the number of denoising passes, with terminal zero added after the
-last pass. Whole-denoiser reuse is Euler-only: it evaluates the first and last pass plus every
-requested interval, then extrapolates skipped video and audio velocities on
-their independent schedules. With very small step counts, keep `--reuse 1`.
+The local default is `--sampler euler --scheduler beta`, for ordinary generation
+and video-only restart refinement. Beta spacing uses alpha = beta = 0.6 on the
+1000-entry timestep table, with video shift 12 and audio shift 3. The beta grid
+ends with an explicit transition to zero. At high requested step counts,
+duplicate rounded table indices are omitted; normal draft and production
+budgets retain their requested number of evaluations.
 
-For the low-budget path, the released linear base grid won against
-actual-video-sigma linear spacing,
-quadratic and cubic warps, exact 30-point tail subsets, mild power warps,
-zero-order held full-grid velocities, linear velocity extrapolation, and RES.
-The more tail-heavy candidates often sharpened the subject but damaged motion
-or left a repetitive woven background; sparse RES and long extrapolation
-intervals failed much more visibly.
+Whole-denoiser reuse evaluates the first and last pass plus every requested
+interval, then extrapolates skipped video and audio velocities on their
+independent schedules. Keep `--reuse 1` for ordinary production.
 
 Layer thinning ranks the checkpoint's actual AdaLN gates while protecting
 structurally important first and final blocks. Unused weights and schedule

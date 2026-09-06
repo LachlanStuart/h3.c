@@ -376,6 +376,58 @@ static void test_temporal_and_canvas(void) {
     CHECK(!h3_reference_video_canvas(0, 360, &width, &height));
 }
 
+static void test_beta_schedule(void) {
+    h3_sigma_schedule schedule;
+    h3_params defaults = H3_PARAMS_DEFAULT;
+    CHECK(defaults.sampler == H3_SAMPLER_EULER);
+    CHECK(defaults.scheduler == H3_SCHEDULER_BETA);
+    const int indices4[] = {999, 823, 500, 176};
+    CHECK(h3_beta_schedule_build(4, &schedule));
+    CHECK(schedule.steps == 4);
+    for (int i = 0; i < 4; i++) {
+        float base = (float)(indices4[i] + 1) / 1000.0f;
+        CHECK(close_enough(schedule.video[i], 12.0f * base / (1.0f + 11.0f * base), 1e-7));
+        CHECK(close_enough(schedule.audio[i], 3.0f * base / (1.0f + 2.0f * base), 1e-7));
+    }
+    CHECK(schedule.video[4] == 0.0f && schedule.audio[4] == 0.0f);
+    const int indices10[] = {999, 959, 876, 765, 637, 500, 362, 234, 123, 40};
+    CHECK(h3_beta_schedule_build(10, &schedule));
+    CHECK(schedule.steps == 10);
+    for (int i = 0; i < 10; i++) {
+        float base = (float)(indices10[i] + 1) / 1000.0f;
+        CHECK(close_enough(schedule.video[i], 12.0f * base / (1.0f + 11.0f * base), 1e-7));
+        CHECK(close_enough(schedule.audio[i], 3.0f * base / (1.0f + 2.0f * base), 1e-7));
+    }
+    CHECK(schedule.video[10] == 0.0f && schedule.audio[10] == 0.0f);
+    const int indices15[] = {999, 979, 936, 876, 805, 724, 637, 546, 453, 362, 275, 194, 123, 63, 20};
+    CHECK(h3_beta_schedule_build(15, &schedule));
+    CHECK(schedule.steps == 15);
+    for (int i = 0; i < 15; i++) {
+        float base = (float)(indices15[i] + 1) / 1000.0f;
+        CHECK(close_enough(schedule.video[i], 12.0f * base / (1.0f + 11.0f * base), 1e-7));
+        CHECK(close_enough(schedule.audio[i], 3.0f * base / (1.0f + 2.0f * base), 1e-7));
+    }
+    CHECK(schedule.video[15] == 0.0f && schedule.audio[15] == 0.0f);
+    const int indices20[] = {999, 986, 959, 922, 876, 823, 765, 703, 637, 569, 500, 430, 362, 296, 234, 176, 123, 77, 40, 13};
+    CHECK(h3_beta_schedule_build(20, &schedule));
+    CHECK(schedule.steps == 20);
+    for (int i = 0; i < 20; i++) {
+        float base = (float)(indices20[i] + 1) / 1000.0f;
+        CHECK(close_enough(schedule.video[i], 12.0f * base / (1.0f + 11.0f * base), 1e-7));
+        CHECK(close_enough(schedule.audio[i], 3.0f * base / (1.0f + 2.0f * base), 1e-7));
+    }
+    CHECK(schedule.video[20] == 0.0f && schedule.audio[20] == 0.0f);
+    CHECK(h3_beta_schedule_build(1000, &schedule));
+    CHECK(schedule.steps == 847);
+    for (int i = 0; i < schedule.steps; i++) {
+        CHECK(schedule.video[i] > schedule.video[i + 1]);
+        CHECK(schedule.audio[i] > schedule.audio[i + 1]);
+    }
+    CHECK(!h3_beta_schedule_build(1, &schedule));
+    CHECK(!h3_beta_schedule_build(1001, &schedule));
+    CHECK(!h3_beta_schedule_build(20, NULL));
+}
+
 static void test_schedule(void) {
     h3_params defaults = H3_PARAMS_DEFAULT;
     CHECK(defaults.steps == 20);
@@ -849,6 +901,7 @@ int main(void) {
     test_gpu_continue_drain();
     test_temporal_and_canvas();
     test_schedule();
+    test_beta_schedule();
     test_dit_reuse_schedule();
     test_layout_tiny();
     test_layout_fl2va();

@@ -103,10 +103,11 @@ int h3_dit_forward(h3_dit *dit, int step,
 int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
                    h3_dit_progress progress, void *progress_opaque,
                    char *error, size_t error_size);
-/* Restart suffix sampler: video transitions [start,steps), with an Euler
- * bootstrap at start and RES thereafter. Audio stays resident but immutable. */
+/* Restart suffix sampler: video transitions [start,steps). use_euler selects
+ * Euler throughout; otherwise bootstrap RES with Euler and retain x0 history.
+ * Audio stays resident but immutable. */
 int h3_dit_restart_refine(h3_dit *dit, float *video_latent,
-                          const float *frozen_audio, int start_step,
+                          const float *frozen_audio, int start_step, int use_euler,
                           h3_dit_progress progress, void *progress_opaque,
                           char *error, size_t error_size);
 

@@ -55,6 +55,11 @@ typedef enum {
     H3_SAMPLER_EULER = 1
 } h3_sampler;
 
+typedef enum {
+    H3_SCHEDULER_SIMPLE = 0,
+    H3_SCHEDULER_BETA = 1
+} h3_scheduler;
+
 /* H.264 is the portable delivery format. FFV1 is an RGB lossless diagnostic
  * format and must be written to a Matroska (.mkv) container. */
 typedef enum {
@@ -99,6 +104,7 @@ typedef struct {
     int frames;
     int steps;
     h3_sampler sampler;
+    h3_scheduler scheduler;
     uint64_t seed;
     /* Optional exact DiT safetensors file. The remaining tokenizer, text
      * encoder, and VAEs continue to come from model_dir. */
@@ -197,7 +203,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     .width = H3_DEFAULT_WIDTH, .height = H3_DEFAULT_HEIGHT, \
     .frames = H3_DEFAULT_FRAMES, .steps = H3_DEFAULT_STEPS, \
-    .sampler = H3_SAMPLER_RES, .seed = UINT64_C(42), \
+    .sampler = H3_SAMPLER_EULER, .scheduler = H3_SCHEDULER_BETA, .seed = UINT64_C(42), \
     .video_codec = H3_VIDEO_CODEC_H264, \
     .video_preset = H3_VIDEO_PRESET_SLOW, .video_crf = 18, \
     .reference_image_size = H3_REFERENCE_IMAGE_MATCH, \
