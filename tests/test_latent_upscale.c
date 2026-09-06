@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -25,7 +26,26 @@ static int invoke(const char *script, float **output, int *time,
 }
 
 /* The fake child covers framing and all bridge failure paths without Torch/MPS. */
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 4) {
+        /* Exercise the real publisher's temporal-chunking path through the
+         * production pipe, without spending an H3 denoising pass. */
+        const int tokens = 52, h = 2, w = 2;
+        float input[24 * 52 * 2 * 2];
+        for (size_t i = 0; i < sizeof(input) / sizeof(input[0]); i++)
+            input[i] = (float)(i % 101) / 31.0f - 1.5f;
+        float *output = NULL;
+        int ot = 0, oh = 0, ow = 0;
+        char error[256];
+        int ok = h3_latent_upscale_pipe(NULL, argv[1], argv[2], argv[3],
+            input, tokens, h, w, &output, &ot, &oh, &ow, error, sizeof(error));
+        if (!ok) fprintf(stderr, "%s\n", error);
+        assert(ok && ot == tokens && oh == h * 2 && ow == w * 2);
+        free(output);
+        puts("ok: real chunked upscaler preserves the binary pipe");
+        return 0;
+    }
+    assert(argc == 1);
     char path[] = "/tmp/h3-upscale-XXXXXX";
     int descriptor = mkstemp(path);
     assert(descriptor >= 0);

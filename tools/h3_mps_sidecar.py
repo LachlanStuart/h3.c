@@ -19,6 +19,7 @@ format.
 """
 
 import argparse
+import contextlib
 import gc
 import hashlib
 import importlib.util
@@ -206,9 +207,13 @@ def main():
     if not keys or set(dtype_counts) != {"BF16"}:
         raise ValueError(f"checkpoint is not entirely BF16: {dtype_counts}")
 
-    module = import_published_upscaler(
-        args.source, os.path.dirname(args.checkpoint)
-    )
+    # Publisher diagnostics (including temporal chunking for T > 32) must
+    # never enter the binary stdout protocol, even as a delayed text flush.
+    binary_output = sys.stdout.buffer
+    with contextlib.redirect_stdout(sys.stderr):
+        module = import_published_upscaler(
+            args.source, os.path.dirname(args.checkpoint)
+        )
     input_cpu = read_latent_stream(sys.stdin.buffer) if args.stream else read_latent(args.input)
     input_shape = list(input_cpu.shape)
     input_metrics = tensor_stats(input_cpu)
@@ -218,7 +223,7 @@ def main():
     device = torch.device("mps")
     torch.mps.empty_cache()
     started = time.perf_counter()
-    with MemorySampler() as memory:
+    with MemorySampler() as memory, contextlib.redirect_stdout(sys.stderr):
         safetensors_started = time.perf_counter()
         raw_state = module._load_raw_sd(args.checkpoint)
         safetensors_seconds = time.perf_counter() - safetensors_started
@@ -294,7 +299,7 @@ def main():
         if learned_delta_rmse <= 1e-4:
             raise RuntimeError("learned output collapsed to trilinear substitution")
         if args.stream:
-            write_latent_stream(sys.stdout.buffer, output_cpu)
+            write_latent_stream(binary_output, output_cpu)
         else:
             write_latent(args.output, output_cpu)
 
