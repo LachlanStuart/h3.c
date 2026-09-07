@@ -41,6 +41,11 @@ struct int8_quant_args {
     float clip;
 };
 
+struct curve_args {
+    uint rows;
+    uint table_rows;
+};
+
 struct int8_head_major_quant_args {
     uint rows;
     uint padded_rows;
@@ -197,6 +202,55 @@ kernel void h3_cast_bf16_to_f32(device const ushort *input [[buffer(0)]],
                                 constant uint &count [[buffer(2)]],
                                 uint gid [[thread_position_in_grid]]) {
     if (gid < count) output[gid] = h3_bf16_to_f32(input[gid]);
+}
+
+kernel void h3_adaln_table_interpolate_f32(
+                                device const float *times [[buffer(0)]],
+                                device const float *table [[buffer(1)]],
+                                device float *output [[buffer(2)]],
+                                constant curve_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint rank = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || rank >= 8 || args.table_rows < 2) return;
+    float position = clamp(times[row], 0.0f, 1.0f) *
+                     float(args.table_rows - 1);
+    uint lower = min((uint)floor(position), args.table_rows - 2);
+    float fraction = position - float(lower);
+    float left = table[lower * 8 + rank];
+    float right = table[(lower + 1) * 8 + rank];
+    output[row * 8 + rank] = mix(left, right, fraction);
+}
+
+kernel void h3_linear_rank8_f16_bf16(
+                                device const float *input [[buffer(0)]],
+                                device const half *weight [[buffer(1)]],
+                                device const half *bias [[buffer(2)]],
+                                device ushort *output [[buffer(3)]],
+                                constant linear_args &args [[buffer(4)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.output_dim) return;
+    float sum = (float)bias[column];
+    for (uint rank = 0; rank < 8; rank++)
+        sum = fma(input[row * 8 + rank],
+                  (float)weight[column * 8 + rank], sum);
+    output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
+}
+
+kernel void h3_cast_f32_to_f16(device const float *input [[buffer(0)]],
+                               device half *output [[buffer(1)]],
+                               constant uint &count [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = half(input[gid]);
+}
+
+kernel void h3_cast_f16_to_f32(device const half *input [[buffer(0)]],
+                               device float *output [[buffer(1)]],
+                               constant uint &count [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = float(input[gid]);
 }
 
 struct norm_args {
@@ -494,6 +548,30 @@ static int h3_reflect_coordinate(int coordinate, int length) {
     return coordinate;
 }
 
+kernel void h3_vae_encoder_normalize_pixels_f16(
+                            device const float *input [[buffer(0)]],
+                            device half *output [[buffer(1)]],
+                            constant vae_encoder_pad_args &args [[buffer(2)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint channel = gid.x;
+    uint x = gid.y;
+    uint plane = gid.z;
+    if (channel >= 3 || x >= args.width ||
+        plane >= args.batch * args.depth * args.height) return;
+    uint y = plane % args.height;
+    uint temporal_plane = plane / args.height;
+    uint time = temporal_plane % args.depth;
+    uint batch = temporal_plane / args.depth;
+    size_t source = ((((size_t)batch * 3 + channel) * args.depth + time) *
+                     args.height + y) * args.width + x;
+    size_t destination = ((((size_t)batch * args.depth + time) * args.height +
+                           y) * args.width + x) * 3 + channel;
+    constexpr float mean[3] = {0.485f, 0.456f, 0.406f};
+    constexpr float deviation[3] = {0.229f, 0.224f, 0.225f};
+    float normalized = (input[source] - mean[channel]) / deviation[channel];
+    output[destination] = half(normalized);
+}
+
 kernel void h3_vae_encoder_pad_f32(
                             device const float *input [[buffer(0)]],
                             device float *output [[buffer(1)]],
@@ -529,6 +607,41 @@ kernel void h3_vae_encoder_pad_f32(
     output[destination] = input[source];
 }
 
+kernel void h3_vae_encoder_pad_f16(
+                            device const half *input [[buffer(0)]],
+                            device half *output [[buffer(1)]],
+                            constant vae_encoder_pad_args &args [[buffer(2)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint channel = gid.x;
+    uint out_x = gid.y;
+    uint out_height = args.height + args.height_before + args.height_after;
+    uint out_width = args.width + args.width_before + args.width_after;
+    uint out_depth = args.depth + args.depth_front;
+    uint plane = gid.z;
+    if (channel >= args.channels || out_x >= out_width ||
+        plane >= args.batch * out_depth * out_height) return;
+    uint out_y = plane % out_height;
+    uint temporal_plane = plane / out_height;
+    uint out_t = temporal_plane % out_depth;
+    uint batch = temporal_plane / out_depth;
+    size_t destination = ((((size_t)batch * out_depth + out_t) * out_height +
+                           out_y) * out_width + out_x) * args.channels +
+                         channel;
+    if (out_t < args.depth_front) {
+        output[destination] = half(0.0f);
+        return;
+    }
+    int source_y = h3_reflect_coordinate(
+        int(out_y) - int(args.height_before), int(args.height));
+    int source_x = h3_reflect_coordinate(
+        int(out_x) - int(args.width_before), int(args.width));
+    uint source_t = out_t - args.depth_front;
+    size_t source = ((((size_t)batch * args.depth + source_t) * args.height +
+                      uint(source_y)) * args.width + uint(source_x)) *
+                    args.channels + channel;
+    output[destination] = input[source];
+}
+
 struct vae_encoder_norm_args {
     uint batch;
     uint depth;
@@ -538,6 +651,127 @@ struct vae_encoder_norm_args {
     uint groups;
     float epsilon;
 };
+
+struct vae_encoder_stitch_args {
+    uint time_offset;
+    uint chunk_time;
+    uint full_time;
+    uint full_height;
+    uint full_width;
+    uint tile_height;
+    uint tile_width;
+    uint destination_y;
+    uint destination_x;
+    uint overlap_y;
+    uint overlap_x;
+    uint keep_height;
+    uint keep_width;
+    uint has_above;
+    uint has_left;
+};
+
+kernel void h3_vae_encoder_stitch_latent_f32(
+                            device const float *current [[buffer(0)]],
+                            device const float *above [[buffer(1)]],
+                            device const float *left [[buffer(2)]],
+                            device const float *mean [[buffer(3)]],
+                            device const float *std [[buffer(4)]],
+                            device float *output [[buffer(5)]],
+                            constant vae_encoder_stitch_args &args [[buffer(6)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint x = gid.x;
+    uint y = gid.y;
+    uint plane = gid.z;
+    if (x >= args.keep_width || y >= args.keep_height ||
+        plane >= args.chunk_time * 24) return;
+    uint channel = plane % 24;
+    uint time = plane / 24;
+    size_t current_index = (((size_t)time * args.tile_height + y) *
+                            args.tile_width + x) * 48 + channel;
+    float value = current[current_index];
+    if (args.has_above && y < args.overlap_y) {
+        uint above_y = args.tile_height - args.overlap_y + y;
+        size_t above_index = (((size_t)time * args.tile_height + above_y) *
+                              args.tile_width + x) * 48 + channel;
+        float weight = float(y) / float(args.overlap_y);
+        value = above[above_index] * (1.0f - weight) + value * weight;
+    }
+    if (args.has_left && x < args.overlap_x) {
+        uint left_x = args.tile_width - args.overlap_x + x;
+        size_t left_index = (((size_t)time * args.tile_height + y) *
+                             args.tile_width + left_x) * 48 + channel;
+        float weight = float(x) / float(args.overlap_x);
+        value = left[left_index] * (1.0f - weight) + value * weight;
+    }
+    size_t destination = (((size_t)channel * args.full_time +
+                           args.time_offset + time) * args.full_height +
+                          args.destination_y + y) * args.full_width +
+                         args.destination_x + x;
+    output[destination] = (value - mean[channel]) / std[channel];
+}
+
+kernel void h3_vae_encoder_stitch_latent_f16(
+                            device const half *current [[buffer(0)]],
+                            device const half *above [[buffer(1)]],
+                            device const half *left [[buffer(2)]],
+                            device const float *mean [[buffer(3)]],
+                            device const float *std [[buffer(4)]],
+                            device float *output [[buffer(5)]],
+                            constant vae_encoder_stitch_args &args [[buffer(6)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint x = gid.x;
+    uint y = gid.y;
+    uint plane = gid.z;
+    if (x >= args.keep_width || y >= args.keep_height ||
+        plane >= args.chunk_time * 24) return;
+    uint channel = plane % 24;
+    uint time = plane / 24;
+    size_t current_index = (((size_t)time * args.tile_height + y) *
+                            args.tile_width + x) * 48 + channel;
+    float value = float(current[current_index]);
+    if (args.has_above && y < args.overlap_y) {
+        uint above_y = args.tile_height - args.overlap_y + y;
+        size_t above_index = (((size_t)time * args.tile_height + above_y) *
+                              args.tile_width + x) * 48 + channel;
+        float weight = float(y) / float(args.overlap_y);
+        value = float(above[above_index]) * (1.0f - weight) + value * weight;
+    }
+    if (args.has_left && x < args.overlap_x) {
+        uint left_x = args.tile_width - args.overlap_x + x;
+        size_t left_index = (((size_t)time * args.tile_height + y) *
+                             args.tile_width + left_x) * 48 + channel;
+        float weight = float(x) / float(args.overlap_x);
+        value = float(left[left_index]) * (1.0f - weight) + value * weight;
+    }
+    size_t destination = (((size_t)channel * args.full_time +
+                           args.time_offset + time) * args.full_height +
+                          args.destination_y + y) * args.full_width +
+                         args.destination_x + x;
+    output[destination] = (value - mean[channel]) / std[channel];
+}
+
+struct vae_encoder_take_args {
+    uint source_time;
+    uint destination_time;
+    uint height;
+    uint width;
+};
+
+kernel void h3_vae_encoder_temporal_take_f32(
+                            device const float *source [[buffer(0)]],
+                            device float *destination [[buffer(1)]],
+                            constant vae_encoder_take_args &args [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    uint plane = args.destination_time * args.height * args.width;
+    uint channel = gid / plane;
+    uint rem = gid % plane;
+    uint time = rem / (args.height * args.width);
+    uint spatial = rem % (args.height * args.width);
+    if (channel >= 24) return;
+    size_t source_index = ((size_t)channel * args.source_time + time) *
+                          args.height * args.width + spatial;
+    destination[gid] = source[source_index];
+}
 
 kernel void h3_vae_encoder_group_norm_silu_f32(
                             device const float *input [[buffer(0)]],
@@ -600,6 +834,70 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
         float value = (input[destination] - mean) * inverse * weight[channel] +
                       bias[channel];
         output[destination] = value / (1.0f + exp(-value));
+    }
+}
+
+kernel void h3_vae_encoder_group_norm_silu_f16(
+                            device const half *input [[buffer(0)]],
+                            device const half *weight [[buffer(1)]],
+                            device const half *bias [[buffer(2)]],
+                            device half *output [[buffer(3)]],
+                            constant vae_encoder_norm_args &args [[buffer(4)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 thread_position [[thread_position_in_threadgroup]],
+                            uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint rows = args.batch * args.depth * args.groups;
+    if (row >= rows) return;
+    uint channels_per_group = args.channels / args.groups;
+    uint group_index = row % args.groups;
+    uint temporal_plane = row / args.groups;
+    uint elements = args.height * args.width * channels_per_group;
+    threadgroup float reductions[256];
+    float local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        local += float(input[source]);
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = reductions[0] / float(elements);
+    local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        float centered = float(input[source]) - mean;
+        local = fma(centered, centered, local);
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(elements) + args.epsilon);
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t destination =
+            ((size_t)temporal_plane * args.height * args.width + spatial) *
+            args.channels + channel;
+        float value = (float(input[destination]) - mean) * inverse *
+                      float(weight[channel]) + float(bias[channel]);
+        output[destination] = half(value / (1.0f + exp(-value)));
     }
 }
 
@@ -1419,6 +1717,67 @@ kernel void h3_quantize_bf16_int8_rows_scalar(
     for (uint column = tid; column < args.columns; column += 256) {
         int quantized = (int)rint((float)input[base + column] * inverse);
         output[base + column] = (int8_t)clamp(quantized, -127, 127);
+    }
+}
+
+/* ConvRot activation boundary. One 256-thread group owns a complete row and
+ * walks its 256-wide groups. Four radix-4 H4 stages implement normalized
+ * H4^4 without transposes. The BF16-rounded rotation is used both for the row
+ * scale and final quantization, matching the checkpoint compute boundary. */
+kernel void h3_convrot_quantize_bf16_int8_rows(
+                           device const bfloat *input [[buffer(0)]],
+                           device bfloat *rotated [[buffer(1)]],
+                           device int8_t *output [[buffer(2)]],
+                           device float *scales [[buffer(3)]],
+                           constant int8_quant_args &args [[buffer(4)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    uint base = row * args.columns;
+    if (row >= args.rows) {
+        for (uint column = tid; column < args.columns; column += 256)
+            output[base + column] = 0;
+        if (tid == 0) scales[row] = 1.0f;
+        return;
+    }
+    threadgroup float values[256];
+    threadgroup float reduction[8];
+    float local_max = 0.0f;
+    for (uint group = 0; group < args.columns; group += 256) {
+        values[tid] = (float)input[base + group + tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 1; stride <= 64; stride *= 4) {
+            if (tid < 64) {
+                uint quartet = tid / stride;
+                uint offset = tid % stride;
+                uint index = quartet * stride * 4 + offset;
+                float a = values[index];
+                float b = values[index + stride];
+                float c = values[index + stride * 2];
+                float d = values[index + stride * 3];
+                values[index] = a + b + c - d;
+                values[index + stride] = a + b - c + d;
+                values[index + stride * 2] = a - b + c + d;
+                values[index + stride * 3] = -a + b + c + d;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        bfloat rounded = (bfloat)(values[tid] * (1.0f / 16.0f));
+        rotated[base + group + tid] = rounded;
+        local_max = max(local_max, fabs((float)rounded));
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    float max_abs = h3_int8_reduce_max(
+        local_max, reduction, simdgroup, lane);
+    float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+    float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+    if (tid == 0) scales[row] = scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint column = tid; column < args.columns; column += 256) {
+        int value = (int)rint((float)rotated[base + column] * inverse);
+        output[base + column] = (int8_t)clamp(value, -128, 127);
     }
 }
 
@@ -3977,11 +4336,10 @@ kernel void h3_gqa_causal_bf16(
     threadgroup float shared_query[128];
 
     for (uint d = tid; d < args.head_dim; d += threads) {
-        /* MLX's fused SDPA applies the scale to Q before the tiled QK
-         * contraction. Matching that order matters at sharp late-layer
-         * attention boundaries. */
-        shared_query[d] = h3_bf16_to_f32(h3_f32_to_bf16(
-            h3_bf16_to_f32(query[q_base + d]) * args.scale));
+        /* Keep Q scaling in F32 through the QK contraction. Rounding the
+         * product back to BF16 discards precision without reducing storage. */
+        shared_query[d] =
+            h3_bf16_to_f32(query[q_base + d]) * args.scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -4035,6 +4393,15 @@ kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
     if (gid >= count) return;
     output[gid] = h3_f32_to_bf16(h3_bf16_to_f32(left[gid]) +
                                   h3_bf16_to_f32(right[gid]));
+}
+
+kernel void h3_add_f16(device const half *left [[buffer(0)]],
+                       device const half *right [[buffer(1)]],
+                       device half *output [[buffer(2)]],
+                       constant uint &count [[buffer(3)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    output[gid] = half(float(left[gid]) + float(right[gid]));
 }
 
 kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
@@ -4318,6 +4685,46 @@ kernel void h3_euler_bf16(device float *sample [[buffer(0)]],
                          last_value);
     uint sample_index = args.sample_offset + gid;
     sample[sample_index] = fma(args.delta, velocity, sample[sample_index]);
+}
+
+/* Keep the RES state entirely in shared Metal buffers.  In particular, do not
+ * split the denoised calculation and the history copy into separate passes:
+ * both depend only on the old sample/history at this index and can be safely
+ * replaced after the new sample has been calculated. */
+struct h3_res_velocity_args {
+    uint sample_offset;
+    uint elements;
+    float sigma;
+    float sigma_next;
+    float decay;
+    float h;
+    float b1;
+    float b2;
+    uint use_multistep;
+};
+
+kernel void h3_res_velocity_bf16(device float *sample [[buffer(0)]],
+                                  device const ushort *velocity [[buffer(1)]],
+                                  device float *history [[buffer(2)]],
+                                  constant h3_res_velocity_args &args
+                                      [[buffer(3)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.elements) return;
+    uint sample_index = args.sample_offset + gid;
+    float current = sample[sample_index];
+    float denoised = fma(args.sigma, h3_bf16_to_f32(velocity[gid]), current);
+    float next;
+    if (args.use_multistep) {
+        next = args.decay * current + args.h *
+            fma(args.b2, history[gid], args.b1 * denoised);
+    } else {
+        /* (x - (x + sigma v)) / sigma == -v, but retain the same expression
+         * as the CPU reference so first/terminal-step equivalence is obvious. */
+        next = current + ((current - denoised) / args.sigma) *
+            (args.sigma_next - args.sigma);
+    }
+    history[gid] = denoised;
+    sample[sample_index] = next;
 }
 
 kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],

@@ -99,7 +99,8 @@ int main(int argc, char **argv) {
         die("native visual encoder exceeds MLX parity bound");
     int tiles = axis_tiles(height) * axis_tiles(width);
     size_t latent_bytes = latent_count * sizeof(*got.values);
-    int fp16 = !environment_enabled("H3_VIDEO_ENCODER_FP16");
+    const char *fp16_value = getenv("H3_VIDEO_ENCODER_FP16");
+    int fp16 = !fp16_value || !*fp16_value || strcmp(fp16_value, "0");
     int serial = fp16 && environment_enabled("H3_VIDEO_ENCODER_SERIAL_TILES");
     uint64_t expected_submissions = fp16 ?
         (serial ? (uint64_t)tiles + 2u : 1u + (uint64_t)(tiles + 1) / 2u) :

@@ -685,12 +685,11 @@ buffer, retains each tile's scratch arena until the queued chain is fenced, and
 keeps at most six tiles' scratch state live before a bounded fence. A 608x352
 reference therefore encodes its six spatial tiles with one final stitch/fence
 instead of waiting after every tile; much larger canvases do not retain all
-tile arenas blindly. Ref2VA temporal encoding folds each chunk's spatial stitch
-into its final tile command and retains one final drop-three submission. The
-encoder uses FP16 by default, matching ComfyUI's supported and default MiniMax
-H3 VideoVAE working precision. Set `H3_VIDEO_ENCODER_FP16=0` for the retained
-F32 comparison path, or `H3_VIDEO_ENCODER_SERIAL_TILES=1` for the retained
-serial FP16 scheduling oracle. The FP16 path
+tile arenas blindly. The encoder uses FP16 by default, matching ComfyUI's
+supported and default MiniMax H3 VideoVAE working precision. Set
+`H3_VIDEO_ENCODER_FP16=0` for the retained F32 comparison path, or
+`H3_VIDEO_ENCODER_SERIAL_TILES=1` for the retained serial FP16 scheduling oracle.
+The FP16 path
 converts the F32 checkpoint weights once on Metal,
 normalizes/reorders each uploaded F32 source tile directly into FP16, and keeps
 padding, FP32-accumulating GroupNorm+SiLU, Float16 Conv3D, residual, and quant
