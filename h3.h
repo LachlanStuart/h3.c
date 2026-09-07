@@ -69,6 +69,10 @@ typedef struct {
     int steps;
     uint64_t seed;
     const char *output_path;
+    /* Optional normalized F32 [24,T,H,W] latent written after denoising and
+     * before VideoVAE decode. The stable file format is documented by
+     * h3_latent_io.h. */
+    const char *latent_output_path;
     const char *first_frame;
     const char *last_frame;
     const h3_reference *references;
@@ -130,7 +134,7 @@ typedef struct {
 
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
+    UINT64_C(42), NULL, NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 

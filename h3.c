@@ -1,6 +1,7 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
 #include "h3_host.h"
+#include "h3_latent_io.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
 #include "h3_metal.h"
@@ -530,6 +531,10 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     if (params->core_reuse < 1 || params->core_reuse > 6) {
         h3_set_error(ctx, "core reuse must be in [1, 6]");
+        return 0;
+    }
+    if (params->latent_output_path && !*params->latent_output_path) {
+        h3_set_error(ctx, "latent output path must not be empty");
         return 0;
     }
     if (params->token_reduction != 0 && params->token_reduction != 1) {
@@ -1591,6 +1596,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->latent_output_path) {
+        if (!h3_video_latent_file_write(
+                params->latent_output_path, video, temporal.video_t,
+                latent_h, latent_w, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        fprintf(stderr, "h3: wrote clean video latent %s shape=1x24x%dx%dx%d\n",
+                params->latent_output_path, temporal.video_t,
+                latent_h, latent_w);
+    }
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
