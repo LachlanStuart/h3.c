@@ -1,5 +1,29 @@
 # h3-metal
 
+## Fork change map
+
+This fork's `main` is a working superset of the `upstream-main` branch, which
+tracks the current `antirez/h3.c` head. The table maps the local change groups
+to upstream review where an equivalent exists, or to a fork PR for novel work.
+The RES scheduler is intentionally retained as fork-local work.
+
+| Change | Local commits | Review destination | Difference or status |
+| --- | --- | --- | --- |
+| 256-pixel VideoVAE tiles and the validated 320-pixel override ceiling | `2373d6e`, `784d1d7` | [antirez #1](https://github.com/antirez/h3.c/pull/1), [antirez #14](https://github.com/antirez/h3.c/pull/14) | Matches #1's default; the fork also carries the explicit 320-pixel cap from #14. |
+| Causal-GQA scaled-query precision and threadgroup alignment | `a2f2982`, `1e0bdcb` | [antirez #4](https://github.com/antirez/h3.c/pull/4), [antirez #44](https://github.com/antirez/h3.c/pull/44) | The fork additionally has the separate 128-token softmax-reduction race fix in `8db7487`. |
+| Loader hardening and folded Turbo-LoRA tool | `733ca94`, `16b6235`, `d5948be`, `bb89c68` | [antirez #14](https://github.com/antirez/h3.c/pull/14) | The relative shader-path fix is adapted to this fork's `h3_gpu_shader_path` helper and covers the precompiled metallib path. |
+| Denoised-estimate previews and resident VideoVAE progress | `281d15b`, `caddf2f` | [antirez #34](https://github.com/antirez/h3.c/pull/34), [antirez #35](https://github.com/antirez/h3.c/pull/35) | Same behavior, with the fork's surrounding preview/runtime integration and tests. |
+| Official H3 dialogue/audio control tokens | `90f46da` | [antirez #56](https://github.com/antirez/h3.c/pull/56) | The fork includes atomic encode/decode coverage for the root, FL2VA, and Ref2VA tokenizer bundles. |
+| RES audio scheduling | `b73a02b`, `48997e0`, `5594400` | [antirez #7](https://github.com/antirez/h3.c/pull/7) — reference only | Intentionally local-only; it is not being proposed for upstream. |
+| ConvRot hybrid checkpoints and text-refiner layout correction | `9827fc4`, `b13c30d` | [fork PR #2](https://github.com/LachlanStuart/h3.c/pull/2) | PR #2 contains the standalone ConvRot support; `b13c30d` and its refiner regression are additional fork-main follow-up work. |
+| Native FP16 VideoVAE decoder and resident tiled stitching | `21738d3` … `c88ddd4` | [fork PR #1](https://github.com/LachlanStuart/h3.c/pull/1) | PR #1 is the clean initial decoder slice; fork `main` also contains later tile-capture, stitching, and cleanup follow-ups. |
+| Native FP16 VideoVAE encoder, tile scheduling, and image-latent stitching | `0b4564e`, `7ec339d`, `f0c625a`, `7e4f465` | [draft fork PR #4](https://github.com/LachlanStuart/h3.c/pull/4) | Novel fork work; the draft keeps only encoder-specific prerequisites, code, and tests. |
+| Learned 24-channel latent upscaler bridge and restart handoff | `84a3de8`, `a63422` | [draft fork PR #3](https://github.com/LachlanStuart/h3.c/pull/3) | Novel fork work; the draft is the export/sidecar/decode bridge rather than the full local restart sampler, and uses the external BF16 SafeTensors checkpoint without vendoring model weights or publisher code. |
+| High-resolution restart refinement and Euler/beta production sampling | `35f7597` … `2fbd396`, `a351c49` | Fork-local | Local workflow feature; no upstream-equivalent PR was found. |
+| Runtime adapters, Turbo inline Production, and adapter workspace fixes | `66d0375`, `9cc2177`, `4c25881`, `bd6f202` | Fork-local | Integrates ModelTC/PAI adapters into resident multi-stage production; no upstream-equivalent PR was found. |
+| Hybrid anchors, ordered references, audio-only references, and long-form/audio-only output | `f819517`, `9af9a39`, `26b552c`, `51ef4e5`, `196b20a`, `8c57cab` | Fork-local | H3 workflow extensions, including native 32-kHz stereo WAV output and extended experimental frame counts. |
+| Process serialization, lossless media diagnostics, attention parity, and accumulator diagnostics | `73c068d`, `772a3a7`, `211f86a`, `aff3ca6`, `5c35eba` | Fork-local | Operational and diagnostic additions; no upstream-equivalent PR was found. |
+
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
 sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
