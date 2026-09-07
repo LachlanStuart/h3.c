@@ -528,6 +528,10 @@ public strength is scaled by the official profile's alpha/rank factor (8/128),
 so strength 1 matches its published inference setting rather than the raw
 factor-product magnitude.
 
+The runtime evaluates each LoRA target through a cached MPSGraph containing
+both rank projections and the output add. Set `H3_DISABLE_LORA_MPSGRAPH=1` to
+use the direct Metal epilogue instead for performance or numerical diagnosis.
+
 ```sh
 ./h3 -d ../models/compact \
   --adapter ../models/adapters/MiniMax-H3-FL2VA-Acc-8Step.safetensors \

@@ -74,7 +74,6 @@ static void test_target_refiner_workspace(h3_gpu *gpu) {
     require(adapter_prepare_scratch(&dit, 1, "first-stage refiner", error,
                                     sizeof(error)), error);
     free_tensor(&dit.adapter_rank);
-    free_tensor(&dit.adapter_delta);
     require(adapter_prepare_scratch(&dit, 1, "target-stage refiner", error,
                                     sizeof(error)), error);
     require(h3_gpu_begin(gpu), "begin target refiner command");
@@ -84,14 +83,16 @@ static void test_target_refiner_workspace(h3_gpu *gpu) {
     uint16_t result = 0;
     require(h3_gpu_tensor_read_bf16(output, &result, 1),
             "read target refiner output");
-    require(result == f32_to_bf16(1.0f + 8.0f / 128.0f),
+    uint32_t result_bits = (uint32_t)result << 16;
+    float result_value;
+    memcpy(&result_value, &result_bits, sizeof(result_value));
+    require(fabsf(result_value - (1.0f + 8.0f / 128.0f)) <= 0.02f,
             "target refiner uses resident ModelTC adapter factors");
     h3_gpu_tensor_free(factor.down);
     h3_gpu_tensor_free(factor.up);
     h3_gpu_tensor_free(input);
     h3_gpu_tensor_free(output);
     free_tensor(&dit.adapter_rank);
-    free_tensor(&dit.adapter_delta);
 }
 
 int main(void) {

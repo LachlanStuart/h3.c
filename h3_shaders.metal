@@ -1420,6 +1420,100 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
     }
 }
 
+struct lora_linear_add_args {
+    uint rows;
+    uint input_dim;
+    uint output_dim;
+    float scale;
+};
+
+/* LoRA second-projection epilogue. Preserve the useful BF16 operation
+ * boundaries of the unfused path, but avoid writing/reading a temporary
+ * delta, a scale pass, and a separate add pass. */
+kernel void h3_linear_add_bf16(
+                           device const ushort *input [[buffer(0)]],
+                           device const ushort *weight [[buffer(1)]],
+                           device ushort *output [[buffer(2)]],
+                           constant lora_linear_add_args &args [[buffer(3)]],
+                           uint2 tid [[thread_position_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float input_tile[16][16];
+    threadgroup float weight_tile[16][16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ?
+            h3_bf16_to_f32(input[row * args.input_dim + input_k]) : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.input_dim ?
+            h3_bf16_to_f32(weight[column * args.input_dim + weight_k]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(input_tile[tid.y][k], weight_tile[k][tid.x], sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.output_dim) {
+        ushort delta = h3_f32_to_bf16(sum);
+        float contribution = args.scale * h3_bf16_to_f32(delta);
+        uint index = row * args.output_dim + column;
+        output[index] = h3_f32_to_bf16(
+            h3_bf16_to_f32(output[index]) + contribution);
+    }
+}
+
+struct lora_qkv_add_args {
+    uint rows;
+    uint input_dim;
+    uint width;
+    uint component;
+    uint grouped;
+    float scale;
+};
+
+kernel void h3_linear_add_qkv_component_bf16(
+                           device const ushort *input [[buffer(0)]],
+                           device const ushort *weight [[buffer(1)]],
+                           device ushort *output [[buffer(2)]],
+                           constant lora_qkv_add_args &args [[buffer(3)]],
+                           uint2 tid [[thread_position_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float input_tile[16][16];
+    threadgroup float weight_tile[16][16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ?
+            h3_bf16_to_f32(input[row * args.input_dim + input_k]) : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.width && weight_k < args.input_dim ?
+            h3_bf16_to_f32(weight[column * args.input_dim + weight_k]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(input_tile[tid.y][k], weight_tile[k][tid.x], sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.width) {
+        ushort delta = h3_f32_to_bf16(sum);
+        float contribution = args.scale * h3_bf16_to_f32(delta);
+        uint output_column = args.grouped ?
+            ((column / 128) * 3 + args.component) * 128 + column % 128 :
+            args.component * args.width + column;
+        uint index = row * args.width * 3 + output_column;
+        output[index] = h3_f32_to_bf16(
+            h3_bf16_to_f32(output[index]) + contribution);
+    }
+}
+
 /* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
  * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
 inline float h3_int8_reduce_max(float value, threadgroup float *scratch,

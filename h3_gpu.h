@@ -130,6 +130,29 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t rows,
                       uint32_t input_dim, uint32_t output_dim);
+/* BF16 low-rank epilogue. Computes output += scale * input * weight^T
+ * without materializing the scaled branch. */
+int h3_gpu_linear_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight, float scale,
+                           uint32_t rows, uint32_t input_dim,
+                           uint32_t output_dim);
+int h3_gpu_linear_add_qkv_component_bf16(
+                           h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight, float scale,
+                           uint32_t rows, uint32_t input_dim,
+                           uint32_t width,
+                           uint32_t component, int grouped_layout);
+/* Cached MPSGraph LoRA path. Computes both low-rank projections and the
+ * output add in one graph encode. The DiT adapter path uses this by default;
+ * H3_DISABLE_LORA_MPSGRAPH=1 selects the direct epilogue for comparison. */
+int h3_gpu_lora_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *input,
+                     const h3_gpu_tensor *down,
+                     const h3_gpu_tensor *up, float scale, uint32_t rows,
+                     uint32_t input_dim, uint32_t rank, uint32_t output_dim,
+                     int component, int grouped_layout);
 /* Native half matrix product. VideoVAE dimensions are MPSGraph sized; this
  * API deliberately has no scalar fallback. */
 int h3_gpu_linear_f16(h3_gpu *gpu, h3_gpu_tensor *output,

@@ -17,7 +17,7 @@ LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o h3_mutex.o linenoise.o
 
-.PHONY: all test parity real-parity clean
+.PHONY: all test parity real-parity clean h3_lora_bench
 
 all: h3 libh3.a
 
@@ -130,6 +130,9 @@ h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_lora_bench: tests/bench_lora.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)

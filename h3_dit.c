@@ -224,7 +224,6 @@ struct h3_dit {
     h3_gpu_tensor *previous_audio_denoised;
     h3_gpu_tensor *previous_video_denoised;
     h3_gpu_tensor *adapter_rank;
-    h3_gpu_tensor *adapter_delta;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -440,20 +439,15 @@ static int adapter_prepare_scratch(h3_dit *dit, size_t rows, const char *stage,
                                    char *error, size_t error_size) {
     if (!dit->adapter.runtime) return 1;
     unsigned rank = h3_adapter_runtime_rank(dit->adapter.runtime);
-    if (!rows || !rank || rows > SIZE_MAX / rank ||
-        rows > SIZE_MAX / ((size_t)FFN * 2)) {
+    if (!rows || !rank || rows > SIZE_MAX / rank) {
         fail(error, error_size, "invalid %s adapter workspace dimensions",
              stage ? stage : "runtime");
         return 0;
     }
     free_tensor(&dit->adapter_rank);
-    free_tensor(&dit->adapter_delta);
     dit->adapter_rank = h3_gpu_tensor_new_bf16(dit->gpu, rows * rank);
-    dit->adapter_delta = h3_gpu_tensor_new_bf16(dit->gpu,
-        rows * (size_t)FFN * 2);
-    if (!dit->adapter_rank || !dit->adapter_delta) {
+    if (!dit->adapter_rank) {
         free_tensor(&dit->adapter_rank);
-        free_tensor(&dit->adapter_delta);
         fail(error, error_size, "cannot allocate %s adapter workspace: %s",
              stage ? stage : "runtime", h3_gpu_error(dit->gpu));
         return 0;
@@ -493,7 +487,9 @@ static int configure_adapter(h3_dit *dit, const h3_params *params,
 
 /* Adapter factors are evaluated from the original projection activation.  In
  * particular ConvRot's base matrix sees its rotated activation, while this
- * dense LoRA branch must see the unrotated tensor used by the source model. */
+ * dense LoRA branch must see the unrotated tensor used by the source model.
+ * The direct fallback uses one temporary rank projection; the graph path
+ * feeds the original activation directly into both projections. */
 static int adapter_apply(h3_dit *dit, const h3_dit_adapter_factor *factor,
                          const h3_gpu_tensor *input, h3_gpu_tensor *output,
                          uint32_t rows, int qkv_component, int qkv_grouped,
@@ -503,21 +499,25 @@ static int adapter_apply(h3_dit *dit, const h3_dit_adapter_factor *factor,
     float scale = h3_adapter_runtime_scale(dit->adapter.runtime);
     if (scale == 0.0f) return 1;
     unsigned rank = h3_adapter_runtime_rank(dit->adapter.runtime);
-    size_t elements = (size_t)rows * factor->output;
-    if (!dit->adapter_rank || !dit->adapter_delta ||
+    const char *disable_mps_graph = getenv("H3_DISABLE_LORA_MPSGRAPH");
+    if (!(disable_mps_graph && *disable_mps_graph &&
+          strcmp(disable_mps_graph, "0")))
+        return gpu_op(dit, h3_gpu_lora_bf16(
+            dit->gpu, output, input, factor->down, factor->up, scale, rows,
+            factor->input, rank, factor->output, qkv_component, qkv_grouped),
+            error, error_size, label);
+    if (!dit->adapter_rank ||
         !gpu_op(dit, h3_gpu_linear_bf16(dit->gpu, dit->adapter_rank, input,
             factor->down, NULL, rows, factor->input, rank), error, error_size,
-            label) || !gpu_op(dit, h3_gpu_linear_bf16(dit->gpu,
-            dit->adapter_delta, dit->adapter_rank, factor->up, NULL, rows,
-            rank, factor->output), error, error_size, label)) return 0;
-    if (scale != 1.0f && !gpu_op(dit, h3_gpu_scale_bf16(dit->gpu,
-            dit->adapter_delta, dit->adapter_delta, scale, (uint32_t)elements),
-            error, error_size, label)) return 0;
+            label)) return 0;
     return qkv_component >= 0 ? gpu_op(dit,
-        h3_gpu_add_qkv_component_bf16(dit->gpu, output, dit->adapter_delta,
-        rows, factor->output, (uint32_t)qkv_component, qkv_grouped), error, error_size,
-        label) : gpu_op(dit, h3_gpu_add_bf16(dit->gpu, output, output,
-        dit->adapter_delta, (uint32_t)elements), error, error_size, label);
+        h3_gpu_linear_add_qkv_component_bf16(
+            dit->gpu, output, dit->adapter_rank, factor->up, scale, rows,
+            rank, factor->output, (uint32_t)qkv_component, qkv_grouped),
+        error, error_size, label) : gpu_op(dit,
+        h3_gpu_linear_add_bf16(dit->gpu, output, dit->adapter_rank,
+            factor->up, scale, rows, rank, factor->output), error, error_size,
+        label);
 }
 
 static int copy_layout(h3_dit *dit, const h3_layout *layout,
@@ -3856,7 +3856,7 @@ static void free_session(h3_dit *dit) {
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
     FREE(previous_audio_denoised); FREE(previous_video_denoised);
-    FREE(adapter_rank); FREE(adapter_delta);
+    FREE(adapter_rank);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
     dit->schedule = NULL;

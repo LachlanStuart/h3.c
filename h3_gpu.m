@@ -84,6 +84,22 @@
 @implementation H3MLP
 @end
 
+@interface H3LoRA : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *base;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *down;
+@property(nonatomic, strong) MPSGraphTensor *up;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *baseShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *downShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *upShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+@end
+@implementation H3LoRA
+@end
+
 @interface H3Conv : NSObject
 @property(nonatomic, strong) MPSGraph *graph;
 @property(nonatomic, strong) MPSGraphTensor *input;
@@ -109,6 +125,7 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3GQA *> *gqaCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Linear *> *linearCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3MLP *> *mlpCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3LoRA *> *loraCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
 @property(nonatomic, strong) MPSCommandBuffer *mpsCommand;
 @property(nonatomic) BOOL reuseMPSCommandDefault;
@@ -360,6 +377,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.gqaCache = [NSMutableDictionary dictionary];
         gpu.linearCache = [NSMutableDictionary dictionary];
         gpu.mlpCache = [NSMutableDictionary dictionary];
+        gpu.loraCache = [NSMutableDictionary dictionary];
         gpu.convCache = [NSMutableDictionary dictionary];
         if (!gpu.device || !gpu.queue) {
             if (error && error_size) snprintf(error, error_size, "cannot initialize Metal");
@@ -472,7 +490,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
-            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_scale_bf16", @"h3_add_qkv_component_bf16", @"h3_sub_bf16",
+            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_scale_bf16", @"h3_add_qkv_component_bf16",
+            @"h3_linear_add_bf16", @"h3_linear_add_qkv_component_bf16", @"h3_sub_bf16",
             @"h3_add_f16",
             @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
             @"h3_token_expand_delta_bf16",
@@ -1227,6 +1246,14 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *bias, uint32_t rows,
                              uint32_t input_dim, uint32_t output_dim,
                              MPSDataType dataType);
+static int h3_gpu_lora_bf16_mps(
+                             H3GPU *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *down,
+                             const h3_gpu_tensor *up, float scale,
+                             uint32_t rows, uint32_t input_dim,
+                             uint32_t rank, uint32_t output_dim,
+                             int component, int grouped_layout);
 
 int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
@@ -3449,6 +3476,184 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
     return 1;
 }
 
+static H3LoRA *h3_gpu_lora_graph(
+                             H3GPU *gpu, uint32_t rows, uint32_t input_dim,
+                             uint32_t rank, uint32_t output_dim, float scale,
+                             int component, int grouped_layout) {
+    NSString *key = [NSString stringWithFormat:
+        @"%u:%u:%u:%u:%d:%d:%.9g", rows, input_dim, rank, output_dim,
+        component, grouped_layout, scale];
+    H3LoRA *cached = gpu.loraCache[key];
+    if (cached) return cached;
+    if (component >= 0 && (component > 2 || output_dim % 128)) return nil;
+    @autoreleasepool {
+        H3LoRA *lora = [[H3LoRA alloc] init];
+        lora.graph = [[MPSGraph alloc] init];
+        uint32_t base_width = component >= 0 ? output_dim * 3 : output_dim;
+        lora.baseShape = @[@1, @(rows), @(base_width)];
+        lora.inputShape = @[@1, @(rows), @(input_dim)];
+        lora.downShape = @[@1, @(rank), @(input_dim)];
+        lora.upShape = @[@1, @(output_dim), @(rank)];
+        lora.outputShape = lora.baseShape;
+        lora.base = [lora.graph placeholderWithShape:lora.baseShape
+                                                dataType:MPSDataTypeBFloat16
+                                                    name:nil];
+        lora.input = [lora.graph placeholderWithShape:lora.inputShape
+                                                 dataType:MPSDataTypeBFloat16
+                                                     name:nil];
+        lora.down = [lora.graph placeholderWithShape:lora.downShape
+                                                dataType:MPSDataTypeBFloat16
+                                                    name:nil];
+        lora.up = [lora.graph placeholderWithShape:lora.upShape
+                                              dataType:MPSDataTypeBFloat16
+                                                  name:nil];
+        MPSGraphTensor *down_transposed =
+            [lora.graph transposeTensor:lora.down dimension:1
+                          withDimension:2 name:nil];
+        MPSGraphTensor *rank_values =
+            [lora.graph matrixMultiplicationWithPrimaryTensor:lora.input
+                                               secondaryTensor:down_transposed
+                                                          name:nil];
+        MPSGraphTensor *up_transposed =
+            [lora.graph transposeTensor:lora.up dimension:1
+                          withDimension:2 name:nil];
+        MPSGraphTensor *delta =
+            [lora.graph matrixMultiplicationWithPrimaryTensor:rank_values
+                                               secondaryTensor:up_transposed
+                                                          name:nil];
+        if (scale != 1.0f) {
+            MPSGraphTensor *scaleTensor = [lora.graph
+                constantWithScalar:scale dataType:MPSDataTypeBFloat16];
+            delta = [lora.graph multiplicationWithPrimaryTensor:delta
+                                               secondaryTensor:scaleTensor
+                                                          name:nil];
+        }
+        MPSGraphTensor *result = nil;
+        if (component < 0) {
+            result = [lora.graph additionWithPrimaryTensor:lora.base
+                                           secondaryTensor:delta name:nil];
+        } else if (grouped_layout) {
+            uint32_t groups = output_dim / 128;
+            MPSShape *layoutShape = @[@1, @(rows), @(groups), @3, @128];
+            MPSShape *deltaShape = @[@1, @(rows), @(groups), @1, @128];
+            MPSGraphTensor *base = [lora.graph reshapeTensor:lora.base
+                                                   withShape:layoutShape
+                                                        name:nil];
+            MPSGraphTensor *branch = [lora.graph reshapeTensor:delta
+                                                     withShape:deltaShape
+                                                          name:nil];
+            MPSGraphTensor *target = [lora.graph sliceTensor:base dimension:3
+                                                         start:component length:1
+                                                          name:nil];
+            MPSGraphTensor *updated =
+                [lora.graph additionWithPrimaryTensor:target
+                                      secondaryTensor:branch name:nil];
+            NSMutableArray<MPSGraphTensor *> *parts = [NSMutableArray array];
+            if (component) [parts addObject:
+                [lora.graph sliceTensor:base dimension:3 start:0
+                                 length:component name:nil]];
+            [parts addObject:updated];
+            if (component < 2) [parts addObject:
+                [lora.graph sliceTensor:base dimension:3
+                                 start:component + 1 length:2 - component
+                                  name:nil]];
+            MPSGraphTensor *combined = [lora.graph concatTensors:parts
+                                                            dimension:3
+                                                                 name:nil];
+            result = [lora.graph reshapeTensor:combined
+                                    withShape:lora.baseShape name:nil];
+        } else {
+            MPSGraphTensor *target = [lora.graph sliceTensor:lora.base
+                dimension:2 start:(NSInteger)(component * output_dim)
+                length:output_dim name:nil];
+            MPSGraphTensor *updated =
+                [lora.graph additionWithPrimaryTensor:target
+                                      secondaryTensor:delta name:nil];
+            NSMutableArray<MPSGraphTensor *> *parts = [NSMutableArray array];
+            if (component) [parts addObject:
+                [lora.graph sliceTensor:lora.base dimension:2 start:0
+                                 length:(NSInteger)(component * output_dim)
+                                  name:nil]];
+            [parts addObject:updated];
+            if (component < 2) [parts addObject:
+                [lora.graph sliceTensor:lora.base dimension:2
+                                 start:(NSInteger)((component + 1) * output_dim)
+                                 length:(NSInteger)((2 - component) * output_dim)
+                                  name:nil]];
+            result = [lora.graph concatTensors:parts dimension:2 name:nil];
+        }
+        lora.output = [lora.graph castTensor:result
+                                       toType:MPSDataTypeBFloat16 name:nil];
+        gpu.loraCache[key] = lora;
+        return lora;
+    }
+}
+
+static int h3_gpu_lora_bf16_mps(
+                             H3GPU *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *down,
+                             const h3_gpu_tensor *up, float scale,
+                             uint32_t rows, uint32_t input_dim,
+                             uint32_t rank, uint32_t output_dim,
+                             int component, int grouped_layout) {
+    uint32_t base_width = component >= 0 ? output_dim * 3 : output_dim;
+    size_t input_count = (size_t)rows * input_dim;
+    size_t down_count = (size_t)rank * input_dim;
+    size_t up_count = (size_t)output_dim * rank;
+    size_t output_count = (size_t)rows * base_width;
+    if (!isfinite(scale) || (component >= 0 && component > 2) ||
+        (component >= 0 && output_dim % 128) || output_count > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, input, input_count,
+                             @"MPS LoRA input") ||
+        !h3_gpu_require_bf16(gpu, down, down_count,
+                             @"MPS LoRA down weight") ||
+        !h3_gpu_require_bf16(gpu, up, up_count,
+                             @"MPS LoRA up weight") ||
+        !h3_gpu_require_bf16(gpu, output, output_count,
+                             @"MPS LoRA output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    H3LoRA *lora = h3_gpu_lora_graph(
+        gpu, rows, input_dim, rank, output_dim, scale, component,
+        grouped_layout);
+    if (!lora) {
+        h3_gpu_set_error(gpu, @"cannot build MPSGraph LoRA");
+        return 0;
+    }
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *base_data = h3_gpu_graph_data(
+            output, lora.baseShape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, lora.inputShape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *down_data = h3_gpu_graph_data(
+            down, lora.downShape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *up_data = h3_gpu_graph_data(
+            up, lora.upShape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, lora.outputShape, MPSDataTypeBFloat16, 1);
+        NSDictionary *feeds = @{lora.base: base_data,
+                                lora.input: input_data,
+                                lora.down: down_data,
+                                lora.up: up_data};
+        NSDictionary *results = @{lora.output: output_data};
+        @try {
+            [lora.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph LoRA failed: %@",
+                             exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_linear_dispatches += 2;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *weight,
@@ -3569,6 +3774,136 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+typedef struct {
+    uint32_t rows, input_dim, output_dim;
+    float scale;
+} lora_linear_add_args;
+
+typedef struct {
+    uint32_t rows, input_dim, width, component, grouped;
+    float scale;
+} lora_qkv_add_args;
+
+static int h3_gpu_linear_add_bf16_direct(
+                             H3GPU *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight, float scale,
+                             uint32_t rows, uint32_t input_dim,
+                             uint32_t output_dim) {
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!isfinite(scale) || output_count > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, input, input_count,
+                             @"LoRA epilogue input") ||
+        !h3_gpu_require_bf16(gpu, weight, weight_count,
+                             @"LoRA epilogue weight") ||
+        !h3_gpu_require_bf16(gpu, output, output_count,
+                             @"LoRA epilogue output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    lora_linear_add_args args = {rows, input_dim, output_dim, scale};
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_add_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch BF16 LoRA epilogue");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((output_dim + 15) / 16, (rows + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+static int h3_gpu_linear_add_qkv_component_bf16_direct(
+                             H3GPU *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight, float scale,
+                             uint32_t rows, uint32_t input_dim,
+                             uint32_t width,
+                             uint32_t component, int grouped_layout) {
+    size_t branch_count = (size_t)rows * input_dim;
+    size_t output_count = (size_t)rows * width * 3;
+    if (!isfinite(scale) || component > 2 || output_count > UINT32_MAX ||
+        !h3_gpu_require_bf16(gpu, input, branch_count,
+                             @"LoRA QKV epilogue input") ||
+        !h3_gpu_require_bf16(gpu, weight, (size_t)width * input_dim,
+                             @"LoRA QKV epilogue weight") ||
+        !h3_gpu_require_bf16(gpu, output, output_count,
+                             @"LoRA QKV epilogue output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    lora_qkv_add_args args = {rows, input_dim, width, component,
+                              grouped_layout ? 1u : 0u, scale};
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_add_qkv_component_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu,
+                         @"device cannot dispatch BF16 LoRA QKV epilogue");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((width + 15) / 16, (rows + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_linear_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight, float scale,
+                           uint32_t rows, uint32_t input_dim,
+                           uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    return h3_gpu_linear_add_bf16_direct(
+        gpu, output, input, weight, scale, rows, input_dim, output_dim);
+}
+
+int h3_gpu_linear_add_qkv_component_bf16(
+                           h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight, float scale,
+                           uint32_t rows, uint32_t input_dim,
+                           uint32_t width,
+                           uint32_t component, int grouped_layout) {
+    H3GPU *gpu = GPU(opaque);
+    return h3_gpu_linear_add_qkv_component_bf16_direct(
+        gpu, output, input, weight, scale, rows, input_dim, width,
+        component, grouped_layout);
+}
+
+int h3_gpu_lora_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *input,
+                     const h3_gpu_tensor *down,
+                     const h3_gpu_tensor *up, float scale, uint32_t rows,
+                     uint32_t input_dim, uint32_t rank, uint32_t output_dim,
+                     int component, int grouped_layout) {
+    return h3_gpu_lora_bf16_mps(
+        GPU(opaque), output, input, down, up, scale, rows, input_dim, rank,
+        output_dim, component, grouped_layout);
 }
 
 static H3MLP *h3_gpu_mlp_graph(H3GPU *gpu, uint32_t rows,
