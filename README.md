@@ -1,5 +1,42 @@
 # h3-metal
 
+## Optional learned latent upscaler bridge
+
+The native CLI can export a clean normalized H3 video latent for an external
+learned spatial upscaler. The interchange file contains little-endian F32
+channel-major `[24,T,H,W]` data:
+
+```sh
+./h3 -d ./MiniMax-H3 -p "..." --latent-output outputs/base.h3latent
+```
+
+The included Apple-Silicon sidecar runs the published 3D upscaler on MPS and
+does not vendor its code or weights. Install its optional Python dependencies
+(`torch`, `safetensors`, `numpy`, and `psutil`), clone the
+[publisher's node](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler),
+and download the BF16 checkpoint from the
+[Hugging Face model page](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler):
+
+```sh
+python3 -m pip install torch safetensors numpy psutil
+python3 tools/h3_mps_sidecar.py \
+  --source /path/to/minimax_h3_latent_upscaler_3d.py \
+  --checkpoint /path/to/minimax_h3_latent_upscaler_3d_bf16.safetensors \
+  --input outputs/base.h3latent \
+  --output outputs/upscaled.h3latent \
+  --metrics outputs/upscaled-metrics.json \
+  --scale 2
+```
+
+The checkpoint used during local validation was
+`minimax_h3_latent_upscaler_3d_bf16.safetensors` (SHA-256
+`4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6`). The
+model card currently labels the weights Apache-2.0, but verify the publisher's
+license and attribution requirements before redistribution. The sidecar is an
+optional proof-of-life path: it performs learned latent enlargement and
+validation, not high-resolution denoising or a complete restart-refinement
+pipeline.
+
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
 sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, prompt-to-video/audio, and

@@ -21,6 +21,7 @@ static void usage(const char *program) {
         "  -d, --model-dir PATH   MiniMax-H3 local directory\n"
         "  -p, --prompt TEXT      Raw H3 prompt\n"
         "  -o, --output PATH      Output MP4 (default: outputs/h3.mp4)\n"
+        "      --latent-output PATH  Write final normalized F32 video latent\n"
         "      --width N          Output width (default: 864)\n"
         "      --height N         Output height (default: 480)\n"
         "      --render-width N   Lower internal model width (optional)\n"
@@ -251,11 +252,12 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_PROFILE, OPT_INFO, OPT_LATENT_OUTPUT };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
         {"output", required_argument, NULL, 'o'},
+        {"latent-output", required_argument, NULL, OPT_LATENT_OUTPUT},
         {"width", required_argument, NULL, OPT_WIDTH},
         {"height", required_argument, NULL, OPT_HEIGHT},
         {"render-width", required_argument, NULL, OPT_RENDER_WIDTH},
@@ -326,6 +328,7 @@ int main(int argc, char **argv) {
             case 'd': model_dir = optarg; break;
             case 'p': prompt = optarg; break;
             case 'o': output = optarg; break;
+            case OPT_LATENT_OUTPUT: params.latent_output_path = optarg; break;
             case 'h': usage(argv[0]); return 0;
             case OPT_WIDTH: params.width = parse_int(optarg, "width"); break;
             case OPT_HEIGHT: params.height = parse_int(optarg, "height"); break;
