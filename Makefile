@@ -57,6 +57,9 @@ h3_av_mux_test: tests/test_av_mux.o $(LIB_OBJ)
 h3_real_video_encoder_test: tests/test_real_video_encoder.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_video_encoder_fp16_test: tests/test_video_encoder_fp16.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -100,7 +103,8 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
-	h3_real_video_encoder_test h3_real_qwen_vision_test \
+	h3_real_video_encoder_test h3_video_encoder_fp16_test \
+	h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test
 
 	./h3_tests
@@ -139,6 +143,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	else \
 		echo "skip: FFmpeg is not installed"; \
 	fi
+	./h3_video_encoder_fp16_test
 	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors && \
 	         test -f misc/fixtures/h3_real_video_encoder_256.safetensors; then \
 		./h3_real_video_encoder_test; \
@@ -207,7 +212,8 @@ clean:
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
-		h3_real_video_encoder_test h3_real_qwen_vision_test \
+		h3_real_video_encoder_test h3_video_encoder_fp16_test \
+		h3_real_qwen_vision_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \

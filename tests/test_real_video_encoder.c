@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void die(const char *message) {
     fprintf(stderr, "FAIL tests/test_real_video_encoder.c: %s\n", message);
@@ -16,6 +17,11 @@ static int axis_tiles(int extent) {
     int count = (extent + 255) / 256;
     while (256 * count - 64 * (count - 1) < extent) count++;
     return count;
+}
+
+static int environment_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && *value && strcmp(value, "0");
 }
 
 static void progress(int completed, int total, void *opaque) {
@@ -92,8 +98,20 @@ int main(int argc, char **argv) {
     if (maximum >= 2e-3 || relative_l2 >= 0.02)
         die("native visual encoder exceeds MLX parity bound");
     int tiles = axis_tiles(height) * axis_tiles(width);
+    size_t latent_bytes = latent_count * sizeof(*got.values);
+    const char *fp16_value = getenv("H3_VIDEO_ENCODER_FP16");
+    int fp16 = !fp16_value || !*fp16_value || strcmp(fp16_value, "0");
+    int serial = fp16 && environment_enabled("H3_VIDEO_ENCODER_SERIAL_TILES");
+    uint64_t expected_submissions = fp16 ?
+        (serial ? (uint64_t)tiles + 2u : 1u + (uint64_t)(tiles + 1) / 2u) :
+        (uint64_t)tiles + 1u;
     if (got.gpu_stats.mps_conv_dispatches != (uint64_t)(34 * tiles) ||
-        got.gpu_stats.submissions != (uint64_t)(18 * tiles))
+        got.gpu_stats.submissions != expected_submissions ||
+        got.gpu_stats.blit_copies != 0 ||
+        got.gpu_stats.host_tensor_reads != 1 ||
+        got.gpu_stats.host_tensor_read_bytes != latent_bytes ||
+        got.gpu_stats.host_tensor_writes != 0 ||
+        got.gpu_stats.host_tensor_write_bytes != 0)
         die("native visual encoder dispatch structure changed unexpectedly");
     h3_video_latent_free(&got);
     h3_st_free_header(&fixture);

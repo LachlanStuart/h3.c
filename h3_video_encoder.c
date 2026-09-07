@@ -3,6 +3,7 @@
 #include "h3_weights.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -65,6 +66,8 @@ typedef struct {
 typedef struct {
     h3_gpu *gpu;
     h3_weight_store *store;
+    int fp16;
+    int scheduled_tiles;
     encoder_conv conv_in;
     encoder_level levels[LEVELS];
     encoder_norm norm_out;
@@ -72,6 +75,8 @@ typedef struct {
     encoder_conv quant;
     float latent_mean[LATENT_CHANNELS];
     float latent_std[LATENT_CHANNELS];
+    h3_gpu_tensor *latent_mean_gpu;
+    h3_gpu_tensor *latent_std_gpu;
 } encoder_context;
 
 typedef struct {
@@ -80,6 +85,44 @@ typedef struct {
     int *starts;
     int *overlaps;
 } tile_axis;
+
+/* A tile forward is encoded into one Metal command buffer.  Scratch buffers
+ * therefore have to remain resident until that command buffer completes; the
+ * old per-layer submit made immediate frees safe, but also serialized every
+ * convolution on the host. */
+typedef struct {
+    h3_gpu_tensor **items;
+    size_t count;
+    size_t capacity;
+} tensor_arena;
+
+/* A forward owns all transient activation tensors through its arena, while its
+ * quantized moments remain separately owned by the caller for the later
+ * spatial stitch.  The arena cannot be released at encode time: an enqueued
+ * MPSGraph command may still read any of these buffers. */
+typedef struct {
+    h3_gpu_tensor *quant;
+    tensor_arena scratch;
+} tile_forward;
+
+/* Two tile forwards fit comfortably in a root command on M5 without the
+ * MPSGraph command-buffer back-pressure seen with unbounded batches.  Keep at
+ * most three such commands' scratch arenas live.  A normal 608x352 image has
+ * six tiles, so it still has one final synchronization; very large canvases
+ * gain bounded peak memory rather than retaining every tile arena. */
+enum {
+    TILES_PER_COMMAND = 2,
+    MAX_DEFERRED_TILES = 6
+};
+
+typedef struct {
+    encoder_context *encoder;
+    tile_forward *forwards;
+    int count;
+    int released;
+    int command_tiles;
+    int command_active;
+} tile_schedule;
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
@@ -99,6 +142,66 @@ static int gpu_op(encoder_context *encoder, int ok, char *error,
 static void free_tensor(h3_gpu_tensor **tensor) {
     h3_gpu_tensor_free(*tensor);
     *tensor = NULL;
+}
+
+static void tensor_arena_free(tensor_arena *arena) {
+    if (!arena) return;
+    for (size_t index = 0; index < arena->count; index++)
+        h3_gpu_tensor_free(arena->items[index]);
+    free(arena->items);
+    memset(arena, 0, sizeof(*arena));
+}
+
+static void tile_forward_free_scratch(tile_forward *forward) {
+    if (!forward) return;
+    tensor_arena_free(&forward->scratch);
+}
+
+static void tile_schedule_release_scratch(tile_schedule *schedule,
+                                          int through) {
+    if (!schedule) return;
+    for (int index = schedule->released; index < through; index++)
+        tile_forward_free_scratch(&schedule->forwards[index]);
+    schedule->released = through;
+}
+
+static h3_gpu_tensor *tensor_arena_own(tensor_arena *arena,
+                                       h3_gpu_tensor *tensor) {
+    if (!tensor) return NULL;
+    if (arena->count == arena->capacity) {
+        size_t next = arena->capacity ? arena->capacity * 2 : 64;
+        h3_gpu_tensor **grown = realloc(arena->items,
+                                        next * sizeof(*grown));
+        if (!grown) {
+            h3_gpu_tensor_free(tensor);
+            return NULL;
+        }
+        arena->items = grown;
+        arena->capacity = next;
+    }
+    arena->items[arena->count++] = tensor;
+    return tensor;
+}
+
+static h3_gpu_tensor *tensor_arena_new_activation(encoder_context *encoder,
+                                                   tensor_arena *arena,
+                                                   size_t elements) {
+    h3_gpu_tensor *tensor = encoder->fp16 ?
+        h3_gpu_tensor_new_f16(encoder->gpu, elements) :
+        h3_gpu_tensor_new_f32(encoder->gpu, elements);
+    return tensor_arena_own(arena, tensor);
+}
+
+static int configured_fp16(void) {
+    const char *value = getenv("H3_VIDEO_ENCODER_FP16");
+    return !value || !*value || strcmp(value, "0");
+}
+
+/* Preserve an explicit FP16 serial oracle for scheduling A/B tests.  The F32
+ * path is independently retained by H3_VIDEO_ENCODER_FP16=0. */
+static int configured_tile_schedule(void) {
+    const char *value = getenv("H3_VIDEO_ENCODER_SERIAL_TILES");
+    return !value || !*value || !strcmp(value, "0");
 }
 
 static void free_conv(encoder_conv *conv) {
@@ -128,6 +231,8 @@ static void cleanup(encoder_context *encoder) {
     free_norm(&encoder->norm_out);
     free_conv(&encoder->conv_out);
     free_conv(&encoder->quant);
+    h3_gpu_tensor_free(encoder->latent_mean_gpu);
+    h3_gpu_tensor_free(encoder->latent_std_gpu);
     h3_weight_store_free(encoder->store);
     h3_gpu_free(encoder->gpu);
     memset(encoder, 0, sizeof(*encoder));
@@ -280,6 +385,16 @@ static int load_normalization(encoder_context *encoder,
             fail(error, error_size, "video VAE latent deviation is invalid");
             return 0;
         }
+    if (ok) {
+        encoder->latent_mean_gpu = h3_gpu_tensor_from_f32(
+            encoder->gpu, encoder->latent_mean, LATENT_CHANNELS);
+        encoder->latent_std_gpu = h3_gpu_tensor_from_f32(
+            encoder->gpu, encoder->latent_std, LATENT_CHANNELS);
+        if (!encoder->latent_mean_gpu || !encoder->latent_std_gpu) {
+            fail(error, error_size, "cannot upload video VAE latent normalization");
+            return 0;
+        }
+    }
     return ok;
 }
 
@@ -343,6 +458,89 @@ static int load_weights(encoder_context *encoder, char *error,
     return 1;
 }
 
+static int convert_tensor_fp16(encoder_context *encoder,
+                               h3_gpu_tensor **tensor,
+                               tensor_arena *f32_weights, char *error,
+                               size_t error_size) {
+    if (!tensor || !*tensor) return 1;
+    h3_gpu_tensor *f32 = *tensor;
+    size_t elements = h3_gpu_tensor_elements(f32);
+    *tensor = NULL;
+    if (elements > UINT32_MAX || !tensor_arena_own(f32_weights, f32)) {
+        fail(error, error_size, "cannot retain F32 VideoVAE weight");
+        return 0;
+    }
+    h3_gpu_tensor *fp16 = h3_gpu_tensor_new_f16(encoder->gpu, elements);
+    if (!fp16) {
+        fail(error, error_size, "cannot allocate FP16 VideoVAE weight");
+        return 0;
+    }
+    *tensor = fp16;
+    return gpu_op(encoder, h3_gpu_cast_f32_to_f16(
+        encoder->gpu, fp16, f32, (uint32_t)elements), error, error_size,
+        "convert VideoVAE weight to FP16");
+}
+
+static int convert_conv_fp16(encoder_context *encoder, encoder_conv *conv,
+                             tensor_arena *f32_weights, char *error,
+                             size_t error_size) {
+    return convert_tensor_fp16(encoder, &conv->weight, f32_weights,
+                               error, error_size) &&
+           convert_tensor_fp16(encoder, &conv->bias, f32_weights,
+                               error, error_size);
+}
+
+static int convert_norm_fp16(encoder_context *encoder, encoder_norm *norm,
+                             tensor_arena *f32_weights, char *error,
+                             size_t error_size) {
+    return convert_tensor_fp16(encoder, &norm->weight, f32_weights,
+                               error, error_size) &&
+           convert_tensor_fp16(encoder, &norm->bias, f32_weights,
+                               error, error_size);
+}
+
+static int prepare_fp16_weights(encoder_context *encoder, char *error,
+                                size_t error_size) {
+    tensor_arena f32_weights = {0};
+    int ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
+                    "begin VideoVAE FP16 weight conversion") &&
+             convert_conv_fp16(encoder, &encoder->conv_in, &f32_weights,
+                               error, error_size);
+    for (int level = 0; ok && level < LEVELS; level++) {
+        for (int block = 0; ok && block < BLOCKS; block++) {
+            encoder_block *item = &encoder->levels[level].blocks[block];
+            ok = convert_norm_fp16(encoder, &item->norm1, &f32_weights,
+                                   error, error_size) &&
+                 convert_conv_fp16(encoder, &item->conv1, &f32_weights,
+                                   error, error_size) &&
+                 convert_norm_fp16(encoder, &item->norm2, &f32_weights,
+                                   error, error_size) &&
+                 convert_conv_fp16(encoder, &item->conv2, &f32_weights,
+                                   error, error_size) &&
+                 (!item->has_shortcut || convert_conv_fp16(
+                     encoder, &item->shortcut, &f32_weights,
+                     error, error_size));
+        }
+        if (ok && encoder->levels[level].has_downsample)
+            ok = convert_conv_fp16(encoder,
+                    &encoder->levels[level].downsample, &f32_weights,
+                    error, error_size);
+    }
+    if (ok)
+        ok = convert_norm_fp16(encoder, &encoder->norm_out, &f32_weights,
+                               error, error_size) &&
+             convert_conv_fp16(encoder, &encoder->conv_out, &f32_weights,
+                               error, error_size) &&
+             convert_conv_fp16(encoder, &encoder->quant, &f32_weights,
+                               error, error_size);
+    int submitted = h3_gpu_submit(encoder->gpu);
+    if (ok && !submitted)
+        ok = gpu_op(encoder, 0, error, error_size,
+                    "submit VideoVAE FP16 weight conversion");
+    tensor_arena_free(&f32_weights);
+    return ok && submitted;
+}
+
 static size_t tensor_elements(uint32_t depth, uint32_t height, uint32_t width,
                               uint32_t channels) {
     return (size_t)depth * height * width * channels;
@@ -355,25 +553,37 @@ static int conv_op(encoder_context *encoder, h3_gpu_tensor *output,
     const h3_gpu_tensor *source = input;
     uint32_t source_depth = depth, source_height = height, source_width = width;
     if (padded) {
-        if (!gpu_op(encoder, h3_gpu_vae_encoder_pad_f32(
-                encoder->gpu, padded, input, 1, depth, height, width,
-                conv->input_channels, conv->depth_front, conv->height_before,
-                conv->height_after, conv->width_before, conv->width_after),
+        int padded_ok = encoder->fp16 ? h3_gpu_vae_encoder_pad_f16(
+            encoder->gpu, padded, input, 1, depth, height, width,
+            conv->input_channels, conv->depth_front, conv->height_before,
+            conv->height_after, conv->width_before, conv->width_after) :
+            h3_gpu_vae_encoder_pad_f32(
+            encoder->gpu, padded, input, 1, depth, height, width,
+            conv->input_channels, conv->depth_front, conv->height_before,
+            conv->height_after, conv->width_before, conv->width_after);
+        if (!gpu_op(encoder, padded_ok,
                 error, error_size, "visual encoder causal padding")) return 0;
         source = padded;
         source_depth += conv->depth_front;
         source_height += conv->height_before + conv->height_after;
         source_width += conv->width_before + conv->width_after;
     }
-    return gpu_op(encoder, h3_gpu_conv3d_f32(
-        encoder->gpu, output, source, conv->weight, conv->bias, 1,
-        source_depth, source_height, source_width, conv->input_channels,
-        conv->output_channels, conv->kernel, conv->kernel, conv->kernel,
-        conv->stride_t, conv->stride_h, conv->stride_w), error, error_size,
+    int conv_ok = encoder->fp16 ? h3_gpu_conv3d_f16(
+            encoder->gpu, output, source, conv->weight, conv->bias, 1,
+            source_depth, source_height, source_width, conv->input_channels,
+            conv->output_channels, conv->kernel, conv->kernel, conv->kernel,
+            conv->stride_t, conv->stride_h, conv->stride_w) :
+        h3_gpu_conv3d_f32(
+            encoder->gpu, output, source, conv->weight, conv->bias, 1,
+            source_depth, source_height, source_width, conv->input_channels,
+            conv->output_channels, conv->kernel, conv->kernel, conv->kernel,
+            conv->stride_t, conv->stride_h, conv->stride_w);
+    return gpu_op(encoder, conv_ok, error, error_size,
         "visual encoder Conv3d");
 }
 
 static h3_gpu_tensor *run_conv(encoder_context *encoder,
+                               tensor_arena *arena,
                                h3_gpu_tensor *input,
                                const encoder_conv *conv,
                                uint32_t depth, uint32_t height, uint32_t width,
@@ -389,34 +599,28 @@ static h3_gpu_tensor *run_conv(encoder_context *encoder,
     h3_gpu_tensor *padded = NULL;
     if (conv->depth_front || conv->height_before || conv->height_after ||
         conv->width_before || conv->width_after)
-        padded = h3_gpu_tensor_new_f32(
-            encoder->gpu, tensor_elements(padded_d, padded_h, padded_w,
-                                           conv->input_channels));
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(
-        encoder->gpu, tensor_elements(*output_depth, *output_height,
-                                      *output_width, conv->output_channels));
+        padded = tensor_arena_new_activation(
+            encoder, arena,
+            tensor_elements(padded_d, padded_h, padded_w,
+                            conv->input_channels));
+    h3_gpu_tensor *output = tensor_arena_new_activation(
+        encoder, arena,
+        tensor_elements(*output_depth, *output_height,
+                        *output_width, conv->output_channels));
     int ok = output && (!((conv->depth_front || conv->height_before ||
                            conv->height_after || conv->width_before ||
                            conv->width_after)) || padded);
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder convolution");
-    } else {
-        ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                    "begin visual encoder convolution") &&
-             conv_op(encoder, output, input, conv, depth, height, width, padded,
-                     error, error_size) &&
-             gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                    "submit visual encoder convolution");
-    }
-    h3_gpu_tensor_free(padded);
-    if (!ok) {
-        h3_gpu_tensor_free(output);
-        return NULL;
-    }
+    } else
+        ok = conv_op(encoder, output, input, conv, depth, height, width, padded,
+                     error, error_size);
+    if (!ok) return NULL;
     return output;
 }
 
 static h3_gpu_tensor *run_block(encoder_context *encoder,
+                                tensor_arena *arena,
                                 h3_gpu_tensor *input,
                                 const encoder_block *block, uint32_t depth,
                                 uint32_t height, uint32_t width,
@@ -429,32 +633,45 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
                                         input_channels);
     size_t pad2_count = tensor_elements(depth + 2, height + 2, width + 2,
                                         output_channels);
-    h3_gpu_tensor *norm1 = h3_gpu_tensor_new_f32(encoder->gpu, input_count);
-    h3_gpu_tensor *pad1 = h3_gpu_tensor_new_f32(encoder->gpu, pad1_count);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *norm2 = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *pad2 = h3_gpu_tensor_new_f32(encoder->gpu, pad2_count);
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
+    h3_gpu_tensor *norm1 = tensor_arena_new_activation(encoder, arena,
+                                                 input_count);
+    h3_gpu_tensor *pad1 = tensor_arena_new_activation(encoder, arena, pad1_count);
+    h3_gpu_tensor *hidden = tensor_arena_new_activation(encoder, arena,
+                                                  output_count);
+    h3_gpu_tensor *norm2 = tensor_arena_new_activation(encoder, arena,
+                                                 output_count);
+    h3_gpu_tensor *pad2 = tensor_arena_new_activation(encoder, arena, pad2_count);
+    h3_gpu_tensor *output = tensor_arena_new_activation(encoder, arena,
+                                                  output_count);
     h3_gpu_tensor *shortcut = block->has_shortcut ?
-        h3_gpu_tensor_new_f32(encoder->gpu, output_count) : NULL;
+        tensor_arena_new_activation(encoder, arena, output_count) : NULL;
     int ok = norm1 && pad1 && hidden && norm2 && pad2 && output &&
              (!block->has_shortcut || shortcut);
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder residual block");
         goto done;
     }
-    ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                "begin visual encoder residual block") &&
-         gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
-             encoder->gpu, norm1, input, block->norm1.weight, block->norm1.bias,
-             1, depth, height, width, input_channels, GROUPS, 1e-6f),
+    int norm_ok = encoder->fp16 ? h3_gpu_vae_encoder_group_norm_silu_f16(
+        encoder->gpu, norm1, input, block->norm1.weight, block->norm1.bias,
+        1, depth, height, width, input_channels, GROUPS, 1e-6f) :
+        h3_gpu_vae_encoder_group_norm_silu_f32(
+        encoder->gpu, norm1, input, block->norm1.weight, block->norm1.bias,
+        1, depth, height, width, input_channels, GROUPS, 1e-6f);
+    ok = gpu_op(encoder, norm_ok,
              error, error_size, "visual encoder group norm 1") &&
          conv_op(encoder, hidden, norm1, &block->conv1, depth, height, width,
-                 pad1, error, error_size) &&
-         gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
-             encoder->gpu, norm2, hidden, block->norm2.weight, block->norm2.bias,
-             1, depth, height, width, output_channels, GROUPS, 1e-6f),
-             error, error_size, "visual encoder group norm 2") &&
+                 pad1, error, error_size);
+    if (ok) {
+        norm_ok = encoder->fp16 ? h3_gpu_vae_encoder_group_norm_silu_f16(
+            encoder->gpu, norm2, hidden, block->norm2.weight, block->norm2.bias,
+            1, depth, height, width, output_channels, GROUPS, 1e-6f) :
+            h3_gpu_vae_encoder_group_norm_silu_f32(
+            encoder->gpu, norm2, hidden, block->norm2.weight, block->norm2.bias,
+            1, depth, height, width, output_channels, GROUPS, 1e-6f);
+        ok = gpu_op(encoder, norm_ok, error, error_size,
+                    "visual encoder group norm 2");
+    }
+    if (ok) ok =
          conv_op(encoder, output, norm2, &block->conv2, depth, height, width,
                  pad2, error, error_size);
     const h3_gpu_tensor *residual = input;
@@ -463,142 +680,238 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
                      width, NULL, error, error_size);
         residual = shortcut;
     }
-    if (ok) ok = gpu_op(encoder, h3_gpu_add_scaled_f32(
-        encoder->gpu, output, residual, output, 1.0f, 1.0f,
-        (uint32_t)output_count), error, error_size,
-        "visual encoder residual add");
-    if (ok) ok = gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                        "submit visual encoder residual block");
-
-done:
-    h3_gpu_tensor_free(norm1);
-    h3_gpu_tensor_free(pad1);
-    h3_gpu_tensor_free(hidden);
-    h3_gpu_tensor_free(norm2);
-    h3_gpu_tensor_free(pad2);
-    h3_gpu_tensor_free(shortcut);
-    if (!ok) {
-        h3_gpu_tensor_free(output);
-        return NULL;
+    if (ok) {
+        int add_ok = encoder->fp16 ? h3_gpu_add_f16(
+            encoder->gpu, output, residual, output, (uint32_t)output_count) :
+            h3_gpu_add_scaled_f32(encoder->gpu, output, residual, output,
+                                  1.0f, 1.0f, (uint32_t)output_count);
+        ok = gpu_op(encoder, add_ok, error, error_size,
+                    "visual encoder residual add");
     }
+done:
+    if (!ok) return NULL;
     return output;
 }
 
-static float *encode_tile(encoder_context *encoder, const float *pixels,
-                          int frames, int height, int width,
-                          int *latent_time, char *error, size_t error_size) {
+static int encode_tile_quant_enqueue(encoder_context *encoder,
+                                     const float *pixels, int frames,
+                                     int height, int width,
+                                     int *latent_time, tile_forward *forward,
+                                     char *error, size_t error_size) {
+    if (!forward) {
+        fail(error, error_size, "missing visual encoder tile forward");
+        return 0;
+    }
+    memset(forward, 0, sizeof(*forward));
     size_t pixel_count = (size_t)frames * height * width * RGB_CHANNELS;
-    float *normalized = malloc(pixel_count * sizeof(*normalized));
-    if (!normalized) {
+    float *normalized = encoder->fp16 ? NULL :
+        malloc(pixel_count * sizeof(*normalized));
+    if (!encoder->fp16 && !normalized) {
         fail(error, error_size, "out of memory normalizing visual anchor");
-        return NULL;
+        return 0;
     }
     static const float mean[] = {0.485f, 0.456f, 0.406f};
     static const float deviation[] = {0.229f, 0.224f, 0.225f};
-    size_t destination = 0;
-    for (int time = 0; time < frames; time++)
-        for (int y = 0; y < height; y++)
-            for (int x = 0; x < width; x++)
-                for (int channel = 0; channel < RGB_CHANNELS; channel++) {
-                    size_t source = (((size_t)channel * frames + time) * height +
-                                     y) * width + x;
-                    normalized[destination++] =
-                        (pixels[source] - mean[channel]) / deviation[channel];
-                }
-    h3_gpu_tensor *hidden = h3_gpu_tensor_from_f32(
-        encoder->gpu, normalized, pixel_count);
-    free(normalized);
-    if (!hidden) {
-        fail(error, error_size, "cannot allocate visual encoder pixels");
-        return NULL;
+    if (!encoder->fp16) {
+        size_t destination = 0;
+        for (int time = 0; time < frames; time++)
+            for (int y = 0; y < height; y++)
+                for (int x = 0; x < width; x++)
+                    for (int channel = 0; channel < RGB_CHANNELS; channel++) {
+                        size_t source = (((size_t)channel * frames + time) *
+                                         height + y) * width + x;
+                        normalized[destination++] =
+                            (pixels[source] - mean[channel]) /
+                            deviation[channel];
+                    }
     }
+    tensor_arena *arena = &forward->scratch;
+    h3_gpu_tensor *uploaded = tensor_arena_own(
+        arena, h3_gpu_tensor_from_f32(
+            encoder->gpu, encoder->fp16 ? pixels : normalized, pixel_count));
+    h3_gpu_tensor *hidden = encoder->fp16 ? tensor_arena_new_activation(
+        encoder, arena, pixel_count) : uploaded;
+    free(normalized);
+    if (!uploaded || !hidden) {
+        fail(error, error_size, "cannot allocate visual encoder pixels");
+        tile_forward_free_scratch(forward);
+        return 0;
+    }
+    h3_gpu_tensor *quant = NULL;
+    int ok = 1;
+    if (encoder->fp16)
+        ok = gpu_op(encoder, h3_gpu_vae_encoder_normalize_pixels_f16(
+            encoder->gpu, hidden, uploaded, 1, (uint32_t)frames,
+            (uint32_t)height, (uint32_t)width), error, error_size,
+            "normalize visual encoder pixels to FP16");
     uint32_t depth = (uint32_t)frames, h = (uint32_t)height, w = (uint32_t)width;
     uint32_t next_d, next_h, next_w;
-    h3_gpu_tensor *next = run_conv(encoder, hidden, &encoder->conv_in,
+    h3_gpu_tensor *next = ok ? run_conv(
+        encoder, arena, hidden, &encoder->conv_in,
                                    depth, h, w, &next_d, &next_h, &next_w,
-                                   error, error_size);
-    free_tensor(&hidden);
+                                   error, error_size) : NULL;
     hidden = next;
-    if (!hidden) return NULL;
+    if (!hidden) goto done;
     depth = next_d; h = next_h; w = next_w;
     uint32_t previous = 128;
     for (int level = 0; level < LEVELS && hidden; level++) {
         uint32_t channels = level_channels[level];
         for (int block = 0; block < BLOCKS && hidden; block++) {
             uint32_t input_channels = block ? channels : previous;
-            next = run_block(encoder, hidden,
+            next = run_block(encoder, arena, hidden,
                              &encoder->levels[level].blocks[block], depth, h, w,
                              input_channels, channels, error, error_size);
-            free_tensor(&hidden);
             hidden = next;
         }
         if (hidden && encoder->levels[level].has_downsample) {
-            next = run_conv(encoder, hidden,
+            next = run_conv(encoder, arena, hidden,
                             &encoder->levels[level].downsample, depth, h, w,
                             &next_d, &next_h, &next_w, error, error_size);
-            free_tensor(&hidden);
             hidden = next;
             depth = next_d; h = next_h; w = next_w;
         }
         previous = channels;
     }
-    if (!hidden) return NULL;
+    if (!hidden) goto done;
 
     size_t hidden_count = tensor_elements(depth, h, w, 1024);
     size_t padded_count = tensor_elements(depth + 2, h + 2, w + 2, 1024);
     size_t moment_count = tensor_elements(depth, h, w, MOMENT_CHANNELS);
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_f32(encoder->gpu, hidden_count);
-    h3_gpu_tensor *padded = h3_gpu_tensor_new_f32(encoder->gpu, padded_count);
-    h3_gpu_tensor *moments = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
-    h3_gpu_tensor *quant = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
-    int ok = norm && padded && moments && quant;
+    h3_gpu_tensor *norm = tensor_arena_new_activation(encoder, arena,
+                                                hidden_count);
+    h3_gpu_tensor *padded = tensor_arena_new_activation(encoder, arena,
+                                                  padded_count);
+    h3_gpu_tensor *moments = tensor_arena_new_activation(encoder, arena,
+                                                   moment_count);
+    quant = encoder->fp16 ? h3_gpu_tensor_new_f16(encoder->gpu, moment_count) :
+                            h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
+    ok = norm && padded && moments && quant;
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder output");
     } else {
-        ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
-                    "begin visual encoder output") &&
-             gpu_op(encoder, h3_gpu_vae_encoder_group_norm_silu_f32(
-                 encoder->gpu, norm, hidden, encoder->norm_out.weight,
-                 encoder->norm_out.bias, 1, depth, h, w, 1024, GROUPS, 1e-6f),
+        int norm_ok = encoder->fp16 ? h3_gpu_vae_encoder_group_norm_silu_f16(
+            encoder->gpu, norm, hidden, encoder->norm_out.weight,
+            encoder->norm_out.bias, 1, depth, h, w, 1024, GROUPS, 1e-6f) :
+            h3_gpu_vae_encoder_group_norm_silu_f32(
+            encoder->gpu, norm, hidden, encoder->norm_out.weight,
+            encoder->norm_out.bias, 1, depth, h, w, 1024, GROUPS, 1e-6f);
+        ok = gpu_op(encoder, norm_ok,
                  error, error_size, "visual encoder output norm") &&
              conv_op(encoder, moments, norm, &encoder->conv_out, depth, h, w,
                      padded, error, error_size) &&
              conv_op(encoder, quant, moments, &encoder->quant, depth, h, w,
-                     NULL, error, error_size) &&
-             gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
-                    "submit visual encoder output");
+                     NULL, error, error_size);
     }
-    float *raw = ok ? malloc(moment_count * sizeof(*raw)) : NULL;
-    size_t latent_count = (size_t)LATENT_CHANNELS * depth * h * w;
-    float *latent = ok ? malloc(latent_count * sizeof(*latent)) : NULL;
-    if (ok && (!raw || !latent ||
-               !h3_gpu_tensor_read_f32(quant, raw, moment_count))) {
-        fail(error, error_size, "cannot read visual encoder latent");
-        ok = 0;
-    }
-    if (ok) for (uint32_t channel = 0; channel < LATENT_CHANNELS; channel++)
-        for (uint32_t time = 0; time < depth; time++)
-            for (uint32_t y = 0; y < h; y++)
-                for (uint32_t x = 0; x < w; x++) {
-                    size_t source = (((size_t)time * h + y) * w + x) *
-                                    MOMENT_CHANNELS + channel;
-                    size_t target = (((size_t)channel * depth + time) * h + y) *
-                                    w + x;
-                    latent[target] = (raw[source] - encoder->latent_mean[channel]) /
-                                     encoder->latent_std[channel];
-                }
-    free(raw);
-    free_tensor(&hidden);
-    h3_gpu_tensor_free(norm);
-    h3_gpu_tensor_free(padded);
-    h3_gpu_tensor_free(moments);
-    h3_gpu_tensor_free(quant);
+done:
     if (!ok) {
-        free(latent);
-        return NULL;
+        h3_gpu_tensor_free(quant);
+        tile_forward_free_scratch(forward);
+        return 0;
     }
     *latent_time = (int)depth;
-    return latent;
+    forward->quant = quant;
+    return 1;
+}
+
+/* Retained F32 oracle path: keep its exact submit/fence schedule.  The FP16
+ * path below is the experimentally scheduled path; retaining this wrapper
+ * gives A/B diagnosis a stable reference. */
+static h3_gpu_tensor *encode_tile_quant_sync(encoder_context *encoder,
+                                             const float *pixels, int frames,
+                                             int height, int width,
+                                             int *latent_time, char *error,
+                                             size_t error_size) {
+    tile_forward forward = {0};
+    int ok = gpu_op(encoder, h3_gpu_begin(encoder->gpu), error, error_size,
+                    "begin visual encoder tile") &&
+             encode_tile_quant_enqueue(encoder, pixels, frames, height, width,
+                                       latent_time, &forward, error, error_size);
+    if (ok) ok = gpu_op(encoder, h3_gpu_submit(encoder->gpu), error, error_size,
+                        "submit visual encoder tile");
+    else h3_gpu_abort(encoder->gpu);
+    tile_forward_free_scratch(&forward);
+    if (!ok) {
+        h3_gpu_tensor_free(forward.quant);
+        return NULL;
+    }
+    return forward.quant;
+}
+
+static int tile_schedule_enqueue(tile_schedule *schedule,
+                                 const float *pixels, int frames,
+                                 int height, int width, int *latent_time,
+                                 char *error, size_t error_size) {
+    if (!schedule || !schedule->encoder || !schedule->forwards) {
+        fail(error, error_size, "invalid visual encoder tile schedule");
+        return 0;
+    }
+    if (!schedule->command_active) {
+        if (!gpu_op(schedule->encoder, h3_gpu_begin(schedule->encoder->gpu),
+                    error, error_size, "begin visual encoder tile batch"))
+            return 0;
+        schedule->command_active = 1;
+        schedule->command_tiles = 0;
+    }
+    if (!encode_tile_quant_enqueue(schedule->encoder, pixels, frames, height,
+                                   width, latent_time,
+                                   &schedule->forwards[schedule->count], error,
+                                   error_size)) return 0;
+    schedule->count++;
+    schedule->command_tiles++;
+    return 1;
+}
+
+/* Commit at a modest cadence without fencing.  Scratch arenas are deferred
+ * until a later submit proves every command that references them complete.
+ * This is deliberately distinct from freeing after h3_gpu_continue(): a
+ * continued command is only committed, not known complete. */
+static int tile_schedule_after_tile(tile_schedule *schedule, int final_tile,
+                                    char *error, size_t error_size) {
+    if (!schedule || !schedule->command_active) {
+        fail(error, error_size, "visual encoder tile schedule has no command");
+        return 0;
+    }
+    int retained = schedule->count - schedule->released;
+    if (!final_tile && retained == MAX_DEFERRED_TILES) {
+        if (!gpu_op(schedule->encoder, h3_gpu_submit(schedule->encoder->gpu),
+                    error, error_size, "submit bounded visual encoder batch"))
+            return 0;
+        schedule->command_active = 0;
+        schedule->command_tiles = 0;
+        tile_schedule_release_scratch(schedule, schedule->count);
+        return 1;
+    }
+    if (!final_tile && schedule->command_tiles == TILES_PER_COMMAND) {
+        if (!gpu_op(schedule->encoder, h3_gpu_continue(schedule->encoder->gpu),
+                    error, error_size, "continue visual encoder tile batch"))
+            return 0;
+        schedule->command_tiles = 0;
+    }
+    return 1;
+}
+
+static int tile_schedule_submit(tile_schedule *schedule, char *error,
+                                size_t error_size) {
+    if (!schedule || !schedule->command_active) {
+        fail(error, error_size, "visual encoder schedule has no final command");
+        return 0;
+    }
+    int ok = gpu_op(schedule->encoder, h3_gpu_submit(schedule->encoder->gpu),
+                    error, error_size, "submit visual encoder tile chain");
+    schedule->command_active = 0;
+    if (ok) tile_schedule_release_scratch(schedule, schedule->count);
+    return ok;
+}
+
+static void tile_schedule_abort(tile_schedule *schedule) {
+    if (!schedule || !schedule->encoder) return;
+    if (schedule->command_active) h3_gpu_abort(schedule->encoder->gpu);
+    /* A failure after h3_gpu_continue() leaves prior batches in flight. Fence
+     * them before the caller frees command-scoped scratch.  This is a failure
+     * path only; successful FP16 scheduling has no intermediate wait. */
+    (void)h3_gpu_drain(schedule->encoder->gpu);
+    schedule->command_active = 0;
+    tile_schedule_release_scratch(schedule, schedule->count);
 }
 
 static void tile_axis_free(tile_axis *axis) {
@@ -673,72 +986,53 @@ static float *extract_pixel_tile(const float *pixels, int frames,
     return tile;
 }
 
-static int stitch_latents(float **tiles, int latent_time,
-                          const tile_axis *y_axis, const tile_axis *x_axis,
-                          h3_video_latent *output, char *error,
-                          size_t error_size) {
-    int tile_h = y_axis->length / SPATIAL_RATIO;
-    int tile_w = x_axis->length / SPATIAL_RATIO;
-    int full_h = (y_axis->starts[y_axis->count - 1] + y_axis->length) /
-                 SPATIAL_RATIO;
-    int full_w = (x_axis->starts[x_axis->count - 1] + x_axis->length) /
-                 SPATIAL_RATIO;
-    size_t count = (size_t)LATENT_CHANNELS * latent_time * full_h * full_w;
-    float *values = malloc(count * sizeof(*values));
-    if (!values) {
-        fail(error, error_size, "out of memory stitching visual latents");
-        return 0;
-    }
+static int stitch_gpu_tiles(encoder_context *encoder,
+                            h3_gpu_tensor *destination,
+                            h3_gpu_tensor *const *tiles,
+                            const tile_axis *y_axis,
+                            const tile_axis *x_axis,
+                            uint32_t time_offset, uint32_t chunk_time,
+                            uint32_t full_time, uint32_t full_height,
+                            uint32_t full_width, char *error,
+                            size_t error_size) {
+    uint32_t tile_h = (uint32_t)(y_axis->length / SPATIAL_RATIO);
+    uint32_t tile_w = (uint32_t)(x_axis->length / SPATIAL_RATIO);
     for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
         for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
             int index = tile_y * x_axis->count + tile_x;
-            const float *current = tiles[index];
-            const float *above = tile_y ? tiles[index - x_axis->count] : NULL;
-            const float *left = tile_x ? tiles[index - 1] : NULL;
-            int overlap_y = tile_y ?
-                y_axis->overlaps[tile_y - 1] / SPATIAL_RATIO : 0;
-            int overlap_x = tile_x ?
-                x_axis->overlaps[tile_x - 1] / SPATIAL_RATIO : 0;
-            int keep_h = tile_h - (tile_y + 1 < y_axis->count ?
+            int above = tile_y ? index - x_axis->count : index;
+            int left = tile_x ? index - 1 : index;
+            uint32_t overlap_y = tile_y ?
+                (uint32_t)(y_axis->overlaps[tile_y - 1] / SPATIAL_RATIO) : 0;
+            uint32_t overlap_x = tile_x ?
+                (uint32_t)(x_axis->overlaps[tile_x - 1] / SPATIAL_RATIO) : 0;
+            uint32_t keep_h = tile_h - (uint32_t)(
+                tile_y + 1 < y_axis->count ?
                 y_axis->overlaps[tile_y] / SPATIAL_RATIO : 0);
-            int keep_w = tile_w - (tile_x + 1 < x_axis->count ?
+            uint32_t keep_w = tile_w - (uint32_t)(
+                tile_x + 1 < x_axis->count ?
                 x_axis->overlaps[tile_x] / SPATIAL_RATIO : 0);
-            int destination_y = y_axis->starts[tile_y] / SPATIAL_RATIO;
-            int destination_x = x_axis->starts[tile_x] / SPATIAL_RATIO;
-            for (int channel = 0; channel < LATENT_CHANNELS; channel++)
-                for (int time = 0; time < latent_time; time++)
-                    for (int y = 0; y < keep_h; y++)
-                        for (int x = 0; x < keep_w; x++) {
-                            size_t local = (((size_t)channel * latent_time + time) *
-                                            tile_h + y) * tile_w + x;
-                            float value = current[local];
-                            if (above && y < overlap_y) {
-                                size_t source = (((size_t)channel * latent_time +
-                                    time) * tile_h + tile_h - overlap_y + y) *
-                                    tile_w + x;
-                                float weight = (float)y / (float)overlap_y;
-                                value = above[source] * (1.0f - weight) +
-                                        value * weight;
-                            }
-                            if (left && x < overlap_x) {
-                                size_t source = (((size_t)channel * latent_time +
-                                    time) * tile_h + y) * tile_w +
-                                    tile_w - overlap_x + x;
-                                float weight = (float)x / (float)overlap_x;
-                                value = left[source] * (1.0f - weight) +
-                                        value * weight;
-                            }
-                            size_t destination =
-                                (((size_t)channel * latent_time + time) * full_h +
-                                  destination_y + y) * full_w +
-                                 destination_x + x;
-                            values[destination] = value;
-                        }
+            int ok = encoder->fp16 ? h3_gpu_vae_encoder_stitch_latent_f16(
+                encoder->gpu, destination, tiles[index],
+                tile_y ? tiles[above] : NULL,
+                tile_x ? tiles[left] : NULL, encoder->latent_mean_gpu,
+                encoder->latent_std_gpu, time_offset, chunk_time, full_time,
+                full_height, full_width, tile_h, tile_w,
+                (uint32_t)(y_axis->starts[tile_y] / SPATIAL_RATIO),
+                (uint32_t)(x_axis->starts[tile_x] / SPATIAL_RATIO),
+                overlap_y, overlap_x, keep_h, keep_w) :
+                h3_gpu_vae_encoder_stitch_latent_f32(
+                encoder->gpu, destination, tiles[index],
+                tile_y ? tiles[above] : NULL,
+                tile_x ? tiles[left] : NULL, encoder->latent_mean_gpu,
+                encoder->latent_std_gpu, time_offset, chunk_time, full_time,
+                full_height, full_width, tile_h, tile_w,
+                (uint32_t)(y_axis->starts[tile_y] / SPATIAL_RATIO),
+                (uint32_t)(x_axis->starts[tile_x] / SPATIAL_RATIO),
+                overlap_y, overlap_x, keep_h, keep_w);
+            if (!gpu_op(encoder, ok, error, error_size,
+                        "visual encoder latent stitch")) return 0;
         }
-    output->time = latent_time;
-    output->height = full_h;
-    output->width = full_w;
-    output->values = values;
     return 1;
 }
 
@@ -756,7 +1050,7 @@ int h3_video_vae_encode(const char *weight_directory,
         fail(error, error_size, "invalid visual encoder arguments");
         return 0;
     }
-    tile_axis y_axis, x_axis;
+    tile_axis y_axis = {0}, x_axis = {0};
     int ok = tile_axis_build(height, &y_axis, error, error_size) &&
              tile_axis_build(width, &x_axis, error, error_size);
     if (!ok) {
@@ -765,6 +1059,8 @@ int h3_video_vae_encode(const char *weight_directory,
         return 0;
     }
     encoder_context encoder = {0};
+    encoder.fp16 = configured_fp16();
+    encoder.scheduled_tiles = encoder.fp16 && configured_tile_schedule();
     encoder.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (encoder.gpu)
         h3_gpu_profile_set_label(encoder.gpu, "video VAE encoder");
@@ -772,13 +1068,21 @@ int h3_video_vae_encode(const char *weight_directory,
         encoder.store = h3_weight_store_open(weight_directory, error, error_size);
     ok = encoder.gpu && encoder.store &&
          load_normalization(&encoder, weight_directory, error, error_size) &&
-         load_weights(&encoder, error, error_size);
+         load_weights(&encoder, error, error_size) &&
+         (!encoder.fp16 || prepare_fp16_weights(&encoder, error, error_size));
     int tile_count = y_axis.count * x_axis.count;
-    float **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
-    if (ok && !tiles) {
+    h3_gpu_tensor **tiles = ok ? calloc((size_t)tile_count, sizeof(*tiles)) : NULL;
+    tile_forward *forwards = ok && encoder.scheduled_tiles ?
+        calloc((size_t)tile_count, sizeof(*forwards)) : NULL;
+    h3_gpu_tensor *final = NULL;
+    if (ok && (!tiles || (encoder.scheduled_tiles && !forwards))) {
         fail(error, error_size, "out of memory allocating visual encoder tiles");
         ok = 0;
     }
+    tile_schedule schedule = {
+        .encoder = &encoder,
+        .forwards = forwards
+    };
     int latent_time = 0;
     for (int y = 0, completed = 0; ok && y < y_axis.count; y++)
         for (int x = 0; ok && x < x_axis.count; x++, completed++) {
@@ -786,20 +1090,72 @@ int h3_video_vae_encode(const char *weight_directory,
                 pixels, frames, height, width, y_axis.starts[y], x_axis.starts[x],
                 y_axis.length, x_axis.length, error, error_size);
             int current_time = 0;
-            if (tile) tiles[completed] = encode_tile(
-                &encoder, tile, frames, y_axis.length, x_axis.length,
-                &current_time, error, error_size);
+            if (tile && encoder.scheduled_tiles) {
+                ok = tile_schedule_enqueue(
+                    &schedule, tile, frames, y_axis.length, x_axis.length,
+                    &current_time, error, error_size);
+                if (ok) tiles[completed] = forwards[completed].quant;
+            } else if (tile) {
+                tiles[completed] = encode_tile_quant_sync(
+                    &encoder, tile, frames, y_axis.length, x_axis.length,
+                    &current_time, error, error_size);
+            }
             free(tile);
-            ok = tiles[completed] != NULL &&
+            ok = ok && tiles[completed] != NULL &&
                  (!latent_time || latent_time == current_time);
             if (ok) latent_time = current_time;
             if (ok && progress) progress(completed + 1, tile_count, progress_opaque);
+            if (ok && encoder.scheduled_tiles)
+                ok = tile_schedule_after_tile(
+                    &schedule, completed + 1 == tile_count, error, error_size);
         }
-    if (ok) ok = stitch_latents(tiles, latent_time, &y_axis, &x_axis,
-                                output, error, error_size) &&
-                 h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);
-    if (tiles) for (int index = 0; index < tile_count; index++) free(tiles[index]);
+    int latent_h = height / SPATIAL_RATIO;
+    int latent_w = width / SPATIAL_RATIO;
+    size_t latent_count = (size_t)LATENT_CHANNELS * (size_t)latent_time *
+                          (size_t)latent_h * (size_t)latent_w;
+    if (ok && latent_count > UINT32_MAX) {
+        fail(error, error_size, "visual encoder latent is too large");
+        ok = 0;
+    }
+    if (ok) final = h3_gpu_tensor_new_f32(encoder.gpu, latent_count);
+    if (ok && !final) {
+        fail(error, error_size, "cannot allocate visual encoder latent");
+        ok = 0;
+    }
+    if (ok && !encoder.scheduled_tiles) ok = gpu_op(&encoder, h3_gpu_begin(encoder.gpu), error,
+                                         error_size, "begin visual encoder stitch");
+    if (ok) ok = stitch_gpu_tiles(
+        &encoder, final, tiles, &y_axis, &x_axis, 0, (uint32_t)latent_time,
+        (uint32_t)latent_time, (uint32_t)latent_h, (uint32_t)latent_w,
+        error, error_size);
+    if (ok) ok = encoder.scheduled_tiles ? tile_schedule_submit(&schedule, error, error_size) :
+        gpu_op(&encoder, h3_gpu_submit(encoder.gpu), error,
+               error_size, "submit visual encoder stitch");
+    if (ok) {
+        output->values = malloc(latent_count * sizeof(*output->values));
+        ok = output->values && h3_gpu_tensor_read_f32(
+            final, output->values, latent_count) &&
+            h3_gpu_get_stats(encoder.gpu, &output->gpu_stats);
+        if (!ok) fail(error, error_size, "cannot read visual encoder latent");
+        if (ok && (output->gpu_stats.host_tensor_reads != 1 ||
+                   output->gpu_stats.host_tensor_writes != 0 ||
+                   output->gpu_stats.blit_copies != 0)) {
+            fail(error, error_size,
+                 "visual encoder made an unexpected tensor transfer");
+            ok = 0;
+        }
+        output->time = latent_time;
+        output->height = latent_h;
+        output->width = latent_w;
+    }
+    if (!ok && encoder.scheduled_tiles) tile_schedule_abort(&schedule);
+    if (forwards) for (int index = 0; index < tile_count; index++)
+        tile_forward_free_scratch(&forwards[index]);
+    free(forwards);
+    if (tiles) for (int index = 0; index < tile_count; index++)
+        h3_gpu_tensor_free(tiles[index]);
     free(tiles);
+    h3_gpu_tensor_free(final);
     cleanup(&encoder);
     tile_axis_free(&y_axis);
     tile_axis_free(&x_axis);

@@ -9,6 +9,7 @@ typedef struct h3_gpu_tensor h3_gpu_tensor;
 
 typedef enum {
     H3_GPU_F32 = 0,
+    H3_GPU_F16,
     H3_GPU_BF16,
     H3_GPU_I8,
     H3_GPU_U32
@@ -25,6 +26,12 @@ typedef struct {
     uint64_t mps_sdpa_dispatches;
     uint64_t blit_copies;
     uint64_t submissions;
+    /* CPU access to shared Metal buffers.  These counters make sampler
+     * boundary crossings observable in a profile rather than inferred. */
+    uint64_t host_tensor_reads;
+    uint64_t host_tensor_writes;
+    uint64_t host_tensor_read_bytes;
+    uint64_t host_tensor_write_bytes;
     double command_encode_seconds;
     double command_wait_seconds;
     /* Root MTLCommandBuffer timestamps; MPSGraph may schedule child buffers,
@@ -41,11 +48,16 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_new_f16(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
                                       size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_from_f16(h3_gpu *gpu, const uint16_t *values,
+                                      size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
@@ -53,6 +65,10 @@ h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_f16(h3_gpu *gpu, const char *path,
+                                      uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
  * accounting are unchanged, so this may run on an I/O thread while another
  * tensor is in flight on the GPU. */
@@ -75,6 +91,8 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
@@ -87,10 +105,16 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
                                    const uint16_t *values, size_t elements);
 
 int h3_gpu_begin(h3_gpu *gpu);
+/* Drop an uncommitted command buffer after an encode/allocation failure.
+ * Already submitted work is never cancelled. */
+void h3_gpu_abort(h3_gpu *gpu);
 /* Commit the current command buffer without waiting, then continue encoding on
  * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
 int h3_gpu_continue(h3_gpu *gpu);
 int h3_gpu_submit(h3_gpu *gpu);
+/* Wait for and validate a chain previously committed with h3_gpu_continue().
+ * There must be no active command buffer. */
+int h3_gpu_drain(h3_gpu *gpu);
 const char *h3_gpu_error(const h3_gpu *gpu);
 int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown
@@ -128,6 +152,20 @@ int h3_gpu_cast_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_cast_bf16_to_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                             const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_adaln_table_interpolate_f32(
+                            h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *times,
+                            const h3_gpu_tensor *table, uint32_t rows,
+                            uint32_t table_rows);
+int h3_gpu_linear_rank8_f16_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *bias, uint32_t rows,
+                            uint32_t output_dim);
+int h3_gpu_cast_f32_to_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_cast_f16_to_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset,
                      const h3_gpu_tensor *source, size_t source_offset,
@@ -269,7 +307,29 @@ int h3_gpu_vae_encoder_pad_f32(
                     uint32_t channels, uint32_t depth_front,
                     uint32_t height_before, uint32_t height_after,
                     uint32_t width_before, uint32_t width_after);
+/* Normalize channel-major RGB pixels in F32 and write channels-last FP16 in
+ * one GPU pass. This is the encoder's sole source activation conversion. */
+int h3_gpu_vae_encoder_normalize_pixels_f16(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width);
+int h3_gpu_vae_encoder_pad_f16(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t channels, uint32_t depth_front,
+                      uint32_t height_before, uint32_t height_after,
+                      uint32_t width_before, uint32_t width_after);
 int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t input_channels, uint32_t output_channels,
+                      uint32_t kernel_depth, uint32_t kernel_height,
+                      uint32_t kernel_width, uint32_t stride_depth,
+                      uint32_t stride_height, uint32_t stride_width);
+int h3_gpu_conv3d_f16(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t batch,
@@ -285,6 +345,50 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t depth, uint32_t height, uint32_t width,
                       uint32_t channels, uint32_t groups, float epsilon);
+int h3_gpu_vae_encoder_group_norm_silu_f16(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t channels, uint32_t groups, float epsilon);
+/* Normalize channels-last encoder moments and stitch a temporal chunk into a
+ * channel-major [24,T,H,W] latent entirely on Metal. */
+int h3_gpu_vae_encoder_stitch_latent_f32(
+                      h3_gpu *gpu, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *current,
+                      const h3_gpu_tensor *above,
+                      const h3_gpu_tensor *left,
+                      const h3_gpu_tensor *mean,
+                      const h3_gpu_tensor *std,
+                      uint32_t time_offset, uint32_t chunk_time,
+                      uint32_t full_time, uint32_t full_height,
+                      uint32_t full_width, uint32_t tile_height,
+                      uint32_t tile_width, uint32_t destination_y,
+                      uint32_t destination_x, uint32_t overlap_y,
+                      uint32_t overlap_x, uint32_t keep_height,
+                      uint32_t keep_width);
+int h3_gpu_vae_encoder_stitch_latent_f16(
+                      h3_gpu *gpu, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *current,
+                      const h3_gpu_tensor *above,
+                      const h3_gpu_tensor *left,
+                      const h3_gpu_tensor *mean,
+                      const h3_gpu_tensor *std,
+                      uint32_t time_offset, uint32_t chunk_time,
+                      uint32_t full_time, uint32_t full_height,
+                      uint32_t full_width, uint32_t tile_height,
+                      uint32_t tile_width, uint32_t destination_y,
+                      uint32_t destination_x, uint32_t overlap_y,
+                      uint32_t overlap_x, uint32_t keep_height,
+                      uint32_t keep_width);
+/* Retain the first `destination_time` temporal tokens of a channel-major
+ * latent when its source channel stride is wider. */
+int h3_gpu_vae_encoder_temporal_take_f32(
+                      h3_gpu *gpu, h3_gpu_tensor *destination,
+                      const h3_gpu_tensor *source, uint32_t source_time,
+                      uint32_t destination_time, uint32_t height,
+                      uint32_t width);
 
 /* Portable BF16 storage path. Arithmetic accumulates in F32 and rounds at
  * operation boundaries, matching the released checkpoint's compute dtype. */
@@ -323,6 +427,16 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales);
+int h3_gpu_linear_convrot_int8_bf16(
+                            h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *rotated,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim);
 /* Consume SDPA's native [head,row,dimension] BF16 layout without a full
  * BF16 transpose, gathering directly into the projection's row-major int8. */
 int h3_gpu_linear_int8_head_major_bf16(
@@ -540,6 +654,9 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
+int h3_gpu_add_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                   const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                   uint32_t elements);
 int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
@@ -606,6 +723,22 @@ int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
                       size_t sample_offset, const h3_gpu_tensor *last,
                       const h3_gpu_tensor *previous, uint32_t elements,
                       float delta, float ratio);
+/* Apply one RES step without materialising a host-side velocity or denoised
+ * tensor. `sample` holds the full F32 input tensor; the generated range begins
+ * at sample_offset. `velocity` is the DiT's BF16 final head and `history`
+ * retains the preceding denoised estimate in F32.  The scalar coefficients are
+ * deliberately computed by the host from the exact serving schedule.
+ *
+ * When use_multistep is false this performs the first/terminal Euler-equivalent
+ * RES update.  In either case it replaces history with x_t + sigma * velocity.
+ */
+int h3_gpu_res_velocity_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
+                             size_t sample_offset,
+                             const h3_gpu_tensor *velocity,
+                             h3_gpu_tensor *history, uint32_t elements,
+                             float sigma, float sigma_next,
+                             float decay, float h, float b1, float b2,
+                             int use_multistep);
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
