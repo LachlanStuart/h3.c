@@ -138,6 +138,15 @@ h3_lora_bench: tests/bench_lora.o $(LIB_OBJ)
 h3_dit_lora_bench: tests/bench_dit_lora.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# The benchmark includes h3_dit.c privately to reach run_block(), so its
+# ordinary object must not also be linked.
+h3_convrot_block_bench: tests/bench_convrot_block.o $(filter-out h3_dit.o,$(LIB_OBJ))
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# Includes h3_gpu.m privately to isolate quantization, GEMM and SDPA.
+h3_convrot_kernels_bench: tests/bench_convrot_kernels.o
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -309,4 +318,5 @@ clean:
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 h3_dit_lora_bench h3_lora_bench \
+	h3_convrot_block_bench h3_convrot_kernels_bench \
 	libh3.a *.o *.d tests/*.o tests/*.d

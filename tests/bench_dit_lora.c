@@ -63,6 +63,9 @@ static void usage(const char *program) {
             "                          profile nominal count when adapted)\n"
             "  --step N                Fixed zero-based forward step (default: 0)\n"
             "  --large                 Use 1024x512 and 243 frames\n"
+            "  --ab-convrot            Compare ConvRot reference/candidate\n"
+            "                          (cold AB, warm AB, BA, AB)\n"
+            "  --check-sampler         Run two 16-step Euler correctness passes\n"
             "  --dump PREFIX           Write PREFIX.video.f32 and\n"
             "                          PREFIX.audio.f32 after the warm forwards\n"
             "  --help                  Show this message\n\n"
@@ -235,6 +238,199 @@ static void print_timing(const char *label, const forward_timing *timing,
            byte_equal ? "yes" : "no", video_hash, audio_hash);
 }
 
+typedef struct {
+    char *full_k;
+    char *head_major;
+} convrot_environment;
+
+static int save_convrot_environment(convrot_environment *saved,
+                                    char *error, size_t error_size) {
+    memset(saved, 0, sizeof(*saved));
+    const char *full_k = getenv("H3_DISABLE_CONVROT_FULL_K");
+    const char *head_major = getenv("H3_DISABLE_CONVROT_HEAD_MAJOR");
+    if ((full_k && !(saved->full_k = strdup(full_k))) ||
+        (head_major && !(saved->head_major = strdup(head_major)))) {
+        free(saved->full_k);
+        free(saved->head_major);
+        saved->full_k = NULL;
+        saved->head_major = NULL;
+        snprintf(error, error_size,
+                 "cannot save ConvRot environment values");
+        return 0;
+    }
+    return 1;
+}
+
+static void restore_convrot_environment(convrot_environment *saved) {
+    if (saved->full_k) setenv("H3_DISABLE_CONVROT_FULL_K", saved->full_k, 1);
+    else unsetenv("H3_DISABLE_CONVROT_FULL_K");
+    if (saved->head_major)
+        setenv("H3_DISABLE_CONVROT_HEAD_MAJOR", saved->head_major, 1);
+    else
+        unsetenv("H3_DISABLE_CONVROT_HEAD_MAJOR");
+    free(saved->full_k);
+    free(saved->head_major);
+    saved->full_k = NULL;
+    saved->head_major = NULL;
+}
+
+static int set_convrot_variant(int reference, char *error, size_t error_size) {
+    int full_k = reference ?
+        setenv("H3_DISABLE_CONVROT_FULL_K", "1", 1) :
+        unsetenv("H3_DISABLE_CONVROT_FULL_K");
+    int head_major = reference ?
+        setenv("H3_DISABLE_CONVROT_HEAD_MAJOR", "1", 1) :
+        unsetenv("H3_DISABLE_CONVROT_HEAD_MAJOR");
+    if (full_k != 0 || head_major != 0) {
+        snprintf(error, error_size,
+                 "cannot select ConvRot %s variant: %s",
+                 reference ? "reference" : "candidate", strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+static int run_convrot_ab_forward(
+    h3_dit *dit, int step, const float *video, const float *audio,
+    float *video_output, float *audio_output,
+    float *reference_video, float *reference_audio,
+    size_t video_count, size_t audio_count, int reference_variant,
+    int warm, const char *label, int *have_reference, int *all_finite,
+    int *all_equal, int *warm_count, char *error, size_t error_size) {
+    if (!set_convrot_variant(reference_variant, error, error_size)) return 0;
+    forward_timing timing;
+    if (!get_forward_timing(dit, step, video, audio, video_output,
+                            audio_output, &timing, error, error_size))
+        return 0;
+    int finite = finite_array(video_output, video_count) &&
+        finite_array(audio_output, audio_count);
+    int byte_equal = 0;
+    if (!*have_reference) {
+        if (finite) {
+            memcpy(reference_video, video_output,
+                   video_count * sizeof(*reference_video));
+            memcpy(reference_audio, audio_output,
+                   audio_count * sizeof(*reference_audio));
+            *have_reference = 1;
+        }
+        byte_equal = finite;
+    } else if (finite) {
+        byte_equal = !memcmp(reference_video, video_output,
+                              video_count * sizeof(*reference_video)) &&
+            !memcmp(reference_audio, audio_output,
+                    audio_count * sizeof(*reference_audio));
+    }
+    print_timing(label, &timing, finite, byte_equal,
+                 video_count, audio_count, video_output, audio_output);
+    *all_finite = *all_finite && finite;
+    *all_equal = *all_equal && byte_equal;
+    if (warm) (*warm_count)++;
+    return 1;
+}
+
+static int run_convrot_ab(
+    h3_dit *dit, int step, const float *video, const float *audio,
+    float *video_output, float *audio_output,
+    float *reference_video, float *reference_audio,
+    size_t video_count, size_t audio_count, int *finite, int *stable,
+    int *warm_count, char *error, size_t error_size) {
+    convrot_environment saved;
+    if (!save_convrot_environment(&saved, error, error_size)) {
+        *finite = 0;
+        *stable = 0;
+        *warm_count = 0;
+        return 0;
+    }
+    int have_reference = 0;
+    int all_finite = 1;
+    int all_equal = 1;
+    int completed_warm = 0;
+    struct {
+        int reference;
+        int warm;
+        const char *label;
+    } calls[] = {
+        {1, 0, "convrot-ref-cold"},
+        {0, 0, "convrot-cand-cold"},
+        {1, 1, "convrot-ref-warm1"},
+        {0, 1, "convrot-cand-warm1"},
+        {0, 1, "convrot-cand-warm2"},
+        {1, 1, "convrot-ref-warm2"},
+        {1, 1, "convrot-ref-warm3"},
+        {0, 1, "convrot-cand-warm3"}
+    };
+    int operational = 1;
+    for (size_t index = 0; index < sizeof(calls) / sizeof(*calls); index++) {
+        if (!run_convrot_ab_forward(
+                dit, step, video, audio, video_output, audio_output,
+                reference_video, reference_audio, video_count, audio_count,
+                calls[index].reference, calls[index].warm, calls[index].label,
+                &have_reference, &all_finite, &all_equal, &completed_warm,
+                error, error_size)) {
+            fprintf(stderr, "bench_dit_lora: %s failed: %s\n",
+                    calls[index].label, error);
+            operational = 0;
+            break;
+        }
+    }
+    restore_convrot_environment(&saved);
+    *finite = have_reference && all_finite;
+    *stable = operational && *finite && all_equal && completed_warm == 6;
+    *warm_count = completed_warm;
+    return operational;
+}
+
+static int run_sampler_check(
+    h3_dit *dit, const float *initial_video,
+    const float *initial_audio, float *reference_video,
+    float *reference_audio, float *candidate_video,
+    float *candidate_audio, size_t video_count, size_t audio_count,
+    int *finite, int *byte_equal, char *error, size_t error_size) {
+    convrot_environment saved;
+    if (!save_convrot_environment(&saved, error, error_size)) {
+        *finite = 0;
+        *byte_equal = 0;
+        return 0;
+    }
+    memcpy(reference_video, initial_video,
+           video_count * sizeof(*reference_video));
+    memcpy(reference_audio, initial_audio,
+           audio_count * sizeof(*reference_audio));
+    memcpy(candidate_video, initial_video,
+           video_count * sizeof(*candidate_video));
+    memcpy(candidate_audio, initial_audio,
+           audio_count * sizeof(*candidate_audio));
+
+    int reference_ok = set_convrot_variant(1, error, error_size) &&
+        h3_dit_reset_run(dit, NULL, 0, NULL, 0, error, error_size) &&
+        h3_dit_denoise_euler(dit, reference_video, reference_audio, 1,
+                             progress, NULL, error, error_size);
+    int reference_finite = reference_ok &&
+        finite_array(reference_video, video_count) &&
+        finite_array(reference_audio, audio_count);
+    printf("sampler reference finite=%s\n",
+           reference_finite ? "yes" : "no");
+
+    int candidate_ok = set_convrot_variant(0, error, error_size) &&
+        h3_dit_reset_run(dit, NULL, 0, NULL, 0, error, error_size) &&
+        h3_dit_denoise_euler(dit, candidate_video, candidate_audio, 1,
+                             progress, NULL, error, error_size);
+    int candidate_finite = candidate_ok &&
+        finite_array(candidate_video, video_count) &&
+        finite_array(candidate_audio, audio_count);
+    int equal = reference_finite && candidate_finite &&
+        !memcmp(reference_video, candidate_video,
+                video_count * sizeof(*reference_video)) &&
+        !memcmp(reference_audio, candidate_audio,
+                audio_count * sizeof(*reference_audio));
+    printf("sampler candidate finite=%s byte_equal=%s\n",
+           candidate_finite ? "yes" : "no", equal ? "yes" : "no");
+    restore_convrot_environment(&saved);
+    *finite = reference_finite && candidate_finite;
+    *byte_equal = equal;
+    return reference_ok && candidate_ok;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
@@ -252,6 +448,8 @@ int main(int argc, char **argv) {
     h3_adapter_profile profile = H3_ADAPTER_PROFILE_NONE;
     float adapter_strength = 1.0f;
     int large = 0;
+    int ab_convrot = 0;
+    int check_sampler = 0;
     int steps = DEFAULT_STEPS;
     int steps_given = 0;
     int step = 0;
@@ -263,6 +461,10 @@ int main(int argc, char **argv) {
             return 0;
         } else if (!strcmp(argument, "--large")) {
             large = 1;
+        } else if (!strcmp(argument, "--ab-convrot")) {
+            ab_convrot = 1;
+        } else if (!strcmp(argument, "--check-sampler")) {
+            check_sampler = 1;
         } else if (!strcmp(argument, "--adapter") ||
                    !strcmp(argument, "--adapter-path")) {
             if (++index >= argc) {
@@ -327,6 +529,14 @@ int main(int argc, char **argv) {
     }
     if (profile != H3_ADAPTER_PROFILE_NONE && !steps_given)
         steps = h3_adapter_profile_default_steps(profile);
+    if (check_sampler) {
+        if (steps_given && steps != 16) {
+            fputs("bench_dit_lora: --check-sampler requires --steps 16\n",
+                  stderr);
+            return 2;
+        }
+        steps = 16;
+    }
     if (steps < 2 || steps > H3_MAX_STEPS) {
         fprintf(stderr, "bench_dit_lora: steps must be in [2, %d]\n",
                 H3_MAX_STEPS);
@@ -434,8 +644,20 @@ int main(int argc, char **argv) {
     float *audio_output = malloc(audio_count * sizeof(*audio_output));
     float *reference_video = malloc(video_count * sizeof(*reference_video));
     float *reference_audio = malloc(audio_count * sizeof(*reference_audio));
+    float *sampler_reference_video = check_sampler ?
+        malloc(video_count * sizeof(*sampler_reference_video)) : NULL;
+    float *sampler_reference_audio = check_sampler ?
+        malloc(audio_count * sizeof(*sampler_reference_audio)) : NULL;
+    float *sampler_candidate_video = check_sampler ?
+        malloc(video_count * sizeof(*sampler_candidate_video)) : NULL;
+    float *sampler_candidate_audio = check_sampler ?
+        malloc(audio_count * sizeof(*sampler_candidate_audio)) : NULL;
     if (!video || !audio || !video_output || !audio_output ||
-        !reference_video || !reference_audio)
+        !reference_video || !reference_audio ||
+        (check_sampler && (!sampler_reference_video ||
+                           !sampler_reference_audio ||
+                           !sampler_candidate_video ||
+                           !sampler_candidate_audio)))
         die("out of memory allocating synthetic latent buffers");
     for (size_t index = 0; index < video_count; index++) {
         float magnitude = 0.002f * (float)(1 + index % 29);
@@ -448,47 +670,72 @@ int main(int argc, char **argv) {
     if (!finite_array(video, video_count) || !finite_array(audio, audio_count))
         die("synthetic latent values are not finite");
 
-    forward_timing timing;
     int finite = 0;
     int stable = 1;
-    if (!get_forward_timing(dit, step, video, audio, video_output,
-                            audio_output, &timing, error, sizeof(error))) {
-        fprintf(stderr, "bench_dit_lora: cold forward failed: %s\n", error);
-        stable = 0;
-    } else {
-        finite = finite_array(video_output, video_count) &&
-            finite_array(audio_output, audio_count);
-        if (!finite) stable = 0;
-        if (finite) {
-            memcpy(reference_video, video_output,
-                   video_count * sizeof(*reference_video));
-            memcpy(reference_audio, audio_output,
-                   audio_count * sizeof(*reference_audio));
-        }
-        print_timing("cold", &timing, finite, 1,
-                     video_count, audio_count, video_output, audio_output);
-    }
     int warm_count = 0;
-    for (int warm = 0; stable && warm < 3; warm++) {
+    if (ab_convrot) {
+        (void)run_convrot_ab(
+            dit, step, video, audio, video_output, audio_output,
+            reference_video, reference_audio, video_count, audio_count,
+            &finite, &stable, &warm_count, error, sizeof(error));
+    } else {
+        forward_timing timing;
         if (!get_forward_timing(dit, step, video, audio, video_output,
                                 audio_output, &timing, error, sizeof(error))) {
-            fprintf(stderr, "bench_dit_lora: warm-%d forward failed: %s\n",
-                    warm + 1, error);
+            fprintf(stderr, "bench_dit_lora: cold forward failed: %s\n", error);
             stable = 0;
-            break;
+        } else {
+            finite = finite_array(video_output, video_count) &&
+                finite_array(audio_output, audio_count);
+            if (!finite) stable = 0;
+            if (finite) {
+                memcpy(reference_video, video_output,
+                       video_count * sizeof(*reference_video));
+                memcpy(reference_audio, audio_output,
+                       audio_count * sizeof(*reference_audio));
+            }
+            print_timing("cold", &timing, finite, 1,
+                         video_count, audio_count, video_output, audio_output);
         }
-        finite = finite_array(video_output, video_count) &&
-            finite_array(audio_output, audio_count);
-        int byte_equal = finite &&
-            !memcmp(reference_video, video_output,
-                    video_count * sizeof(*reference_video)) &&
-            !memcmp(reference_audio, audio_output,
-                    audio_count * sizeof(*reference_audio));
-        print_timing(warm == 0 ? "warm-1" : warm == 1 ? "warm-2" : "warm-3",
-                     &timing, finite, byte_equal,
-                     video_count, audio_count, video_output, audio_output);
-        warm_count++;
-        if (!finite || !byte_equal) stable = 0;
+        for (int warm = 0; stable && warm < 3; warm++) {
+            if (!get_forward_timing(dit, step, video, audio, video_output,
+                                    audio_output, &timing, error, sizeof(error))) {
+                fprintf(stderr, "bench_dit_lora: warm-%d forward failed: %s\n",
+                        warm + 1, error);
+                stable = 0;
+                break;
+            }
+            finite = finite_array(video_output, video_count) &&
+                finite_array(audio_output, audio_count);
+            int byte_equal = finite &&
+                !memcmp(reference_video, video_output,
+                        video_count * sizeof(*reference_video)) &&
+                !memcmp(reference_audio, audio_output,
+                        audio_count * sizeof(*reference_audio));
+            print_timing(warm == 0 ? "warm-1" : warm == 1 ? "warm-2" : "warm-3",
+                         &timing, finite, byte_equal,
+                         video_count, audio_count, video_output, audio_output);
+            warm_count++;
+            if (!finite || !byte_equal) stable = 0;
+        }
+    }
+
+    if (check_sampler) {
+        int sampler_finite = 0;
+        int sampler_equal = 0;
+        int sampler_ok = run_sampler_check(
+            dit, video, audio, sampler_reference_video,
+            sampler_reference_audio, sampler_candidate_video,
+            sampler_candidate_audio, video_count, audio_count,
+            &sampler_finite, &sampler_equal, error, sizeof(error));
+        if (!sampler_ok)
+            fprintf(stderr, "bench_dit_lora: sampler check failed: %s\n",
+                    error);
+        printf("sampler_check steps=16 reuse=1 finite=%s byte_stable=%s\n",
+               sampler_finite ? "yes" : "no",
+               sampler_equal ? "yes" : "no");
+        finite = finite && sampler_finite;
+        stable = stable && sampler_finite && sampler_equal;
     }
 
     if (stable && dump_prefix &&
@@ -499,8 +746,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bench_dit_lora: %s\n", error);
         stable = 0;
     }
-    printf("result load=%.3fs warm_forwards=%d finite=%s byte_stable=%s\n",
-           load_seconds, warm_count, finite ? "yes" : "no", stable ? "yes" : "no");
+    if (ab_convrot)
+        printf("result load=%.3fs mode=convrot_ab warm_forwards=%d_each "
+               "finite=%s byte_stable=%s\n", load_seconds, warm_count / 2,
+               finite ? "yes" : "no", stable ? "yes" : "no");
+    else
+        printf("result load=%.3fs warm_forwards=%d finite=%s byte_stable=%s\n",
+               load_seconds, warm_count, finite ? "yes" : "no",
+               stable ? "yes" : "no");
 
     h3_dit_free(dit);
     h3_layout_free(&layout);
@@ -511,5 +764,9 @@ int main(int argc, char **argv) {
     free(audio_output);
     free(reference_video);
     free(reference_audio);
+    free(sampler_reference_video);
+    free(sampler_reference_audio);
+    free(sampler_candidate_video);
+    free(sampler_candidate_audio);
     return stable && finite ? 0 : 1;
 }

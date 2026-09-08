@@ -483,6 +483,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
             @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
             @"h3_qkv_rope_bf16", @"h3_qkv_rope_bf16_coop",
+            @"h3_qkv_rope_bf16_coop_head_major",
             @"h3_qkv_rope_bf16_coop_uncached",
             @"h3_sdpa_bf16_reference",
             @"h3_swiglu_bf16",
@@ -547,6 +548,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_linear_int8_nax_r128"];
             [names addObject:
                 @"h3_linear_int8_nax_r128_full_k14336"];
+            [names addObject:@"h3_linear_int8_nax_r128_full_k5376_n21504"];
+            [names addObject:@"h3_linear_int8_nax_r128_full_k7168_n5376"];
+            [names addObject:@"h3_linear_int8_nax_r128_full_k5376_n28672"];
             [names addObject:
                 @"h3_linear_int8_nax_r128x256_full_k14336"];
             [names addObject:@"h3_linear_int8_local_scales_nax_r128"];
@@ -4380,9 +4384,23 @@ static int h3_gpu_linear_int8_quantized_bf16(
         !h3_gpu_require_command(gpu)) return 0;
     BOOL known_linear = rows <= 2048 && input_dim == 7168 &&
         output_dim == 5376 && getenv("H3_DISABLE_INT8_LINEAR_KNOWN") == NULL;
-    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, known_linear ? @"h3_linear_int8_local_scales_nax_r128_k7168" :
-                            @"h3_linear_int8_local_scales_nax_r128");
+    NSString *name = known_linear ?
+        @"h3_linear_int8_local_scales_nax_r128_k7168" :
+        @"h3_linear_int8_local_scales_nax_r128";
+    /* ConvRot already supplies one quantized activation scale per row.
+     * Static full reductions preserve the int32 sum and BF16 epilogue.
+     * Keep the short-sequence dispatch until it has matching timing evidence. */
+    if (rows > 2048 && !getenv("H3_DISABLE_CONVROT_FULL_K")) {
+        if (input_dim == 14336 && output_dim == 5376)
+            name = @"h3_linear_int8_nax_r128_full_k14336";
+        else if (input_dim == 5376 && output_dim == 21504)
+            name = @"h3_linear_int8_nax_r128_full_k5376_n21504";
+        else if (input_dim == 7168 && output_dim == 5376)
+            name = @"h3_linear_int8_nax_r128_full_k7168_n5376";
+        else if (input_dim == 5376 && output_dim == 28672)
+            name = @"h3_linear_int8_nax_r128_full_k5376_n28672";
+    }
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, name);
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
         h3_gpu_set_error(gpu, @"int8 M5 linear projection is unavailable");
         return 0;
@@ -5173,8 +5191,10 @@ static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
                                        const h3_gpu_tensor *rope_sin,
                                        uint32_t sequence, uint32_t heads,
                                        uint32_t head_dim, uint32_t rope_half,
-                                       uint32_t grouped, float epsilon) {
+                                       uint32_t grouped, float epsilon,
+                                       int head_major) {
     H3GPU *gpu = GPU(opaque);
+    gpu.headMajorSDPAInputs = NO;
     size_t inner = (size_t)heads * head_dim;
     size_t count = (size_t)sequence * inner;
     size_t rope_count = (size_t)sequence * rope_half;
@@ -5191,7 +5211,10 @@ static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
     if (head_dim == 128 && !(heads % 4) &&
         !getenv("H3_DISABLE_COOP_QKV")) {
         if (!h3_gpu_require_command(gpu)) return 0;
-        NSString *pipeline_name = getenv("H3_DISABLE_CACHED_QKV") ?
+        head_major = head_major && !getenv("H3_DISABLE_CACHED_QKV");
+        NSString *pipeline_name = head_major ?
+            @"h3_qkv_rope_bf16_coop_head_major" :
+            getenv("H3_DISABLE_CACHED_QKV") ?
             @"h3_qkv_rope_bf16_coop_uncached" :
             @"h3_qkv_rope_bf16_coop";
         id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
@@ -5221,6 +5244,7 @@ static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
         h3_gpu_stats stats = gpu.stats;
         stats.direct_dispatches++;
         gpu.stats = stats;
+        gpu.headMajorSDPAInputs = head_major != 0;
         return 1;
     }
     return h3_gpu_dispatch_3d(gpu, @"h3_qkv_rope_bf16",
@@ -5249,7 +5273,24 @@ int h3_gpu_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
                          uint32_t rope_half, float epsilon) {
     return h3_gpu_qkv_rope_bf16_layout(
         opaque, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
-        sequence, heads, head_dim, rope_half, 0, epsilon);
+        sequence, heads, head_dim, rope_half, 0, epsilon, 0);
+}
+
+int h3_gpu_qkv_rope_bf16_for_sdpa(h3_gpu *opaque, h3_gpu_tensor *query,
+                         h3_gpu_tensor *key, h3_gpu_tensor *value,
+                         const h3_gpu_tensor *qkv,
+                         const h3_gpu_tensor *q_norm,
+                         const h3_gpu_tensor *k_norm,
+                         const h3_gpu_tensor *rope_cos,
+                         const h3_gpu_tensor *rope_sin, uint32_t sequence,
+                         uint32_t heads, uint32_t head_dim,
+                         uint32_t rope_half, float epsilon) {
+    return h3_gpu_qkv_rope_bf16_layout(
+        opaque, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
+        sequence, heads, head_dim, rope_half, 0, epsilon,
+        !getenv("H3_DISABLE_CONVROT_HEAD_MAJOR") &&
+        !getenv("H3_DISABLE_HEAD_MAJOR_SDPA") &&
+        !getenv("H3_REFERENCE_SDPA"));
 }
 
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
@@ -5264,7 +5305,7 @@ int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
                                  float epsilon) {
     return h3_gpu_qkv_rope_bf16_layout(
         opaque, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
-        sequence, heads, head_dim, rope_half, 1, epsilon);
+        sequence, heads, head_dim, rope_half, 1, epsilon, 0);
 }
 
 int h3_gpu_grouped_qkv_linear_rope_bf16(

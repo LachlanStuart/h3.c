@@ -399,6 +399,151 @@ static void test_comfy_qkv_layout(h3_gpu *gpu) {
     h3_gpu_tensor_free(value_gpu);
 }
 
+static void test_qkv_head_major_sdpa_layout(h3_gpu *gpu) {
+    enum { ROWS = 87, HEADS = 8, HEAD_DIM = 128, ROPE_HALF = 48 };
+    size_t elements = (size_t)ROWS * HEADS * HEAD_DIM;
+    size_t qkv_elements = elements * 3;
+    size_t rope_elements = (size_t)ROWS * ROPE_HALF;
+    uint16_t *qkv = malloc(qkv_elements * sizeof(*qkv));
+    uint16_t *q_norm = malloc(HEAD_DIM * sizeof(*q_norm));
+    uint16_t *k_norm = malloc(HEAD_DIM * sizeof(*k_norm));
+    uint16_t *rope_cos = malloc(rope_elements * sizeof(*rope_cos));
+    uint16_t *rope_sin = malloc(rope_elements * sizeof(*rope_sin));
+    uint16_t *row_q = malloc(elements * sizeof(*row_q));
+    uint16_t *row_k = malloc(elements * sizeof(*row_k));
+    uint16_t *row_v = malloc(elements * sizeof(*row_v));
+    uint16_t *head_q = malloc(elements * sizeof(*head_q));
+    uint16_t *head_k = malloc(elements * sizeof(*head_k));
+    uint16_t *head_v = malloc(elements * sizeof(*head_v));
+    uint16_t *row_attention = malloc(elements * sizeof(*row_attention));
+    uint16_t *head_attention = malloc(elements * sizeof(*head_attention));
+    require(qkv && q_norm && k_norm && rope_cos && rope_sin && row_q && row_k &&
+            row_v && head_q && head_k && head_v && row_attention &&
+            head_attention, "QKV head-major fixture allocation failed");
+    for (size_t index = 0; index < qkv_elements; index++)
+        qkv[index] = f32_to_bf16(
+            ((float)(int)(index % 113) - 56.0f) * 0.03125f +
+            (float)(index % 17) * 0.001f);
+    for (unsigned dimension = 0; dimension < HEAD_DIM; dimension++) {
+        q_norm[dimension] = f32_to_bf16(0.7f +
+            (float)(dimension % 19) * 0.013f);
+        k_norm[dimension] = f32_to_bf16(0.9f +
+            (float)(dimension % 23) * 0.009f);
+    }
+    for (unsigned row = 0; row < ROWS; row++)
+        for (unsigned dimension = 0; dimension < ROPE_HALF; dimension++) {
+            size_t index = (size_t)row * ROPE_HALF + dimension;
+            rope_cos[index] = f32_to_bf16(0.55f +
+                (float)((row * 3 + dimension * 5) % 23) * 0.011f);
+            rope_sin[index] = f32_to_bf16(-0.35f +
+                (float)((row * 7 + dimension * 2) % 19) * 0.017f);
+        }
+    h3_gpu_tensor *qkv_gpu = h3_gpu_tensor_from_bf16(
+        gpu, qkv, qkv_elements);
+    h3_gpu_tensor *q_norm_gpu = h3_gpu_tensor_from_bf16(
+        gpu, q_norm, HEAD_DIM);
+    h3_gpu_tensor *k_norm_gpu = h3_gpu_tensor_from_bf16(
+        gpu, k_norm, HEAD_DIM);
+    h3_gpu_tensor *cos_gpu = h3_gpu_tensor_from_bf16(
+        gpu, rope_cos, rope_elements);
+    h3_gpu_tensor *sin_gpu = h3_gpu_tensor_from_bf16(
+        gpu, rope_sin, rope_elements);
+    h3_gpu_tensor *row_q_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *row_k_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *row_v_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *head_q_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *head_k_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *head_v_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *row_attention_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    h3_gpu_tensor *head_attention_gpu = h3_gpu_tensor_new_bf16(gpu, elements);
+    require(qkv_gpu && q_norm_gpu && k_norm_gpu && cos_gpu && sin_gpu &&
+            row_q_gpu && row_k_gpu && row_v_gpu && head_q_gpu && head_k_gpu &&
+            head_v_gpu && row_attention_gpu && head_attention_gpu,
+            "QKV head-major tensor allocation failed");
+    const char *saved_reference_value = getenv("H3_REFERENCE_SDPA");
+    char *saved_reference = saved_reference_value ?
+        strdup(saved_reference_value) : NULL;
+    require(!saved_reference_value || saved_reference,
+            "QKV head-major environment save failed");
+    /* Force the tested cached paths, then leave all diagnostic switches clear. */
+    unsetenv("H3_DISABLE_COOP_QKV");
+    unsetenv("H3_DISABLE_CACHED_QKV");
+    unsetenv("H3_DISABLE_CONVROT_HEAD_MAJOR");
+    unsetenv("H3_DISABLE_HEAD_MAJOR_SDPA");
+    unsetenv("H3_REFERENCE_SDPA");
+    require(h3_gpu_begin(gpu) &&
+            h3_gpu_qkv_rope_bf16(
+                gpu, row_q_gpu, row_k_gpu, row_v_gpu, qkv_gpu, q_norm_gpu,
+                k_norm_gpu, cos_gpu, sin_gpu, ROWS, HEADS, HEAD_DIM,
+                ROPE_HALF, 1e-5f) && h3_gpu_submit(gpu),
+            "row-major QKV/RoPE regression dispatch failed");
+    require(h3_gpu_tensor_read_bf16(row_q_gpu, row_q, elements) &&
+            h3_gpu_tensor_read_bf16(row_k_gpu, row_k, elements) &&
+            h3_gpu_tensor_read_bf16(row_v_gpu, row_v, elements),
+            "row-major QKV/RoPE regression read failed");
+    require(h3_gpu_begin(gpu) && h3_gpu_sdpa_bf16(
+                gpu, row_attention_gpu, row_q_gpu, row_k_gpu, row_v_gpu,
+                ROWS, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)) &&
+            h3_gpu_submit(gpu) && h3_gpu_tensor_read_bf16(
+                row_attention_gpu, row_attention, elements),
+            "row-major SDPA regression dispatch failed");
+    require(h3_gpu_begin(gpu) &&
+            h3_gpu_qkv_rope_bf16_for_sdpa(
+                gpu, head_q_gpu, head_k_gpu, head_v_gpu, qkv_gpu, q_norm_gpu,
+                k_norm_gpu, cos_gpu, sin_gpu, ROWS, HEADS, HEAD_DIM,
+                ROPE_HALF, 1e-5f) && h3_gpu_submit(gpu),
+            "head-major QKV/RoPE regression dispatch failed");
+    require(h3_gpu_tensor_read_bf16(head_q_gpu, head_q, elements) &&
+            h3_gpu_tensor_read_bf16(head_k_gpu, head_k, elements) &&
+            h3_gpu_tensor_read_bf16(head_v_gpu, head_v, elements),
+            "head-major QKV/RoPE regression read failed");
+    for (unsigned row = 0; row < ROWS; row++)
+        for (unsigned head = 0; head < HEADS; head++)
+            for (unsigned dimension = 0; dimension < HEAD_DIM; dimension++) {
+                size_t row_index = ((size_t)row * HEADS + head) * HEAD_DIM +
+                                   dimension;
+                size_t head_index = ((size_t)head * ROWS + row) * HEAD_DIM +
+                                    dimension;
+                require(head_q[head_index] == row_q[row_index] &&
+                        head_k[head_index] == row_k[row_index] &&
+                        head_v[head_index] == row_v[row_index],
+                        "head-major QKV/RoPE layout differs from row-major");
+            }
+    require(h3_gpu_begin(gpu) &&
+            h3_gpu_qkv_rope_bf16_for_sdpa(
+                gpu, head_q_gpu, head_k_gpu, head_v_gpu, qkv_gpu, q_norm_gpu,
+                k_norm_gpu, cos_gpu, sin_gpu, ROWS, HEADS, HEAD_DIM,
+                ROPE_HALF, 1e-5f) && h3_gpu_sdpa_bf16(
+                gpu, head_attention_gpu, head_q_gpu, head_k_gpu, head_v_gpu,
+                ROWS, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)) &&
+            h3_gpu_submit(gpu) && h3_gpu_tensor_read_bf16(
+                head_attention_gpu, head_attention, elements),
+            "head-major SDPA regression dispatch failed");
+    require(!memcmp(row_attention, head_attention,
+                    elements * sizeof(*row_attention)),
+            "head-major SDPA output differs from row-major baseline");
+    unsetenv("H3_DISABLE_COOP_QKV");
+    unsetenv("H3_DISABLE_CACHED_QKV");
+    unsetenv("H3_DISABLE_CONVROT_HEAD_MAJOR");
+    unsetenv("H3_DISABLE_HEAD_MAJOR_SDPA");
+    if (saved_reference) {
+        setenv("H3_REFERENCE_SDPA", saved_reference, 1);
+        free(saved_reference);
+    } else {
+        unsetenv("H3_REFERENCE_SDPA");
+    }
+    h3_gpu_tensor_free(qkv_gpu); h3_gpu_tensor_free(q_norm_gpu);
+    h3_gpu_tensor_free(k_norm_gpu); h3_gpu_tensor_free(cos_gpu);
+    h3_gpu_tensor_free(sin_gpu); h3_gpu_tensor_free(row_q_gpu);
+    h3_gpu_tensor_free(row_k_gpu); h3_gpu_tensor_free(row_v_gpu);
+    h3_gpu_tensor_free(head_q_gpu); h3_gpu_tensor_free(head_k_gpu);
+    h3_gpu_tensor_free(head_v_gpu); h3_gpu_tensor_free(row_attention_gpu);
+    h3_gpu_tensor_free(head_attention_gpu);
+    free(qkv); free(q_norm); free(k_norm); free(rope_cos); free(rope_sin);
+    free(row_q); free(row_k); free(row_v); free(head_q); free(head_k);
+    free(head_v); free(row_attention); free(head_attention);
+}
+
 static void test_checkpoint_qkv(h3_gpu *gpu, const char *path) {
     enum { CHECKPOINT_INPUT = 5376, CHECKPOINT_OUTPUT = 21504,
            CHECKPOINT_ROWS = 128, CHECK_COLUMNS = 128 };
@@ -1062,6 +1207,7 @@ int main(void) {
     test_convrot(gpu, SHORT_ROWS);
     test_rank8(gpu);
     test_comfy_qkv_layout(gpu);
+    test_qkv_head_major_sdpa_layout(gpu);
     test_adapter_qkv_layout(gpu, 0);
     test_adapter_qkv_layout(gpu, 1);
     const char *checkpoint = getenv("H3_CONVROT_CHECKPOINT");

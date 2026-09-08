@@ -731,6 +731,33 @@ read throughput, and the part of the read wait that was not hidden by GPU work.
 
 ### Metal 4 and TensorOps paths
 
+The pruned ConvRot path keeps its runtime LoRA branch and uses static full-K
+INT8 reductions for its four main projection shapes above 2,048 rows. Its
+cooperative QKV normalization/RoPE kernel writes attention inputs directly in
+head-major order, avoiding three graph transposes. Both changes retain the
+existing precision boundaries. `H3_DISABLE_CONVROT_FULL_K=1` and
+`H3_DISABLE_CONVROT_HEAD_MAJOR=1` restore the previous projection and layout
+dispatch independently.
+
+On M5 Max, balanced warm comparisons with ModelTC measured a 1.4% mean
+wall-time reduction for a complete 50-block Ref2VA forward at 512x256/175
+frames, and 2.9% for a four-block Hybrid chain at 1024x512/243 frames.
+All compared velocities and hidden states were byte-identical. A complete
+16-step Euler trajectory also produced identical final F32 video/audio latents
+on the smaller Ref2VA shape. The larger
+measurement is a target-sized block proxy, not a complete render benchmark;
+GPU clock variation remains visible.
+
+`make h3_convrot_kernels_bench h3_convrot_block_bench h3_dit_lora_bench`
+builds the numerical timing probes. The kernel probe accepts `37680 --gemm`
+or `37680 --sdpa`. The block probe accepts a checkpoint plus the adapter
+options used by `h3_dit_lora_bench`, with `--blocks 4 --ab-optimized
+--no-profile` for the target-size chain or `--small` for 7,246 rows. The
+complete-forward probe's `--ab-convrot` interleaves both dispatches and
+requires exact output equality; `--check-sampler --steps 16` also compares
+two complete Euler trajectories. Each timing comparison separates cold
+execution from three warm measurements per variant.
+
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
 attention-output projections at sequence lengths up to 2,048. The compact
 Morton schedule routes Q/K/V directly into head-major attention inputs, avoids

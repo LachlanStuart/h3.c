@@ -2370,7 +2370,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         /* Comfy TensorWiseINT8 checkpoints preserve the model's three
          * contiguous [Q][K][V] output ranges.  Released native H3 shards use
          * the per-head grouped layout handled by the ordinary load path. */
-        OP(h3_gpu_qkv_rope_bf16(
+        OP(h3_gpu_qkv_rope_bf16_for_sdpa(
             dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
             weight->q_norm, weight->k_norm, rope_cos, rope_sin,
             rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),

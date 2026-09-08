@@ -670,6 +670,17 @@ int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                          const h3_gpu_tensor *rope_sin, uint32_t sequence,
                          uint32_t heads, uint32_t head_dim,
                          uint32_t rope_half, float epsilon);
+/* Conventional QKV input; selects head-major output for the next BF16 SDPA.
+ * Diagnostic/reference paths retain row-major output automatically. */
+int h3_gpu_qkv_rope_bf16_for_sdpa(h3_gpu *gpu, h3_gpu_tensor *query,
+                         h3_gpu_tensor *key, h3_gpu_tensor *value,
+                         const h3_gpu_tensor *qkv,
+                         const h3_gpu_tensor *q_norm,
+                         const h3_gpu_tensor *k_norm,
+                         const h3_gpu_tensor *rope_cos,
+                         const h3_gpu_tensor *rope_sin, uint32_t sequence,
+                         uint32_t heads, uint32_t head_dim,
+                         uint32_t rope_half, float epsilon);
 /* H3 checkpoint QKV rows are [head, q/k/v, dimension], unlike the
  * conventional [q/k/v, head, dimension] layout accepted above. */
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,

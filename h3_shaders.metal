@@ -3298,9 +3298,12 @@ kernel void h3_linear_int8_nax_r128(
     }
 }
 
-/* One-scale FC2 path. A static full-K product lets NAX own the
- * complete 14336-wide reduction; scale loads overlap that long operation. */
-kernel void h3_linear_int8_nax_r128_full_k14336(
+/* One-scale ConvRot paths. A static full-K product lets NAX own the
+ * complete reduction; scale loads overlap that long operation. Keep the
+ * output shape static too so the row/column tile mapping and output stride
+ * are compile-time constants for each production projection. */
+template<uint INPUT_DIM, uint OUTPUT_DIM>
+kernel void h3_linear_int8_nax_r128_full_k_impl(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
                            device const float *input_scales [[buffer(2)]],
@@ -3310,8 +3313,6 @@ kernel void h3_linear_int8_nax_r128_full_k14336(
                            uint code [[threadgroup_position_in_grid]],
                            ushort tid [[thread_index_in_threadgroup]]) {
     constexpr uint TILE = 128;
-    constexpr uint INPUT_DIM = 14336;
-    constexpr uint OUTPUT_DIM = 5376;
     uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
     uint row_tiles = padded_rows / TILE;
     uint2 group = h3_morton_decode_compact(
@@ -3353,6 +3354,21 @@ kernel void h3_linear_int8_nax_r128_full_k14336(
                     local_weight_scales[(uint)index[0]]);
     }
 }
+
+typedef decltype(h3_linear_int8_nax_r128_full_k_impl<14336, 5376>)
+    h3_linear_int8_nax_r128_full_k_t;
+template [[host_name("h3_linear_int8_nax_r128_full_k14336")]]
+kernel h3_linear_int8_nax_r128_full_k_t
+    h3_linear_int8_nax_r128_full_k_impl<14336, 5376>;
+template [[host_name("h3_linear_int8_nax_r128_full_k5376_n21504")]]
+kernel h3_linear_int8_nax_r128_full_k_t
+    h3_linear_int8_nax_r128_full_k_impl<5376, 21504>;
+template [[host_name("h3_linear_int8_nax_r128_full_k7168_n5376")]]
+kernel h3_linear_int8_nax_r128_full_k_t
+    h3_linear_int8_nax_r128_full_k_impl<7168, 5376>;
+template [[host_name("h3_linear_int8_nax_r128_full_k5376_n28672")]]
+kernel h3_linear_int8_nax_r128_full_k_t
+    h3_linear_int8_nax_r128_full_k_impl<5376, 28672>;
 
 kernel void h3_linear_int8_nax_r128x256_full_k14336(
                            device int8_t *input [[buffer(0)]],
@@ -4687,7 +4703,8 @@ kernel void h3_qkv_rope_bf16_coop_uncached(
  * load every projected value once; lane zero retains the oracle's scalar RMS
  * order, and the RoPE epilogue reuses the cached values. Each SIMD group owns
  * disjoint storage, so only SIMD-local barriers are required. */
-kernel void h3_qkv_rope_bf16_coop(
+template<bool HEAD_MAJOR_OUTPUT>
+kernel void h3_qkv_rope_bf16_coop_impl(
                              device const ushort *qkv [[buffer(0)]],
                              device const ushort *q_weight [[buffer(1)]],
                              device const ushort *k_weight [[buffer(2)]],
@@ -4780,13 +4797,20 @@ kernel void h3_qkv_rope_bf16_coop(
             q0 = q0 * c + q1 * s;
             k0 = k0 * c + k1 * s;
         }
-        uint output_index =
+        uint output_index = HEAD_MAJOR_OUTPUT ?
+            (head * args.sequence + row) * args.head_dim + dimension :
             (row * args.heads + head) * args.head_dim + dimension;
         query[output_index] = h3_f32_to_bf16(q0);
         key[output_index] = h3_f32_to_bf16(k0);
         value[output_index] = qkv[v_base + dimension];
     }
 }
+
+typedef decltype(h3_qkv_rope_bf16_coop_impl<false>) h3_qkv_rope_bf16_coop_t;
+template [[host_name("h3_qkv_rope_bf16_coop")]]
+kernel h3_qkv_rope_bf16_coop_t h3_qkv_rope_bf16_coop_impl<false>;
+template [[host_name("h3_qkv_rope_bf16_coop_head_major")]]
+kernel h3_qkv_rope_bf16_coop_t h3_qkv_rope_bf16_coop_impl<true>;
 
 kernel void h3_swiglu_bf16(device const ushort *fused [[buffer(0)]],
                            device ushort *output [[buffer(1)]],
