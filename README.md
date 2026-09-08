@@ -810,11 +810,10 @@ ABBA gains were 1.6% on M3 Max and 0.4-1.1% on M5 Max. Activation wrappers stay
 transient because retaining them regressed the M5. The outputs remain
 byte-identical, and `H3_DISABLE_GRAPH_DATA_CACHE=1` restores transient wrappers
 for all tensors.
-On M3/older hardware, the four MPSGraph segments in each DiT block also reuse
-one `MPSCommandBuffer` wrapper for their shared underlying Metal command buffer.
-Repeated thermal-balanced runs measured 1.0-1.6% faster on M3 Max; M5 measured
-neutral, so it retains fresh wrappers. `H3_REUSE_MPS_COMMAND=0` or `1` overrides
-the automatic selection. Results are byte-identical.
+MPSGraph segments reuse one `MPSCommandBuffer` wrapper for their shared
+underlying Metal command buffer, including on M5. Earlier measurements found
+1.0-1.6% gains on M3 Max and neutral results on M5; wrapper reuse was subsequently
+enabled on both. `H3_REUSE_MPS_COMMAND=0` or `1` overrides the default.
 On M5, the serving Euler sampler keeps its patch-packed F32 latents and cached
 BF16 velocities in Metal buffers. Each selected denoiser refresh is completed
 before the next is encoded, avoiding MPSGraph back-pressure while removing all
@@ -882,12 +881,33 @@ peak physical footprint and zero swaps.
 
 ### Profiling and diagnostic paths
 
-`--profile` reports each Metal-backed phase separately: wall time, CPU-side
-command encoding, complete commit-to-fence wait, root-command GPU timestamps,
+`--profile` reports each Metal-backed phase separately: wall time, elapsed
+command-encoding interval, final commit-to-fence wait, root-command GPU timestamps,
 peak live tensor storage, cumulative allocation, and dispatch counts. The wait
-measurement is the complete command turnaround; the root GPU timestamp alone
-can omit child buffers scheduled internally by MPSGraph and is labeled
-accordingly.
+interval excludes work that MPSGraph already submitted during encoding. The
+`encode` interval includes any driver blocking and GPU execution before the
+final commit; it does not measure CPU execution time or graph compilation
+alone. Root GPU timestamps can omit child buffers scheduled internally by
+MPSGraph. Compare end-to-end wall time, and measure process CPU time separately
+when investigating host overhead.
+
+`make h3_dit_lora_bench` builds a real-weight DiT probe that skips the text
+encoder, VAEs and sampler. It measures one cold and three warm forwards with
+fixed synthetic inputs, reporting process CPU time separately and checking
+finite, repeatable outputs:
+
+```sh
+./h3_dit_lora_bench CHECKPOINT \
+  --adapter ADAPTER --profile modeltc-fl2va-768-8 --steps 16
+```
+
+The default geometry is 512x256 with 175 frames. `--large` selects 1024x512
+with 243 frames; reference conditioning is not included. Omit adapter options
+for a base-only run, use `--adapter-strength 0` for a zero-strength control,
+and set `H3_DISABLE_LORA_MPSGRAPH=1` to measure the direct LoRA fallback.
+`--dump PREFIX` writes video/audio F32 velocities for numerical comparison
+between implementations. Repeatability within one path does not establish
+equivalence between different paths.
 
 The DiT fast path evaluates each BF16 `fc1 -> SwiGLU -> fc2` block as one cached
 graph, avoiding separate graph boundaries and persistent intermediate tensors.

@@ -32,10 +32,16 @@ typedef struct {
     uint64_t host_tensor_writes;
     uint64_t host_tensor_read_bytes;
     uint64_t host_tensor_write_bytes;
+    /* Elapsed wall time from begin/continue to the final root commit. This
+     * includes CPU encoding and any blocking or GPU work inside MPSGraph;
+     * it is not a measurement of CPU execution time. */
     double command_encode_seconds;
+    /* Time from our final commit to completion, plus explicit drain waits.
+     * MPSGraph can commit and execute earlier, during the encode interval. */
     double command_wait_seconds;
     /* Root MTLCommandBuffer timestamps; MPSGraph may schedule child buffers,
-     * so command_wait_seconds is the complete turnaround measurement. */
+     * so neither these timestamps nor the final wait alone measure all GPU
+     * work. Use end-to-end wall time when comparing execution paths. */
     double gpu_seconds;
 } h3_gpu_stats;
 
